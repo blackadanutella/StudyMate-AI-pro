@@ -1,3 +1,5 @@
+
+
 import os
 import io
 import re
@@ -44,6 +46,11 @@ app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 15 * 1024 * 1024  # giới hạn upload 15MB
 app.config['SESSION_COOKIE_HTTPONLY'] = True
 app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
+
+from werkzeug.middleware.proxy_fix import ProxyFix
+
+# Render / Nginx: tin 1 lớp proxy (HTTPS, Host)
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1)
 
 # Khóa bí mật để ký session cookie (đăng nhập). Nên đặt cố định qua biến môi trường
 # SECRET_KEY trong .env khi deploy thật, nếu không mỗi lần restart server người dùng
@@ -2261,6 +2268,14 @@ def chat():
         },
     )
 
+# Cuối file, TRƯỚC if __name__ == '__main__':
+# hoặc ngay sau khi define xong init_db + app routes cũng được,
+# miễn là chạy 1 lần lúc load module:
+try:
+    init_db()
+except Exception as e:
+    print(f"⚠️ init_db failed: {e}")
+    raise
 
 if __name__ == '__main__':
     init_db()
