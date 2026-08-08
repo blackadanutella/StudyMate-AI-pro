@@ -645,6 +645,9 @@ HTML = r'''
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>StudyMate AI Pro - Gia sư THCS</title>
+  <link rel="manifest" href="/static/manifest.json">
+  <meta name="theme-color" content="#4f46e5">
+  <link rel="apple-touch-icon" href="/static/icons/icon-192.png">
   <script src="https://cdn.tailwindcss.com"></script>
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.6.0/css/all.min.css">
   <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
@@ -668,10 +671,27 @@ HTML = r'''
     .ai-content pre { background: #1e293b; color: #e2e8f0; padding: 0.9rem; border-radius: 0.75rem; overflow-x: auto; margin-bottom: 0.6rem; }
     .ai-content pre code { background: transparent; padding: 0; }
 
-    .typing-indicator span { display: inline-block; width: 6px; height: 6px; background-color: #9ca3af; border-radius: 50%; margin: 0 2px; animation: bounce 1.4s infinite ease-in-out both; }
-    .typing-indicator span:nth-child(1) { animation-delay: -0.32s; }
-    .typing-indicator span:nth-child(2) { animation-delay: -0.16s; }
-    @keyframes bounce { 0%, 80%, 100% { transform: scale(0); } 40% { transform: scale(1); } }
+    .typing-indicator span {
+      display: inline-block; width: 7px; height: 7px; border-radius: 50%; margin: 0 2px;
+      background: linear-gradient(135deg, #3b82f6, #6366f1);
+      box-shadow: 0 0 7px rgba(99,102,241,0.6);
+      animation: typingBounce 1.3s infinite ease-in-out both;
+    }
+    .typing-indicator span:nth-child(1) { animation-delay: -0.28s; }
+    .typing-indicator span:nth-child(2) { animation-delay: -0.14s; }
+    @keyframes typingBounce {
+      0%, 80%, 100% { transform: scale(0.55) translateY(0); opacity: 0.55; }
+      40% { transform: scale(1.05) translateY(-3px); opacity: 1; }
+    }
+    .typing-label {
+      font-size: 0.78rem; color: #9ca3af; letter-spacing: .01em;
+      animation: typingLabelPulse 1.9s ease-in-out infinite;
+    }
+    @keyframes typingLabelPulse { 0%, 100% { opacity: 0.55; } 50% { opacity: 1; } }
+    @media (prefers-reduced-motion: reduce) {
+      .typing-indicator span { animation: none; opacity: 0.85; }
+      .typing-label { animation: none; opacity: 0.8; }
+    }
 
     .stream-cursor { display: inline-block; width: 2px; height: 1em; background: currentColor; margin-left: 2px; vertical-align: text-bottom; animation: blink 0.9s steps(1) infinite; }
     @keyframes blink { 50% { opacity: 0; } }
@@ -702,7 +722,51 @@ HTML = r'''
     .attachment-chip img { border: 1px solid rgba(0,0,0,0.08); }
 
     .msg-actions { opacity: 0; transition: opacity 0.15s; }
-    .msg-actions.force-visible, .ai-msg-group:hover .msg-actions { opacity: 1; }
+    /* addMessageActions() inserts the actions bar as a SIBLING right after the
+       .ai-msg-group wrapper (wrapper.after(bar)), not as a child of it — so a
+       descendant selector like ".ai-msg-group:hover .msg-actions" never matches
+       and the "Báo lỗi" button stayed invisible (opacity: 0) forever, even though
+       it was in the DOM and technically clickable. Use the general sibling
+       combinator (~) instead, and also show it on its own hover/focus so touch
+       devices (which have no :hover on the message) and keyboard users can reach it. */
+    .msg-actions.force-visible,
+    .ai-msg-group:hover ~ .msg-actions,
+    .msg-actions:hover,
+    .msg-actions:focus-within { opacity: 1; }
+
+    /* ---------- Avatar "suy nghĩ" (shimmer chạy từ dưới lên trên) ----------
+       Cùng ý tưởng với hiệu ứng shimmer khi Claude đang suy nghĩ, nhưng thay vì
+       quét ngang qua chữ, ở đây một dải sáng quét dọc từ DƯỚI lên TRÊN, lặp lại,
+       trên chính avatar robot — dùng làm avatar chung của cả website (sidebar,
+       khung chat, chỉ báo đang gõ). Khi AI đang trả lời (class .thinking), dải
+       sáng chạy nhanh & rõ hơn; lúc rảnh (brand-avatar ở sidebar) nó chạy chậm,
+       mờ hơn như một nhịp "thở" cho logo. */
+    .ai-avatar { position: relative; overflow: hidden; isolation: isolate; }
+    .ai-avatar::after {
+      content: '';
+      position: absolute; inset: -60% -20%;
+      background: linear-gradient(0deg,
+        transparent 0%,
+        rgba(255,255,255,0) 38%,
+        rgba(255,255,255,0.95) 50%,
+        rgba(255,255,255,0) 62%,
+        transparent 100%);
+      background-size: 100% 260%;
+      background-position: 0% 160%;
+      mix-blend-mode: overlay;
+      opacity: 0;
+      pointer-events: none;
+      will-change: background-position, opacity;
+    }
+    .ai-avatar.thinking::after { opacity: 1; animation: avatarShimmerUp 1.3s ease-in-out infinite; }
+    .ai-avatar.brand-avatar::after { opacity: 0.55; animation: avatarShimmerUp 3.4s ease-in-out infinite; }
+    @keyframes avatarShimmerUp {
+      0%   { background-position: 0% 160%; }
+      100% { background-position: 0% -160%; }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      .ai-avatar.thinking::after, .ai-avatar.brand-avatar::after { animation: none; opacity: 0.35; }
+    }
 
     @keyframes memoryToastFade {
       0% { opacity: 0; transform: translate(-50%, 6px); }
@@ -747,7 +811,7 @@ HTML = r'''
   <aside id="sidebar" class="fixed lg:static inset-y-0 left-0 z-50 w-72 flex-shrink-0 bg-gray-50 dark:bg-[#171717] border-r border-gray-200 dark:border-gray-800 flex flex-col">
     <div class="p-3 flex items-center justify-between">
       <div class="flex items-center gap-2 px-1">
-        <div class="w-8 h-8 rounded-lg bg-gradient-to-br from-blue-600 to-indigo-600 flex items-center justify-center text-white font-bold text-sm">S</div>
+        <div class="ai-avatar brand-avatar w-8 h-8 rounded-lg bg-gradient-to-br from-blue-600 to-indigo-600 flex items-center justify-center text-white text-sm"><i class="fas fa-robot"></i></div>
         <span class="font-bold text-base">StudyMate AI</span>
       </div>
       <button id="closeSidebarBtn" class="lg:hidden w-8 h-8 flex items-center justify-center rounded-lg hover:bg-gray-200 dark:hover:bg-gray-800 text-gray-500">
@@ -948,6 +1012,9 @@ HTML = r'''
       <button onclick="startVoice()" class="w-9 h-9 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-800 text-gray-600 dark:text-gray-300 flex items-center justify-center" title="Trợ lý giọng nói">
         <i class="fas fa-microphone"></i>
       </button>
+      <button id="installAppBtn" style="display:none;" class="w-9 h-9 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-800 text-gray-600 dark:text-gray-300 flex items-center justify-center" title="Cài đặt StudyMate như ứng dụng">
+        <i class="fas fa-download"></i>
+      </button>
       <button onclick="toggleTheme()" class="w-9 h-9 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-800 text-gray-600 dark:text-gray-300 flex items-center justify-center" title="Đổi giao diện">
         <i id="themeIcon" class="fas fa-moon"></i>
       </button>
@@ -993,7 +1060,22 @@ let uploadedImageName = "";
 let currentConversationId = null;
 const html = document.documentElement;
 
-marked.setOptions({ breaks: true });
+// QUAN TRỌNG: marked được nạp từ CDN (dòng <script src="...marked...">). Nếu mạng của
+// người dùng chặn CDN đó (trình duyệt chặn quảng cáo, mạng trường/công ty lọc domain lạ,
+// mạng chập chờn...) thì biến `marked` sẽ không tồn tại. Gọi thẳng marked.setOptions() lúc
+// đó sẽ ném lỗi "marked is not defined" và làm DỪNG LUÔN toàn bộ đoạn <script> này — mọi
+// dòng addEventListener() nằm phía dưới (kể cả nút "Đoạn chat mới") sẽ KHÔNG BAO GIỜ được
+// gắn, dẫn tới bấm nút không phản hồi gì. Bọc try/catch để lỗi (nếu có) không lan ra ngoài.
+try { marked.setOptions({ breaks: true }); } catch (e) { console.error('marked chưa tải được:', e); }
+
+// Dùng hàm này thay vì gọi marked.parse() trực tiếp — tự động lùi về hiển thị chữ thường
+// (có xuống dòng) nếu vì lý do gì đó marked chưa sẵn sàng, thay vì làm vỡ cả trang.
+function safeMarkdown(text) {
+  try {
+    if (typeof marked !== 'undefined') return marked.parse(text);
+  } catch (e) { console.error('Lỗi render markdown:', e); }
+  return escapeHtml(text).replace(/\n/g, '<br>');
+}
 
 // Dựng công thức toán ($$...$$, \(...\), \[...\]) thành hiển thị đẹp bằng KaTeX.
 // throwOnError:false để không vỡ lỗi khi công thức đang gõ dở (lúc đang stream) —
@@ -1013,6 +1095,35 @@ function renderMathIn(el) {
     } catch (e) { /* bỏ qua, không làm hỏng luồng chat */ }
   }
 }
+
+// ---------- PWA: cài app vào máy/điện thoại ----------
+// Đăng ký từ /sw.js (route riêng ở backend, KHÔNG phải file tĩnh trong static/) để scope
+// mặc định của service worker là toàn site "/" chứ không chỉ trong /static/.
+if ('serviceWorker' in navigator) {
+  window.addEventListener('load', () => {
+    navigator.serviceWorker.register('/sw.js').catch(e => console.error('SW lỗi:', e));
+  });
+}
+let deferredInstallPrompt = null;
+const installBtn = document.getElementById('installAppBtn');
+// Sự kiện này chỉ Chrome/Edge/Android bắn ra khi trang đủ điều kiện cài (có manifest hợp lệ +
+// service worker). Safari/iOS không hỗ trợ API này -> nút sẽ tự động luôn ẩn trên iOS, người
+// dùng cài qua Share -> "Thêm vào MH chính" như bình thường của Safari.
+window.addEventListener('beforeinstallprompt', (e) => {
+  e.preventDefault();
+  deferredInstallPrompt = e;
+  if (installBtn) installBtn.style.display = 'flex';
+});
+if (installBtn) {
+  installBtn.addEventListener('click', async () => {
+    if (!deferredInstallPrompt) return;
+    installBtn.style.display = 'none';
+    deferredInstallPrompt.prompt();
+    await deferredInstallPrompt.userChoice;
+    deferredInstallPrompt = null;
+  });
+}
+window.addEventListener('appinstalled', () => { if (installBtn) installBtn.style.display = 'none'; });
 
 document.getElementById('userNameLabel').textContent = CURRENT_USERNAME;
 document.getElementById('userAvatar').textContent = (CURRENT_USERNAME || '?').trim().charAt(0).toUpperCase();
@@ -1247,8 +1358,8 @@ function showTypingIndicator() {
   const wrapper = document.createElement('div');
   wrapper.id = 'typingIndicator';
   wrapper.className = 'flex gap-3 items-start';
-  wrapper.innerHTML = `<div class="w-8 h-8 rounded-full bg-gradient-to-br from-blue-600 to-indigo-600 flex items-center justify-center text-white text-sm flex-shrink-0 mt-0.5"><i class="fas fa-robot"></i></div>
-    <div class="ai-content flex-1 min-w-0 leading-relaxed pt-1.5"><span class="typing-indicator inline-flex items-center gap-1 text-gray-400"><span></span><span></span><span></span></span></div>`;
+  wrapper.innerHTML = `<div class="ai-avatar thinking w-8 h-8 rounded-full bg-gradient-to-br from-blue-600 to-indigo-600 flex items-center justify-center text-white text-sm flex-shrink-0 mt-0.5"><i class="fas fa-robot"></i></div>
+    <div class="ai-content flex-1 min-w-0 leading-relaxed pt-1.5"><span class="inline-flex items-center gap-2"><span class="typing-indicator inline-flex items-center"><span></span><span></span><span></span></span><span class="typing-label">StudyMate đang soạn câu trả lời...</span></span></div>`;
   chat.appendChild(wrapper);
   scrollChatToBottom();
 }
@@ -1270,11 +1381,11 @@ function addMessage(sender, content, isMarkdown = false, actionsCtx = null) {
   const wrapper = document.createElement('div');
   wrapper.className = 'ai-msg-group flex gap-3 items-start';
   const avatar = document.createElement('div');
-  avatar.className = 'w-8 h-8 rounded-full bg-gradient-to-br from-blue-600 to-indigo-600 flex items-center justify-center text-white text-sm flex-shrink-0 mt-0.5';
+  avatar.className = 'ai-avatar w-8 h-8 rounded-full bg-gradient-to-br from-blue-600 to-indigo-600 flex items-center justify-center text-white text-sm flex-shrink-0 mt-0.5';
   avatar.innerHTML = '<i class="fas fa-robot"></i>';
   const bubble = document.createElement('div');
   bubble.className = 'ai-content flex-1 min-w-0 leading-relaxed pt-1.5';
-  bubble.innerHTML = isMarkdown ? marked.parse(content) : escapeHtml(content).replace(/\n/g, '<br>');
+  bubble.innerHTML = isMarkdown ? safeMarkdown(content) : escapeHtml(content).replace(/\n/g, '<br>');
   if (isMarkdown) renderMathIn(bubble);
   wrapper.appendChild(avatar);
   wrapper.appendChild(bubble);
@@ -1288,14 +1399,14 @@ function createAiStreamBubble() {
   const chat = document.getElementById('chat');
   const wrapper = document.createElement('div');
   wrapper.className = 'ai-msg-group flex gap-3 items-start';
-  wrapper.innerHTML = `<div class="w-8 h-8 rounded-full bg-gradient-to-br from-blue-600 to-indigo-600 flex items-center justify-center text-white text-sm flex-shrink-0 mt-0.5"><i class="fas fa-robot"></i></div>
-    <div class="ai-content flex-1 min-w-0 leading-relaxed pt-1.5"><span class="typing-indicator inline-flex items-center gap-1 text-gray-400"><span></span><span></span><span></span></span></div>`;
+  wrapper.innerHTML = `<div class="ai-avatar thinking w-8 h-8 rounded-full bg-gradient-to-br from-blue-600 to-indigo-600 flex items-center justify-center text-white text-sm flex-shrink-0 mt-0.5"><i class="fas fa-robot"></i></div>
+    <div class="ai-content flex-1 min-w-0 leading-relaxed pt-1.5"><span class="inline-flex items-center gap-2"><span class="typing-indicator inline-flex items-center"><span></span><span></span><span></span></span><span class="typing-label">StudyMate đang soạn câu trả lời...</span></span></div>`;
   chat.appendChild(wrapper);
   scrollChatToBottom();
   return wrapper.querySelector('.ai-content');
 }
 function updateAiStreamBubble(bubble, text, showCursor) {
-  bubble.innerHTML = marked.parse(text) + (showCursor ? '<span class="stream-cursor"></span>' : '');
+  bubble.innerHTML = safeMarkdown(text) + (showCursor ? '<span class="stream-cursor"></span>' : '');
   renderMathIn(bubble);
   scrollChatToBottom();
 }
@@ -1613,6 +1724,9 @@ async function sendMessage() {
   } catch (error) {
     updateAiStreamBubble(aiBubble, fullText || '🔌 Đã mất kết nối. Em kiểm tra lại mạng nhé!', false);
   } finally {
+    // Tắt hiệu ứng "đang suy nghĩ" trên avatar khi đã có kết quả (xong hoặc lỗi).
+    const avatarEl = aiBubble.parentElement && aiBubble.parentElement.querySelector('.ai-avatar');
+    if (avatarEl) avatarEl.classList.remove('thinking');
     input.disabled = false;
     sendBtn.disabled = false;
     sendBtn.innerHTML = '<i class="fas fa-arrow-up"></i>';
@@ -2674,6 +2788,44 @@ def logout():
 
 
 # ==========================================
+# 4.5. PWA — Service Worker (route riêng, KHÔNG đặt trong static/, để scope = toàn site "/")
+# ==========================================
+SERVICE_WORKER_JS = """
+const CACHE_NAME = 'studymate-static-v1';
+const PRECACHE_URLS = ['/static/manifest.json', '/static/icons/icon-192.png', '/static/icons/icon-512.png'];
+
+self.addEventListener('install', (event) => {
+  event.waitUntil(caches.open(CACHE_NAME).then((cache) => cache.addAll(PRECACHE_URLS)));
+  self.skipWaiting();
+});
+
+self.addEventListener('activate', (event) => {
+  event.waitUntil(
+    caches.keys().then((keys) => Promise.all(keys.filter((k) => k !== CACHE_NAME).map((k) => caches.delete(k))))
+  );
+  self.clients.claim();
+});
+
+// CHỈ cache-first cho tài nguyên tĩnh trong /static/ (icon, manifest...). Trang chat "/" và
+// mọi endpoint "/api/*" (kể cả stream trả lời AI) luôn đi thẳng ra mạng, KHÔNG bao giờ cache
+// — để không hiện nhầm trang cũ / dữ liệu của phiên đăng nhập khác, và không làm hỏng luồng
+// streaming của /api/chat.
+self.addEventListener('fetch', (event) => {
+  const url = new URL(event.request.url);
+  if (event.request.method !== 'GET' || url.origin !== self.location.origin || !url.pathname.startsWith('/static/')) {
+    return;
+  }
+  event.respondWith(caches.match(event.request).then((cached) => cached || fetch(event.request)));
+});
+"""
+
+
+@app.route('/sw.js')
+def service_worker():
+    return Response(SERVICE_WORKER_JS, mimetype='application/javascript')
+
+
+# ==========================================
 # 5. ĐỊNH TUYẾN CHÍNH (Trang chủ gia sư AI)
 # ==========================================
 @app.route('/')
@@ -3559,4 +3711,13 @@ if __name__ == '__main__':
     print("🛡️ Để xem bảng báo cáo bảo mật... Truy cập: http://localhost:5000/security")
     # debug=True chỉ dùng khi phát triển trên máy cá nhân — KHÔNG bật khi deploy thật
     # (xem README phần "Deploy lên production" để chạy bằng gunicorn thay vì app.run).
-    app.run(host='0.0.0.0', port=5000, debug=True, threaded=True)
+    # use_reloader=False: khi debug=True, Werkzeug mặc định tự khởi động lại
+    # (restart) tiến trình mỗi khi phát hiện một file trong thư mục dự án thay
+    # đổi. studymate.db (SQLite) bị ghi liên tục mỗi khi có tin nhắn mới, nên
+    # nó cũng bị coi là "file thay đổi" và làm server tự restart ngay giữa lúc
+    # đang stream câu trả lời — kết nối SQLite của request đó bị đóng đột ngột,
+    # gây lỗi "Cannot operate on a closed database." mà em thấy trong khung chat.
+    # Tắt use_reloader để tránh restart ngoài ý muốn này (vẫn giữ debug=True để
+    # còn thấy traceback lỗi khi phát triển). Khi sửa code .py, chỉ cần dừng
+    # (Ctrl+C) và chạy lại `python app.py` thủ công.
+    app.run(host='0.0.0.0', port=5000, debug=True, threaded=True, use_reloader=False)
