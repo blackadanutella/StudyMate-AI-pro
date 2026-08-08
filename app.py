@@ -1,5 +1,3 @@
-
-
 import os
 import io
 import re
@@ -182,6 +180,35 @@ def init_db():
         CREATE TABLE IF NOT EXISTS system_settings (
             key TEXT PRIMARY KEY,
             value TEXT
+        )
+    ''')
+    conn.commit()
+
+    # Báo lỗi từ học sinh — mỗi báo cáo gắn với 1 câu trả lời cụ thể (nếu có) để developer xem lại.
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS issue_reports (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            conversation_id INTEGER,
+            message_excerpt TEXT,
+            description TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'open',
+            created_at TEXT NOT NULL,
+            resolved_at TEXT,
+            FOREIGN KEY (user_id) REFERENCES users (id)
+        )
+    ''')
+    # "Bộ nhớ" AI — những điều đáng nhớ về 1 học sinh (học sinh chủ động nhờ ghi nhớ, hoặc
+    # hệ thống tự nhận diện vài tín hiệu đơn giản như lớp học). Dùng để cá nhân hoá câu trả
+    # lời ở các lượt chat sau, và cũng được tổng hợp lại cho developer xem ở trang thống kê.
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS memories (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            content TEXT NOT NULL,
+            source TEXT NOT NULL DEFAULT 'auto',
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (user_id) REFERENCES users (id)
         )
     ''')
     conn.commit()
@@ -403,6 +430,81 @@ def get_banner():
 
 
 # ==========================================
+# 0.4. "BỘ NHỚ" AI (memories) — cá nhân hoá + báo lỗi (issue reports)
+# ==========================================
+# Học sinh chủ động nhờ AI ghi nhớ điều gì đó, ví dụ: "ghi nhớ giúp em là em học lớp 8"
+# hoặc "hãy nhớ mình sắp thi học kỳ môn Hóa". Không cần gọi thêm API AI nào — chỉ dùng
+# regex đơn giản, chạy nhanh và không tốn chi phí.
+MEMORY_TRIGGER_RE = re.compile(
+    r'(?:ghi\s*nhớ|hãy\s*nhớ|nhớ\s*giúp|note\s*giúp|lưu\s*ý\s*giúp)(?:\s*(?:em|mình|giúp|rằng|là))*\s*[:,-]?\s*(.+)',
+    re.IGNORECASE
+)
+GRADE_LEVEL_RE = re.compile(r'\blớp\s*(6|7|8|9)\b', re.IGNORECASE)
+MAX_MEMORY_LEN = 300
+MAX_MEMORIES_IN_PROMPT = 5
+
+
+def save_memory(user_id, content, source='auto'):
+    """Lưu 1 mục bộ nhớ cho học sinh. Không để lỗi ở đây ảnh hưởng tới luồng chat chính."""
+    content = (content or '').strip()
+    if not content:
+        return
+    content = content[:MAX_MEMORY_LEN]
+    try:
+        db = get_db()
+        db.execute(
+            'INSERT INTO memories (user_id, content, source, created_at) VALUES (?, ?, ?, ?)',
+            (user_id, content, source, now_iso())
+        )
+        db.commit()
+    except Exception:
+        pass
+
+
+def extract_and_save_memory(user_id, user_message):
+    """Phát hiện + lưu 1 'bộ nhớ' mới từ tin nhắn của học sinh (nếu có).
+    Trả về nội dung vừa ghi nhớ (để báo lại cho học sinh biết), hoặc None nếu không có gì."""
+    text = (user_message or '').strip()
+    if not text:
+        return None
+
+    # 1) Học sinh chủ động yêu cầu ghi nhớ — ưu tiên cao nhất.
+    m = MEMORY_TRIGGER_RE.search(text)
+    if m:
+        content = m.group(1).strip(' .!?')
+        if content:
+            save_memory(user_id, content, source='explicit')
+            return content
+
+    # 2) Tự nhận diện lớp học (chỉ lưu 1 lần, tránh lặp lại mỗi khi học sinh gõ "lớp 8").
+    g = GRADE_LEVEL_RE.search(text)
+    if g:
+        try:
+            db = get_db()
+            existing = db.execute(
+                "SELECT id FROM memories WHERE user_id = ? AND content LIKE 'Học sinh đang học lớp%'",
+                (user_id,)
+            ).fetchone()
+            if not existing:
+                content = f"Học sinh đang học lớp {g.group(1)}."
+                save_memory(user_id, content, source='auto')
+                return content
+        except Exception:
+            pass
+
+    return None
+
+
+def get_recent_memories(user_id, limit=MAX_MEMORIES_IN_PROMPT):
+    db = get_db()
+    rows = db.execute(
+        'SELECT content FROM memories WHERE user_id = ? ORDER BY created_at DESC LIMIT ?',
+        (user_id, limit)
+    ).fetchall()
+    return [r['content'] for r in reversed(rows)]  # cũ -> mới, đọc tự nhiên hơn trong prompt
+
+
+# ==========================================
 # 1. GIAO DIỆN ĐĂNG NHẬP / ĐĂNG KÝ
 # ==========================================
 AUTH_HTML = r'''
@@ -599,6 +701,16 @@ HTML = r'''
 
     .attachment-chip img { border: 1px solid rgba(0,0,0,0.08); }
 
+    .msg-actions { opacity: 0; transition: opacity 0.15s; }
+    .msg-actions.force-visible, .ai-msg-group:hover .msg-actions { opacity: 1; }
+
+    @keyframes memoryToastFade {
+      0% { opacity: 0; transform: translate(-50%, 6px); }
+      10%, 85% { opacity: 1; transform: translate(-50%, 0); }
+      100% { opacity: 0; transform: translate(-50%, 6px); }
+    }
+    .memory-toast { animation: memoryToastFade 3.5s ease forwards; }
+
     /* ---- Modal system ---- */
     #modalOverlay.open { display: flex; }
     .modal-card.open { display: block; }
@@ -754,9 +866,12 @@ HTML = r'''
             <option value="Ôn tập">🔄 Tổng Hợp Ôn Tập</option>
           </select>
         </div>
-        <div class="pt-3 border-t border-gray-200 dark:border-gray-800">
+        <div class="pt-3 border-t border-gray-200 dark:border-gray-800 space-y-2">
           <button id="deleteAllHistoryBtn" class="w-full flex items-center justify-center gap-2 px-4 py-2.5 rounded-lg bg-red-50 dark:bg-red-900/30 text-red-600 dark:text-red-400 hover:bg-red-100 dark:hover:bg-red-900/50 font-medium text-sm">
             <i class="fas fa-trash-can"></i> <span data-i18n="delete_all_history">Xoá toàn bộ lịch sử</span>
+          </button>
+          <button id="clearMemoriesBtn" class="w-full flex items-center justify-center gap-2 px-4 py-2.5 rounded-lg bg-purple-50 dark:bg-purple-900/30 text-purple-600 dark:text-purple-400 hover:bg-purple-100 dark:hover:bg-purple-900/50 font-medium text-sm">
+            <i class="fas fa-brain"></i> <span data-i18n="clear_my_memories">Xoá bộ nhớ AI của tôi</span>
           </button>
         </div>
       </div>
@@ -782,6 +897,20 @@ HTML = r'''
       </div>
       <div class="p-5 text-sm text-gray-500 dark:text-gray-400 space-y-3">
         <p data-i18n="upgrade_preview">Tính năng nâng cấp gói đang được xây dựng và hiện chưa hỗ trợ thanh toán. Đây chỉ là bản xem trước giao diện.</p>
+      </div>
+    </div>
+
+    <div id="reportIssueModal" class="modal-card hidden bg-white dark:bg-gray-900 rounded-2xl shadow-2xl w-full max-w-md max-h-[85vh] overflow-y-auto">
+      <div class="flex items-center justify-between px-5 py-4 border-b border-gray-200 dark:border-gray-800">
+        <h3 class="font-semibold text-lg" data-i18n="report_issue">Báo lỗi câu trả lời</h3>
+        <button class="modal-close-btn text-gray-400 hover:text-gray-600 w-8 h-8 flex items-center justify-center"><i class="fas fa-xmark"></i></button>
+      </div>
+      <div class="p-5 space-y-3 text-sm">
+        <p class="text-xs text-gray-400" data-i18n="report_issue_desc">Cho Thầy/Cô biết câu trả lời này có vấn đề gì (sai kiến thức, khó hiểu, lạc đề...) để đội ngũ StudyMate cải thiện AI nhé.</p>
+        <textarea id="reportIssueText" rows="4" maxlength="1000" data-i18n-placeholder="report_issue_placeholder" placeholder="Mô tả vấn đề em gặp phải..."
+          class="w-full px-3 py-2 rounded-lg bg-gray-100 dark:bg-gray-800 border-0 focus:outline-none focus:ring-2 focus:ring-red-500 dark:text-white resize-none"></textarea>
+        <button id="reportIssueSubmitBtn" class="w-full px-4 py-2.5 rounded-lg bg-red-600 hover:bg-red-700 disabled:opacity-50 text-white text-sm font-medium" data-i18n="send_report">Gửi báo cáo</button>
+        <p id="reportIssueStatus" class="text-xs text-green-600 hidden" data-i18n="report_sent">Đã gửi báo cáo, cảm ơn em! ✓</p>
       </div>
     </div>
 
@@ -898,6 +1027,10 @@ const I18N = {
     delete_all_history: 'Xoá toàn bộ lịch sử', shortcut_new_chat: 'Đoạn chat mới', shortcut_help: 'Mở trợ giúp',
     shortcut_close: 'Đóng hộp thoại', shortcut_send: 'Gửi câu hỏi',
     upgrade_preview: 'Tính năng nâng cấp gói đang được xây dựng và hiện chưa hỗ trợ thanh toán. Đây chỉ là bản xem trước giao diện.',
+    clear_my_memories: 'Xoá bộ nhớ AI của tôi', report_issue: 'Báo lỗi câu trả lời',
+    report_issue_desc: 'Cho Thầy/Cô biết câu trả lời này có vấn đề gì (sai kiến thức, khó hiểu, lạc đề...) để đội ngũ StudyMate cải thiện AI nhé.',
+    report_issue_placeholder: 'Mô tả vấn đề em gặp phải...', send_report: 'Gửi báo cáo',
+    report_sent: 'Đã gửi báo cáo, cảm ơn em! ✓', report_btn: 'Báo lỗi',
   },
   en: {
     new_chat: 'New chat', search_chats: 'Search chats...', projects: 'Projects', pinned: 'Pinned',
@@ -907,6 +1040,10 @@ const I18N = {
     delete_all_history: 'Delete all history', shortcut_new_chat: 'New chat', shortcut_help: 'Open help',
     shortcut_close: 'Close dialog', shortcut_send: 'Send message',
     upgrade_preview: 'The upgrade flow is a UI preview only — no billing is implemented yet.',
+    clear_my_memories: 'Clear my AI memories', report_issue: 'Report an answer',
+    report_issue_desc: 'Tell us what went wrong with this answer (wrong info, confusing, off-topic...) so we can improve the AI.',
+    report_issue_placeholder: 'Describe the problem...', send_report: 'Send report',
+    report_sent: 'Report sent, thank you! ✓', report_btn: 'Report',
   },
 };
 function applyLanguage(lang) {
@@ -996,6 +1133,45 @@ document.getElementById('deleteAllHistoryBtn').addEventListener('click', async (
   } catch (e) { /* im lặng bỏ qua lỗi mạng */ }
 });
 
+document.getElementById('clearMemoriesBtn').addEventListener('click', async () => {
+  const isEn = PREFERENCES.language === 'en';
+  if (!confirm(isEn ? 'Clear all AI memories about you? This cannot be undone.' : 'Xoá toàn bộ bộ nhớ AI về em? Hành động này không thể hoàn tác.')) return;
+  try {
+    await fetch('/api/memories', { method: 'DELETE' });
+    alert(isEn ? 'Cleared.' : 'Đã xoá xong.');
+  } catch (e) { /* im lặng bỏ qua lỗi mạng */ }
+});
+
+document.getElementById('reportIssueSubmitBtn').addEventListener('click', async () => {
+  const textEl = document.getElementById('reportIssueText');
+  const statusEl = document.getElementById('reportIssueStatus');
+  const description = textEl.value.trim();
+  if (!description) { textEl.focus(); return; }
+  const btn = document.getElementById('reportIssueSubmitBtn');
+  btn.disabled = true;
+  try {
+    const res = await fetch('/api/report-issue', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        conversationId: reportContext.conversationId,
+        messageExcerpt: reportContext.messageExcerpt,
+        description
+      })
+    });
+    if (res.ok) {
+      statusEl.classList.remove('hidden');
+      setTimeout(closeModal, 1200);
+    } else {
+      const data = await res.json().catch(() => ({}));
+      alert(data.error || 'Không gửi được báo cáo.');
+    }
+  } catch (err) {
+    alert('Lỗi mạng khi gửi báo cáo.');
+  } finally {
+    btn.disabled = false;
+  }
+});
+
 // ---------- Modal system ---------- 
 const modalOverlay = document.getElementById('modalOverlay');
 function openModal(id) {
@@ -1081,7 +1257,7 @@ function removeTypingIndicator() {
   if (el) el.remove();
 }
 
-function addMessage(sender, content, isMarkdown = false) {
+function addMessage(sender, content, isMarkdown = false, actionsCtx = null) {
   const chat = document.getElementById('chat');
   if (sender === 'user') {
     const div = document.createElement('div');
@@ -1092,7 +1268,7 @@ function addMessage(sender, content, isMarkdown = false) {
     return div;
   }
   const wrapper = document.createElement('div');
-  wrapper.className = 'flex gap-3 items-start';
+  wrapper.className = 'ai-msg-group flex gap-3 items-start';
   const avatar = document.createElement('div');
   avatar.className = 'w-8 h-8 rounded-full bg-gradient-to-br from-blue-600 to-indigo-600 flex items-center justify-center text-white text-sm flex-shrink-0 mt-0.5';
   avatar.innerHTML = '<i class="fas fa-robot"></i>';
@@ -1103,6 +1279,7 @@ function addMessage(sender, content, isMarkdown = false) {
   wrapper.appendChild(avatar);
   wrapper.appendChild(bubble);
   chat.appendChild(wrapper);
+  if (actionsCtx) addMessageActions(wrapper, actionsCtx.conversationId, () => content);
   scrollChatToBottom();
   return bubble;
 }
@@ -1110,7 +1287,7 @@ function addMessage(sender, content, isMarkdown = false) {
 function createAiStreamBubble() {
   const chat = document.getElementById('chat');
   const wrapper = document.createElement('div');
-  wrapper.className = 'flex gap-3 items-start';
+  wrapper.className = 'ai-msg-group flex gap-3 items-start';
   wrapper.innerHTML = `<div class="w-8 h-8 rounded-full bg-gradient-to-br from-blue-600 to-indigo-600 flex items-center justify-center text-white text-sm flex-shrink-0 mt-0.5"><i class="fas fa-robot"></i></div>
     <div class="ai-content flex-1 min-w-0 leading-relaxed pt-1.5"><span class="typing-indicator inline-flex items-center gap-1 text-gray-400"><span></span><span></span><span></span></span></div>`;
   chat.appendChild(wrapper);
@@ -1121,6 +1298,41 @@ function updateAiStreamBubble(bubble, text, showCursor) {
   bubble.innerHTML = marked.parse(text) + (showCursor ? '<span class="stream-cursor"></span>' : '');
   renderMathIn(bubble);
   scrollChatToBottom();
+}
+
+// ---------- Hành động dưới câu trả lời AI (Báo lỗi...) ----------
+function addMessageActions(wrapper, conversationId, getText) {
+  const bar = document.createElement('div');
+  bar.className = 'msg-actions flex items-center gap-1 mt-1 ml-11';
+  const btn = document.createElement('button');
+  btn.type = 'button';
+  btn.className = 'text-xs text-gray-400 hover:text-red-500 px-2 py-1 -ml-2 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-800 flex items-center gap-1.5';
+  btn.title = 'Báo lỗi câu trả lời này';
+  btn.innerHTML = '<i class="fas fa-flag"></i> <span data-i18n="report_btn">Báo lỗi</span>';
+  btn.addEventListener('click', () => openReportModal(conversationId, getText()));
+  bar.appendChild(btn);
+  wrapper.after(bar);
+  applyLanguage(PREFERENCES.language || 'vi');
+  return bar;
+}
+
+let reportContext = { conversationId: null, messageExcerpt: '' };
+function openReportModal(conversationId, messageExcerpt) {
+  reportContext = { conversationId: conversationId || null, messageExcerpt: (messageExcerpt || '').slice(0, 2000) };
+  const textEl = document.getElementById('reportIssueText');
+  const statusEl = document.getElementById('reportIssueStatus');
+  textEl.value = '';
+  statusEl.classList.add('hidden');
+  openModal('reportIssueModal');
+  setTimeout(() => textEl.focus(), 50);
+}
+
+function showMemoryToast(text) {
+  const toast = document.createElement('div');
+  toast.className = 'memory-toast fixed bottom-24 left-1/2 z-50 bg-gray-900 dark:bg-gray-100 text-white dark:text-gray-900 text-xs px-4 py-2 rounded-full shadow-lg flex items-center gap-2 max-w-[90vw]';
+  toast.innerHTML = `<i class="fas fa-brain text-purple-400"></i> <span class="truncate">Đã ghi nhớ: ${escapeHtml(text.slice(0, 80))}</span>`;
+  document.body.appendChild(toast);
+  setTimeout(() => toast.remove(), 3600);
 }
 
 function showWelcome() {
@@ -1273,7 +1485,12 @@ async function openConversation(id) {
     const messages = await res.json();
     currentConversationId = id;
     document.getElementById('chat').innerHTML = '';
-    messages.forEach(m => addMessage(m.role === 'user' ? 'user' : 'ai', m.content, m.role !== 'user'));
+    messages.forEach(m => addMessage(
+      m.role === 'user' ? 'user' : 'ai',
+      m.content,
+      m.role !== 'user',
+      m.role !== 'user' ? { conversationId: id } : null
+    ));
     clearAttachments();
     closeSidebar();
     loadConversations();
@@ -1370,6 +1587,8 @@ async function sendMessage() {
 
           if (payload.conversationId) {
             currentConversationId = payload.conversationId;
+          } else if (payload.memory) {
+            showMemoryToast(payload.memory);
           } else if (payload.error) {
             updateAiStreamBubble(aiBubble, (fullText ? fullText + '\n\n' : '') + '⚠️ **Lỗi:** ' + payload.error, false);
             handledError = true;
@@ -1385,6 +1604,10 @@ async function sendMessage() {
 
       if (!gotFirstToken && !handledError) {
         updateAiStreamBubble(aiBubble, '⚠️ Thầy/Cô chưa nhận được phản hồi. Em thử lại nhé!', false);
+      }
+
+      if (gotFirstToken && !handledError) {
+        addMessageActions(aiBubble.parentElement, currentConversationId, () => fullText);
       }
     }
   } catch (error) {
@@ -1904,8 +2127,14 @@ DEV_STATS_HTML = r'''
 
   <main class="max-w-6xl mx-auto px-4 sm:px-6 py-6 space-y-6">
 
+    {% if open_issues_count > 0 %}
+    <a href="#issue-reports" class="block bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-900/50 rounded-2xl px-5 py-3 text-sm font-medium text-red-700 dark:text-red-300 flex items-center gap-2 hover:bg-red-100 dark:hover:bg-red-900/30 transition-colors">
+      <i class="fas fa-flag"></i> Có {{ open_issues_count }} báo cáo lỗi đang chờ xử lý — xem bên dưới ↓
+    </a>
+    {% endif %}
+
     <!-- Thẻ tổng quan -->
-    <div class="grid grid-cols-2 lg:grid-cols-4 gap-4">
+    <div class="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-5 gap-4">
       <div class="bg-white dark:bg-[#1c1c1c] rounded-2xl border border-gray-100 dark:border-gray-800 p-5 shadow-sm">
         <div class="flex items-center justify-between">
           <span class="text-xs font-semibold text-gray-400 uppercase">Tổng tài khoản</span>
@@ -1937,6 +2166,14 @@ DEV_STATS_HTML = r'''
         </div>
         <p class="text-3xl font-extrabold mt-2">{{ error_rate }}%</p>
         <p class="text-xs text-gray-400 mt-1">{{ error_count }} lượt gặp lỗi / {{ total_usage }} lượt</p>
+      </div>
+      <div class="bg-white dark:bg-[#1c1c1c] rounded-2xl border border-gray-100 dark:border-gray-800 p-5 shadow-sm">
+        <div class="flex items-center justify-between">
+          <span class="text-xs font-semibold text-gray-400 uppercase">Báo lỗi đang mở</span>
+          <i class="fas fa-flag text-red-500"></i>
+        </div>
+        <p class="text-3xl font-extrabold mt-2">{{ open_issues_count }}</p>
+        <p class="text-xs text-gray-400 mt-1">{{ total_issues_count }} báo cáo tổng cộng</p>
       </div>
     </div>
 
@@ -2069,6 +2306,63 @@ DEV_STATS_HTML = r'''
       </div>
     </div>
 
+    <!-- Báo cáo lỗi từ học sinh -->
+    <div id="issue-reports" class="bg-white dark:bg-[#1c1c1c] rounded-2xl border border-gray-100 dark:border-gray-800 p-5 shadow-sm scroll-mt-20">
+      <div class="flex items-center justify-between mb-1 flex-wrap gap-2">
+        <h2 class="font-bold flex items-center gap-2"><i class="fas fa-flag text-red-500"></i> Báo cáo lỗi từ học sinh</h2>
+        <span class="text-xs text-gray-400">{{ open_issues_count }} đang mở / {{ total_issues_count }} tổng cộng</span>
+      </div>
+      <p class="text-xs text-gray-400 mb-4">Học sinh bấm "Báo lỗi" dưới 1 câu trả lời trong khung chat để gửi báo cáo về đây.</p>
+      <div class="space-y-3">
+        {% for r in issue_reports %}
+        <div class="border border-gray-100 dark:border-gray-800 rounded-xl p-4 {{ 'opacity-50' if r.status == 'resolved' else '' }}" data-issue-id="{{ r.id }}">
+          <div class="flex items-start justify-between gap-3 flex-wrap">
+            <div class="min-w-0">
+              <div class="flex items-center gap-2 text-xs text-gray-400 mb-1 flex-wrap">
+                <span class="font-semibold text-gray-600 dark:text-gray-300">{{ r.username }}</span>
+                <span>•</span><span>{{ r.created_at }}</span>
+                {% if r.status == 'resolved' %}
+                <span class="px-1.5 py-0.5 rounded-full bg-emerald-100 dark:bg-emerald-900 text-emerald-600 dark:text-emerald-300 text-[10px] font-semibold uppercase">Đã xử lý</span>
+                {% else %}
+                <span class="px-1.5 py-0.5 rounded-full bg-red-100 dark:bg-red-900 text-red-600 dark:text-red-300 text-[10px] font-semibold uppercase">Đang mở</span>
+                {% endif %}
+              </div>
+              <p class="text-sm font-medium">{{ r.description }}</p>
+              {% if r.message_excerpt %}
+              <p class="text-xs text-gray-400 mt-1.5 italic">Liên quan tới câu trả lời: "{{ r.message_excerpt[:160] }}{{ '…' if r.message_excerpt|length > 160 else '' }}"</p>
+              {% endif %}
+            </div>
+            <button class="issue-resolve-btn flex-shrink-0 text-xs font-medium px-3 py-1.5 rounded-lg bg-gray-100 dark:bg-gray-800 hover:bg-gray-200 dark:hover:bg-gray-700 whitespace-nowrap">
+              {{ 'Mở lại' if r.status == 'resolved' else 'Đánh dấu đã xử lý' }}
+            </button>
+          </div>
+        </div>
+        {% else %}
+        <p class="text-sm text-gray-400">Chưa có báo cáo lỗi nào. 🎉</p>
+        {% endfor %}
+      </div>
+    </div>
+
+    <!-- Bộ nhớ AI -->
+    <div class="bg-white dark:bg-[#1c1c1c] rounded-2xl border border-gray-100 dark:border-gray-800 p-5 shadow-sm overflow-x-auto">
+      <h2 class="font-bold mb-1 flex items-center gap-2"><i class="fas fa-brain text-purple-500"></i> Bộ nhớ AI gần đây ({{ total_memories }} tổng)</h2>
+      <p class="text-xs text-gray-400 mb-4">Những điều học sinh chủ động nhờ AI ghi nhớ (vd: "ghi nhớ giúp em là...") hoặc hệ thống tự
+        nhận diện (vd: lớp học) — dùng để cá nhân hoá câu trả lời ở các lượt chat sau.</p>
+      <div class="space-y-2.5">
+        {% for m in recent_memories_admin %}
+        <div class="flex items-start gap-3 text-sm border-b border-gray-50 dark:border-gray-900 pb-2.5">
+          <div class="w-6 h-6 rounded-full bg-purple-100 dark:bg-purple-900 text-purple-600 dark:text-purple-300 flex items-center justify-center text-xs font-bold flex-shrink-0 mt-0.5">{{ m.username[0]|upper if m.username != '—' else '?' }}</div>
+          <div class="min-w-0 flex-1">
+            <p class="break-words"><span class="font-semibold">{{ m.username }}</span> — {{ m.content }}</p>
+            <p class="text-xs text-gray-400 mt-0.5">{{ m.created_at }} · {{ 'tự động nhận diện' if m.source == 'auto' else 'học sinh yêu cầu' }}</p>
+          </div>
+        </div>
+        {% else %}
+        <p class="text-sm text-gray-400">Chưa có bộ nhớ nào được ghi nhận.</p>
+        {% endfor %}
+      </div>
+    </div>
+
     <!-- Toàn bộ tài khoản -->
     <div class="bg-white dark:bg-[#1c1c1c] rounded-2xl border border-gray-100 dark:border-gray-800 p-5 shadow-sm overflow-x-auto">
       <div class="flex items-center justify-between mb-4 flex-wrap gap-2">
@@ -2155,6 +2449,19 @@ DEV_STATS_HTML = r'''
         if (res.ok) window.location.reload();
         else alert('Không đổi được trạng thái đăng nhập Google.');
       } catch (err) { alert('Lỗi mạng.'); }
+    });
+  });
+
+  document.querySelectorAll('.issue-resolve-btn').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      const card = btn.closest('[data-issue-id]');
+      const id = card.dataset.issueId;
+      btn.disabled = true;
+      try {
+        const res = await fetch(`/developer/issues/${id}/resolve`, { method: 'POST' });
+        if (res.ok) window.location.reload();
+        else { alert('Không cập nhật được trạng thái báo cáo.'); btn.disabled = false; }
+      } catch (err) { alert('Lỗi mạng.'); btn.disabled = false; }
     });
   });
 
@@ -2488,6 +2795,48 @@ def developer_stats():
 
     developer_count = db.execute("SELECT COUNT(*) c FROM users WHERE role = 'developer'").fetchone()['c']
 
+    # ---- Báo lỗi từ học sinh ----
+    open_issues_count = db.execute("SELECT COUNT(*) c FROM issue_reports WHERE status = 'open'").fetchone()['c']
+    total_issues_count = db.execute('SELECT COUNT(*) c FROM issue_reports').fetchone()['c']
+    issue_rows = db.execute('''
+        SELECT r.id AS id, r.description AS description, r.message_excerpt AS message_excerpt,
+               r.status AS status, r.created_at AS created_at,
+               u.username AS username
+        FROM issue_reports r
+        LEFT JOIN users u ON u.id = r.user_id
+        ORDER BY (r.status = 'open') DESC, r.created_at DESC
+        LIMIT 30
+    ''').fetchall()
+    issue_reports = []
+    for r in issue_rows:
+        issue_reports.append({
+            'id': r['id'],
+            'description': r['description'],
+            'message_excerpt': r['message_excerpt'] or '',
+            'status': r['status'],
+            'username': r['username'] or '—',
+            'created_at': r['created_at'][:16].replace('T', ' ') if r['created_at'] else '',
+        })
+
+    # ---- Bộ nhớ AI (memories) — tổng hợp cho developer xem ----
+    total_memories = db.execute('SELECT COUNT(*) c FROM memories').fetchone()['c']
+    memory_rows = db.execute('''
+        SELECT m.content AS content, m.source AS source, m.created_at AS created_at,
+               u.username AS username
+        FROM memories m
+        LEFT JOIN users u ON u.id = m.user_id
+        ORDER BY m.created_at DESC
+        LIMIT 10
+    ''').fetchall()
+    recent_memories_admin = []
+    for r in memory_rows:
+        recent_memories_admin.append({
+            'content': r['content'],
+            'source': r['source'],
+            'username': r['username'] or '—',
+            'created_at': r['created_at'][:16].replace('T', ' ') if r['created_at'] else '',
+        })
+
     return render_template_string(
         DEV_STATS_HTML,
         total_users=total_users,
@@ -2509,6 +2858,11 @@ def developer_stats():
         banner=get_banner(),
         google_oauth_configured=GOOGLE_OAUTH_ENABLED,
         google_login_on=google_login_effective(),
+        open_issues_count=open_issues_count,
+        total_issues_count=total_issues_count,
+        issue_reports=issue_reports,
+        total_memories=total_memories,
+        recent_memories_admin=recent_memories_admin,
     )
 
 
@@ -2565,6 +2919,22 @@ def developer_set_google_login():
     else:
         set_setting('google_login_override', mode)
     return jsonify({"success": True, "google_login_on": google_login_effective()})
+
+
+@app.route('/developer/issues/<int:issue_id>/resolve', methods=['POST'])
+@developer_required
+def developer_resolve_issue(issue_id):
+    """Đánh dấu 1 báo cáo lỗi là đã xử lý (hoặc mở lại nếu bấm lần nữa)."""
+    db = get_db()
+    row = db.execute('SELECT id, status FROM issue_reports WHERE id = ?', (issue_id,)).fetchone()
+    if not row:
+        return jsonify({"error": "Không tìm thấy báo cáo này."}), 404
+    new_status = 'open' if row['status'] == 'resolved' else 'resolved'
+    resolved_at = now_iso() if new_status == 'resolved' else None
+    db.execute('UPDATE issue_reports SET status = ?, resolved_at = ? WHERE id = ?',
+               (new_status, resolved_at, issue_id))
+    db.commit()
+    return jsonify({"success": True, "status": new_status})
 
 
 @app.route('/developer/export.csv')
@@ -2962,6 +3332,61 @@ def delete_conversation(conv_id):
 # ==========================================
 # 10. CHAT (STREAMING QUA SERVER-SENT EVENTS) + LƯU LỊCH SỬ
 # ==========================================
+@app.route('/api/report-issue', methods=['POST'])
+@login_required
+def report_issue():
+    """Học sinh báo lỗi 1 câu trả lời cụ thể (hoặc báo lỗi chung). Lưu lại để developer xem
+    và xử lý ở trang /developer."""
+    data = request.get_json(silent=True) or {}
+    description = (data.get('description') or '').strip()
+    message_excerpt = (data.get('messageExcerpt') or '').strip()[:2000]
+    raw_conv_id = data.get('conversationId')
+
+    if not description:
+        return jsonify({"error": "Em mô tả lỗi cụ thể giúp Thầy/Cô nhé."}), 400
+    if len(description) > 1000:
+        return jsonify({"error": "Mô tả hơi dài, em rút gọn lại giúp Thầy/Cô nhé!"}), 400
+
+    conv_id = None
+    if raw_conv_id is not None:
+        try:
+            conv_id = int(raw_conv_id)
+        except (TypeError, ValueError):
+            conv_id = None
+
+    db = get_db()
+    db.execute(
+        '''INSERT INTO issue_reports
+           (user_id, conversation_id, message_excerpt, description, status, created_at)
+           VALUES (?, ?, ?, ?, 'open', ?)''',
+        (current_user_id(), conv_id, message_excerpt, description, now_iso())
+    )
+    db.commit()
+    return jsonify({"success": True})
+
+
+@app.route('/api/memories', methods=['GET'])
+@login_required
+def api_list_memories():
+    db = get_db()
+    rows = db.execute(
+        'SELECT id, content, source, created_at FROM memories WHERE user_id = ? ORDER BY created_at DESC',
+        (current_user_id(),)
+    ).fetchall()
+    return jsonify([dict(r) for r in rows])
+
+
+@app.route('/api/memories', methods=['DELETE'])
+@login_required
+def api_clear_memories():
+    """Xoá toàn bộ 'bộ nhớ' AI của chính học sinh này (quyền riêng tư — mỗi người chỉ xoá
+    được bộ nhớ của mình)."""
+    db = get_db()
+    db.execute('DELETE FROM memories WHERE user_id = ?', (current_user_id(),))
+    db.commit()
+    return jsonify({"success": True})
+
+
 @app.route('/api/chat', methods=['POST'])
 @login_required
 def chat():
@@ -3015,6 +3440,11 @@ def chat():
     )
     db.commit()
 
+    # "Bộ nhớ" AI: phát hiện + lưu 1 mục mới từ tin nhắn này (nếu có), rồi lấy những gì
+    # đã ghi nhớ trước đó để cá nhân hoá câu trả lời.
+    new_memory = extract_and_save_memory(user_id, user_message)
+    recent_memories = get_recent_memories(user_id)
+
     system_prompt = f"""
     Bạn là StudyMate AI Pro, gia sư THCS (lớp 6-9) tận tâm.
     Môn học: {subject}. Chế độ: {mode}.
@@ -3030,6 +3460,16 @@ def chat():
     4. Với công thức/phép toán: LUÔN đặt trong cú pháp LaTeX chuẩn — công thức trên
        dòng riêng thì bọc trong "$$...$$", công thức ngắn giữa câu thì bọc trong
        "\\(...\\)". Không viết công thức dưới dạng chữ thường lẫn trong đoạn văn.
+    """
+
+    if recent_memories:
+        mem_lines = "\n".join(f"    - {m}" for m in recent_memories)
+        system_prompt += f"""
+
+    Những điều Thầy/Cô đã ghi nhớ về học sinh này từ các lần trò chuyện trước:
+{mem_lines}
+    Hãy tận dụng thông tin này để cá nhân hoá câu trả lời khi phù hợp (vd: đúng trình độ
+    lớp học), nhưng đừng nhắc lại y nguyên nếu không cần thiết.
     """
 
     if file_context:
@@ -3059,6 +3499,8 @@ def chat():
 
     def generate():
         yield f"data: {json.dumps({'conversationId': conv_id})}\n\n"
+        if new_memory:
+            yield f"data: {json.dumps({'memory': new_memory})}\n\n"
         collected = []
         try:
             for token in stream_consolex_ai(system_prompt, user_content):
