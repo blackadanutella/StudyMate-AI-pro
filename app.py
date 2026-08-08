@@ -41,7 +41,7 @@ except ImportError:
 load_dotenv()  # đọc các biến từ file .env cùng thư mục (nếu có)
 
 app = Flask(__name__)
-app.config['MAX_CONTENT_LENGTH'] = 15 * 1024 * 1024  # giới hạn upload 15MB
+app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024  # giới hạn upload cứng ở tầng Flask/Werkzeug (áp dụng cho mọi tài khoản, kể cả Admin — xem ghi chú "không giới hạn" trong README)
 app.config['SESSION_COOKIE_HTTPONLY'] = True
 app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
 
@@ -165,8 +165,7 @@ def init_db():
             FOREIGN KEY (user_id) REFERENCES users (id)
         )
     ''')
-    conn.commit()
-
+    # "Dự án" (giống Claude Projects) — nhóm các đoạn chat lại theo chủ đề của riêng từng tài khoản.
     conn.execute('''
         CREATE TABLE IF NOT EXISTS projects (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -176,39 +175,11 @@ def init_db():
             FOREIGN KEY (user_id) REFERENCES users (id)
         )
     ''')
+    # Cấu hình hệ thống dạng key-value (thông báo chung, bật/tắt tính năng...) do developer chỉnh.
     conn.execute('''
-        CREATE TABLE IF NOT EXISTS system_settings (
+        CREATE TABLE IF NOT EXISTS settings (
             key TEXT PRIMARY KEY,
             value TEXT
-        )
-    ''')
-    conn.commit()
-
-    # Báo lỗi từ học sinh — mỗi báo cáo gắn với 1 câu trả lời cụ thể (nếu có) để developer xem lại.
-    conn.execute('''
-        CREATE TABLE IF NOT EXISTS issue_reports (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            conversation_id INTEGER,
-            message_excerpt TEXT,
-            description TEXT NOT NULL,
-            status TEXT NOT NULL DEFAULT 'open',
-            created_at TEXT NOT NULL,
-            resolved_at TEXT,
-            FOREIGN KEY (user_id) REFERENCES users (id)
-        )
-    ''')
-    # "Bộ nhớ" AI — những điều đáng nhớ về 1 học sinh (học sinh chủ động nhờ ghi nhớ, hoặc
-    # hệ thống tự nhận diện vài tín hiệu đơn giản như lớp học). Dùng để cá nhân hoá câu trả
-    # lời ở các lượt chat sau, và cũng được tổng hợp lại cho developer xem ở trang thống kê.
-    conn.execute('''
-        CREATE TABLE IF NOT EXISTS memories (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            content TEXT NOT NULL,
-            source TEXT NOT NULL DEFAULT 'auto',
-            created_at TEXT NOT NULL,
-            FOREIGN KEY (user_id) REFERENCES users (id)
         )
     ''')
     conn.commit()
@@ -217,17 +188,6 @@ def init_db():
     existing_cols = [r[1] for r in conn.execute('PRAGMA table_info(users)').fetchall()]
     if 'role' not in existing_cols:
         conn.execute("ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT 'user'")
-        conn.commit()
-    if 'preferences' not in existing_cols:
-        conn.execute("ALTER TABLE users ADD COLUMN preferences TEXT")
-        conn.commit()
-
-    conv_cols = [r[1] for r in conn.execute('PRAGMA table_info(conversations)').fetchall()]
-    if 'pinned' not in conv_cols:
-        conn.execute("ALTER TABLE conversations ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0")
-        conn.commit()
-    if 'project_id' not in conv_cols:
-        conn.execute("ALTER TABLE conversations ADD COLUMN project_id INTEGER")
         conn.commit()
 
     # ---- Di trú cho đăng nhập Google (OAuth) ----
@@ -247,6 +207,74 @@ def init_db():
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_users_oauth ON users (oauth_provider, oauth_id) "
         "WHERE oauth_provider IS NOT NULL"
     )
+    conn.commit()
+
+    # ---- Di trú: tuỳ chỉnh cá nhân theo tài khoản (giao diện, ngôn ngữ, môn/chế độ mặc định) ----
+    if 'preferences' not in existing_cols:
+        conn.execute("ALTER TABLE users ADD COLUMN preferences TEXT DEFAULT '{}'")
+        conn.commit()
+
+    # ---- Di trú: Ghim đoạn chat + gom vào "Dự án" (giống Claude Projects) ----
+    conv_cols = [r[1] for r in conn.execute('PRAGMA table_info(conversations)').fetchall()]
+    if 'pinned' not in conv_cols:
+        conn.execute("ALTER TABLE conversations ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0")
+        conn.commit()
+    if 'project_id' not in conv_cols:
+        conn.execute("ALTER TABLE conversations ADD COLUMN project_id INTEGER")
+        conn.commit()
+
+    # ---- Di trú: hệ thống vai trò 4 cấp (user → developer → admin → super_admin) ----
+    # Khoá tài khoản (is_locked/lock_reason) + "reset session" (session_version: tăng số này
+    # sẽ làm mọi phiên đăng nhập cũ của tài khoản đó tự động bị đăng xuất ở lần request kế tiếp).
+    existing_cols = [r[1] for r in conn.execute('PRAGMA table_info(users)').fetchall()]
+    if 'is_locked' not in existing_cols:
+        conn.execute("ALTER TABLE users ADD COLUMN is_locked INTEGER NOT NULL DEFAULT 0")
+        conn.commit()
+    if 'lock_reason' not in existing_cols:
+        conn.execute("ALTER TABLE users ADD COLUMN lock_reason TEXT DEFAULT ''")
+        conn.commit()
+    if 'session_version' not in existing_cols:
+        conn.execute("ALTER TABLE users ADD COLUMN session_version INTEGER NOT NULL DEFAULT 0")
+        conn.commit()
+
+    # "AI Tutor" tuỳ chỉnh do developer trở lên tự tạo (tên + system prompt riêng).
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS custom_tutors (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            owner_id INTEGER NOT NULL,
+            name TEXT NOT NULL,
+            system_prompt TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (owner_id) REFERENCES users (id)
+        )
+    ''')
+    # API Key cho developer trở lên — chỉ lưu bản băm (hash), không bao giờ lưu key gốc.
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS api_keys (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            name TEXT NOT NULL,
+            key_prefix TEXT NOT NULL,
+            key_hash TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            last_used_at TEXT,
+            revoked INTEGER NOT NULL DEFAULT 0,
+            FOREIGN KEY (user_id) REFERENCES users (id)
+        )
+    ''')
+    # Nhật ký thao tác nhạy cảm (đổi vai trò, khoá tài khoản, xoá tài khoản, cấu hình hệ thống...)
+    # — chỉ Super Admin xem được, phục vụ truy vết trách nhiệm (audit trail).
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS audit_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            actor_id INTEGER,
+            actor_username TEXT,
+            action TEXT NOT NULL,
+            target TEXT DEFAULT '',
+            detail TEXT DEFAULT '',
+            created_at TEXT NOT NULL
+        )
+    ''')
     conn.commit()
 
     # ---- Tạo (hoặc nâng cấp) tài khoản developer ----
@@ -278,6 +306,18 @@ def init_db():
         else:
             print("   Mật khẩu: lấy từ DEVELOPER_PASSWORD trong .env")
 
+    # ---- Nâng tài khoản chỉ định thành Super Admin ----
+    # Super Admin đứng trên cùng hệ thống phân quyền (bao hàm mọi quyền của Admin/Developer/User).
+    # Tên tài khoản lấy từ .env (SUPER_ADMIN_USERNAME) — mặc định "BlackadaNutella" theo yêu cầu.
+    # Chỉ áp dụng nếu tài khoản đã tồn tại sẵn — không tự tạo tài khoản mới ở đây vì không có
+    # mật khẩu do người dùng đặt để gán vào.
+    super_admin_username = (os.environ.get('SUPER_ADMIN_USERNAME', '') or 'BlackadaNutella').strip()
+    sa_row = conn.execute('SELECT id, role FROM users WHERE username = ?', (super_admin_username,)).fetchone()
+    if sa_row and sa_row[1] != 'super_admin':
+        conn.execute("UPDATE users SET role = 'super_admin' WHERE id = ?", (sa_row[0],))
+        conn.commit()
+        print(f"👑 Đã nâng tài khoản '{super_admin_username}' thành Super Admin (có toàn bộ quyền, kể cả Developer).")
+
     conn.close()
 
 
@@ -301,42 +341,160 @@ def now_iso():
 
 
 # ==========================================
-# 0.2. XÁC THỰC NGƯỜI DÙNG (session-based)
+# 0.2. HỆ THỐNG VAI TRÒ (4 cấp, mỗi cấp bao hàm quyền của cấp dưới)
 # ==========================================
+# user < developer < admin < super_admin.
+# Super Admin có TẤT CẢ quyền của Admin, Admin có TẤT CẢ quyền của Developer, v.v.
+# (không cần gán nhiều vai trò cùng lúc — 1 cột "role" duy nhất, cấp cao hơn tự động
+# thừa hưởng quyền của cấp thấp hơn thông qua role_rank()).
+ROLE_ORDER = ['user', 'developer', 'admin', 'super_admin']
+ROLE_META = {
+    'user':        {'label': 'Người dùng', 'icon': '🧑‍🎓',
+                     'badge': 'bg-gray-100 text-gray-500 dark:bg-gray-800 dark:text-gray-400'},
+    'developer':   {'label': 'Developer',  'icon': '🧑‍💻',
+                     'badge': 'bg-indigo-100 text-indigo-600 dark:bg-indigo-900 dark:text-indigo-300'},
+    'admin':       {'label': 'Admin',      'icon': '👑',
+                     'badge': 'bg-amber-100 text-amber-700 dark:bg-amber-900 dark:text-amber-300'},
+    'super_admin': {'label': 'Super Admin', 'icon': '🔥',
+                     'badge': 'bg-red-100 text-red-600 dark:bg-red-900 dark:text-red-300'},
+}
+
+
+def role_rank(role):
+    try:
+        return ROLE_ORDER.index(role)
+    except ValueError:
+        return 0
+
+
+def role_meta(role):
+    return ROLE_META.get(role, ROLE_META['user'])
+
+
+def can_manage_role(actor_role, target_role, new_role):
+    """Quy tắc: chỉ Super Admin được đụng tới vai trò Admin/Super Admin (cấp hoặc thu hồi).
+    Admin chỉ được đổi qua lại giữa User <-> Developer. Không ai được hạ quyền Super Admin
+    qua giao diện này (an toàn hệ thống — phải sửa trực tiếp trong DB nếu thực sự cần)."""
+    if new_role not in ROLE_ORDER:
+        return False, "Vai trò không hợp lệ."
+    if target_role == 'super_admin' and new_role != 'super_admin':
+        return False, "Không thể hạ quyền Super Admin qua giao diện này."
+    if actor_role != 'super_admin':
+        if role_rank(target_role) >= role_rank('admin'):
+            return False, "Chỉ Super Admin mới có thể thay đổi vai trò của Admin/Super Admin."
+        if role_rank(new_role) >= role_rank('admin'):
+            return False, "Chỉ Super Admin mới có thể cấp quyền Admin trở lên."
+    return True, None
+
+
+def write_audit(action, target='', detail=''):
+    """Ghi log các thao tác nhạy cảm (đổi vai trò, khoá tài khoản, cấu hình hệ thống...).
+    Chỉ Super Admin xem được (trang /developer/audit)."""
+    try:
+        db = get_db()
+        actor = current_user()
+        db.execute(
+            'INSERT INTO audit_logs (actor_id, actor_username, action, target, detail, created_at) '
+            'VALUES (?, ?, ?, ?, ?, ?)',
+            (actor['id'] if actor else None, actor['username'] if actor else 'system',
+             action, target, detail, now_iso())
+        )
+        db.commit()
+    except Exception:
+        pass
+
+
+# ==========================================
+# 0.3. XÁC THỰC NGƯỜI DÙNG (session-based)
+# ==========================================
+def current_user():
+    """Nạp thông tin tài khoản hiện tại từ DB 1 lần / request (cache trong g)."""
+    if not hasattr(g, '_current_user'):
+        uid = session.get('user_id')
+        g._current_user = None
+        if uid:
+            g._current_user = get_db().execute('SELECT * FROM users WHERE id = ?', (uid,)).fetchone()
+    return g._current_user
+
+
 def current_user_id():
     return session.get('user_id')
 
 
 def current_user_role():
-    return session.get('role', 'user')
+    u = current_user()
+    return u['role'] if u else 'user'
+
+
+def _auth_gate(min_role=None):
+    """Kiểm tra: đã đăng nhập? tài khoản có bị khoá? phiên có bị admin reset không?
+    có đủ cấp vai trò tối thiểu không? Trả về response lỗi nếu vi phạm, None nếu hợp lệ."""
+    if not session.get('user_id'):
+        if request.path.startswith('/api/'):
+            return jsonify({"error": "Vui lòng đăng nhập để tiếp tục."}), 401
+        return redirect(url_for('login_page', next=request.path))
+
+    user = current_user()
+    if not user:
+        session.clear()
+        if request.path.startswith('/api/'):
+            return jsonify({"error": "Phiên đăng nhập không hợp lệ."}), 401
+        return redirect(url_for('login_page'))
+
+    if user['is_locked']:
+        session.clear()
+        if request.path.startswith('/api/'):
+            return jsonify({"error": "Tài khoản của bạn đã bị khoá."}), 403
+        flash('Tài khoản của em đã bị khoá. Liên hệ quản trị viên nếu có thắc mắc.')
+        return redirect(url_for('login_page'))
+
+    if session.get('session_version') != user['session_version']:
+        session.clear()
+        if request.path.startswith('/api/'):
+            return jsonify({"error": "Phiên đăng nhập đã được đặt lại. Vui lòng đăng nhập lại."}), 401
+        flash('Phiên đăng nhập của em đã được đặt lại, vui lòng đăng nhập lại.')
+        return redirect(url_for('login_page'))
+
+    if min_role and role_rank(user['role']) < role_rank(min_role):
+        if request.path.startswith('/api/'):
+            return jsonify({"error": "Bạn không có quyền truy cập chức năng này."}), 403
+        flash('Tài khoản của em không có quyền truy cập trang này.')
+        return redirect(url_for('home'))
+
+    return None
 
 
 def login_required(view):
     @wraps(view)
     def wrapped(*args, **kwargs):
-        if not current_user_id():
-            if request.path.startswith('/api/'):
-                return jsonify({"error": "Vui lòng đăng nhập để tiếp tục."}), 401
-            return redirect(url_for('login_page', next=request.path))
-        return view(*args, **kwargs)
+        err = _auth_gate()
+        return err if err is not None else view(*args, **kwargs)
     return wrapped
 
 
 def developer_required(view):
-    """Chỉ cho phép tài khoản có role = 'developer' truy cập (vd: trang thống kê)."""
+    """Từ Developer trở lên (Developer / Admin / Super Admin)."""
     @wraps(view)
     def wrapped(*args, **kwargs):
-        wants_json = request.path.startswith('/api/') or request.method != 'GET'
-        if not current_user_id():
-            if wants_json:
-                return jsonify({"error": "Vui lòng đăng nhập để tiếp tục."}), 401
-            return redirect(url_for('login_page', next=request.path))
-        if current_user_role() != 'developer':
-            if wants_json:
-                return jsonify({"error": "Bạn không có quyền truy cập chức năng này."}), 403
-            flash('Tài khoản của em không có quyền truy cập trang này.')
-            return redirect(url_for('home'))
-        return view(*args, **kwargs)
+        err = _auth_gate(min_role='developer')
+        return err if err is not None else view(*args, **kwargs)
+    return wrapped
+
+
+def admin_required(view):
+    """Từ Admin trở lên (Admin / Super Admin)."""
+    @wraps(view)
+    def wrapped(*args, **kwargs):
+        err = _auth_gate(min_role='admin')
+        return err if err is not None else view(*args, **kwargs)
+    return wrapped
+
+
+def super_admin_required(view):
+    @wraps(view)
+    def wrapped(*args, **kwargs):
+        err = _auth_gate(min_role='super_admin')
+        return err if err is not None else view(*args, **kwargs)
     return wrapped
 
 
@@ -358,150 +516,70 @@ def log_usage(user_id, subject, mode, message_chars, response_chars, had_file, h
 
 
 # ==========================================
-# 0.3. TÙY CHỌN NGƯỜI DÙNG (preferences), DỰ ÁN (projects), CÀI ĐẶT HỆ THỐNG
+# 0.3. CẤU HÌNH HỆ THỐNG (settings key-value) — do developer chỉnh qua /developer
 # ==========================================
-DEFAULT_PREFERENCES = {
-    "theme": "system",       # light | dark | system
-    "language": "vi",        # vi | en
-    "default_subject": "",
-    "default_mode": "",
-}
-
-
-def get_preferences(user_id):
-    db = get_db()
-    row = db.execute('SELECT preferences FROM users WHERE id = ?', (user_id,)).fetchone()
-    prefs = dict(DEFAULT_PREFERENCES)
-    if row and row['preferences']:
-        try:
-            prefs.update(json.loads(row['preferences']))
-        except Exception:
-            pass
-    return prefs
-
-
-def set_preferences(user_id, updates):
-    prefs = get_preferences(user_id)
-    for k in DEFAULT_PREFERENCES:
-        if k in updates:
-            prefs[k] = updates[k]
-    db = get_db()
-    db.execute('UPDATE users SET preferences = ? WHERE id = ?', (json.dumps(prefs), user_id))
-    db.commit()
-    return prefs
-
-
 def get_setting(key, default=None):
     db = get_db()
-    row = db.execute('SELECT value FROM system_settings WHERE key = ?', (key,)).fetchone()
-    if row is None:
-        return default
-    return row['value']
+    row = db.execute('SELECT value FROM settings WHERE key = ?', (key,)).fetchone()
+    return row['value'] if row and row['value'] is not None else default
 
 
 def set_setting(key, value):
     db = get_db()
     db.execute(
-        'INSERT INTO system_settings (key, value) VALUES (?, ?) '
+        'INSERT INTO settings (key, value) VALUES (?, ?) '
         'ON CONFLICT(key) DO UPDATE SET value = excluded.value',
         (key, value)
     )
     db.commit()
 
 
-def google_login_effective():
-    """Cờ bật/tắt đăng nhập Google tại runtime, do developer điều khiển, độc lập với .env.
-    Giá trị trong system_settings: 'on' / 'off' / (không đặt = theo cấu hình .env mặc định)."""
-    if not GOOGLE_OAUTH_ENABLED:
-        return False
-    override = get_setting('google_login_override')
+def google_login_effective_enabled():
+    """Developer có thể tạm tắt nút đăng nhập Google từ trang /developer mà không cần
+    sửa .env. Nếu chưa từng đặt override, hành vi mặc định vẫn theo cấu hình .env."""
+    override = get_setting('google_login_override', '')
     if override == 'off':
         return False
     if override == 'on':
-        return True
-    return True  # mặc định: bật nếu .env đã cấu hình client id/secret
-
-
-def get_banner():
-    return {
-        "text": get_setting('banner_text', '') or '',
-        "active": get_setting('banner_active', '0') == '1',
-    }
+        return bool(GOOGLE_OAUTH_ENABLED)  # không thể "bật" nếu chưa có Client ID/Secret
+    return GOOGLE_OAUTH_ENABLED
 
 
 # ==========================================
-# 0.4. "BỘ NHỚ" AI (memories) — cá nhân hoá + báo lỗi (issue reports)
+# 0.4. TUỲ CHỈNH CÁ NHÂN (preferences theo tài khoản)
 # ==========================================
-# Học sinh chủ động nhờ AI ghi nhớ điều gì đó, ví dụ: "ghi nhớ giúp em là em học lớp 8"
-# hoặc "hãy nhớ mình sắp thi học kỳ môn Hóa". Không cần gọi thêm API AI nào — chỉ dùng
-# regex đơn giản, chạy nhanh và không tốn chi phí.
-MEMORY_TRIGGER_RE = re.compile(
-    r'(?:ghi\s*nhớ|hãy\s*nhớ|nhớ\s*giúp|note\s*giúp|lưu\s*ý\s*giúp)(?:\s*(?:em|mình|giúp|rằng|là))*\s*[:,-]?\s*(.+)',
-    re.IGNORECASE
-)
-GRADE_LEVEL_RE = re.compile(r'\blớp\s*(6|7|8|9)\b', re.IGNORECASE)
-MAX_MEMORY_LEN = 300
-MAX_MEMORIES_IN_PROMPT = 5
+PREFERENCE_DEFAULTS = {
+    'theme': 'system',            # 'light' | 'dark' | 'system'
+    'language': 'vi',             # 'vi' | 'en'
+    'default_subject': 'Toán',
+    'default_mode': 'Giải thích',
+}
+ALLOWED_PREFERENCE_KEYS = set(PREFERENCE_DEFAULTS.keys())
 
 
-def save_memory(user_id, content, source='auto'):
-    """Lưu 1 mục bộ nhớ cho học sinh. Không để lỗi ở đây ảnh hưởng tới luồng chat chính."""
-    content = (content or '').strip()
-    if not content:
-        return
-    content = content[:MAX_MEMORY_LEN]
-    try:
-        db = get_db()
-        db.execute(
-            'INSERT INTO memories (user_id, content, source, created_at) VALUES (?, ?, ?, ?)',
-            (user_id, content, source, now_iso())
-        )
-        db.commit()
-    except Exception:
-        pass
-
-
-def extract_and_save_memory(user_id, user_message):
-    """Phát hiện + lưu 1 'bộ nhớ' mới từ tin nhắn của học sinh (nếu có).
-    Trả về nội dung vừa ghi nhớ (để báo lại cho học sinh biết), hoặc None nếu không có gì."""
-    text = (user_message or '').strip()
-    if not text:
-        return None
-
-    # 1) Học sinh chủ động yêu cầu ghi nhớ — ưu tiên cao nhất.
-    m = MEMORY_TRIGGER_RE.search(text)
-    if m:
-        content = m.group(1).strip(' .!?')
-        if content:
-            save_memory(user_id, content, source='explicit')
-            return content
-
-    # 2) Tự nhận diện lớp học (chỉ lưu 1 lần, tránh lặp lại mỗi khi học sinh gõ "lớp 8").
-    g = GRADE_LEVEL_RE.search(text)
-    if g:
-        try:
-            db = get_db()
-            existing = db.execute(
-                "SELECT id FROM memories WHERE user_id = ? AND content LIKE 'Học sinh đang học lớp%'",
-                (user_id,)
-            ).fetchone()
-            if not existing:
-                content = f"Học sinh đang học lớp {g.group(1)}."
-                save_memory(user_id, content, source='auto')
-                return content
-        except Exception:
-            pass
-
-    return None
-
-
-def get_recent_memories(user_id, limit=MAX_MEMORIES_IN_PROMPT):
+def get_user_preferences(user_id):
     db = get_db()
-    rows = db.execute(
-        'SELECT content FROM memories WHERE user_id = ? ORDER BY created_at DESC LIMIT ?',
-        (user_id, limit)
-    ).fetchall()
-    return [r['content'] for r in reversed(rows)]  # cũ -> mới, đọc tự nhiên hơn trong prompt
+    row = db.execute('SELECT preferences FROM users WHERE id = ?', (user_id,)).fetchone()
+    raw = row['preferences'] if row and row['preferences'] else '{}'
+    try:
+        prefs = json.loads(raw)
+        if not isinstance(prefs, dict):
+            prefs = {}
+    except Exception:
+        prefs = {}
+    merged = dict(PREFERENCE_DEFAULTS)
+    merged.update({k: v for k, v in prefs.items() if k in ALLOWED_PREFERENCE_KEYS})
+    return merged
+
+
+def save_user_preferences(user_id, updates):
+    prefs = get_user_preferences(user_id)
+    if isinstance(updates, dict):
+        prefs.update({k: v for k, v in updates.items() if k in ALLOWED_PREFERENCE_KEYS and isinstance(v, str)})
+    db = get_db()
+    db.execute('UPDATE users SET preferences = ? WHERE id = ?', (json.dumps(prefs, ensure_ascii=False), user_id))
+    db.commit()
+    return prefs
 
 
 # ==========================================
@@ -645,9 +723,6 @@ HTML = r'''
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>StudyMate AI Pro - Gia sư THCS</title>
-  <link rel="manifest" href="/static/manifest.json">
-  <meta name="theme-color" content="#4f46e5">
-  <link rel="apple-touch-icon" href="/static/icons/icon-192.png">
   <script src="https://cdn.tailwindcss.com"></script>
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.6.0/css/all.min.css">
   <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
@@ -671,27 +746,10 @@ HTML = r'''
     .ai-content pre { background: #1e293b; color: #e2e8f0; padding: 0.9rem; border-radius: 0.75rem; overflow-x: auto; margin-bottom: 0.6rem; }
     .ai-content pre code { background: transparent; padding: 0; }
 
-    .typing-indicator span {
-      display: inline-block; width: 7px; height: 7px; border-radius: 50%; margin: 0 2px;
-      background: linear-gradient(135deg, #3b82f6, #6366f1);
-      box-shadow: 0 0 7px rgba(99,102,241,0.6);
-      animation: typingBounce 1.3s infinite ease-in-out both;
-    }
-    .typing-indicator span:nth-child(1) { animation-delay: -0.28s; }
-    .typing-indicator span:nth-child(2) { animation-delay: -0.14s; }
-    @keyframes typingBounce {
-      0%, 80%, 100% { transform: scale(0.55) translateY(0); opacity: 0.55; }
-      40% { transform: scale(1.05) translateY(-3px); opacity: 1; }
-    }
-    .typing-label {
-      font-size: 0.78rem; color: #9ca3af; letter-spacing: .01em;
-      animation: typingLabelPulse 1.9s ease-in-out infinite;
-    }
-    @keyframes typingLabelPulse { 0%, 100% { opacity: 0.55; } 50% { opacity: 1; } }
-    @media (prefers-reduced-motion: reduce) {
-      .typing-indicator span { animation: none; opacity: 0.85; }
-      .typing-label { animation: none; opacity: 0.8; }
-    }
+    .typing-indicator span { display: inline-block; width: 6px; height: 6px; background-color: #9ca3af; border-radius: 50%; margin: 0 2px; animation: bounce 1.4s infinite ease-in-out both; }
+    .typing-indicator span:nth-child(1) { animation-delay: -0.32s; }
+    .typing-indicator span:nth-child(2) { animation-delay: -0.16s; }
+    @keyframes bounce { 0%, 80%, 100% { transform: scale(0); } 40% { transform: scale(1); } }
 
     .stream-cursor { display: inline-block; width: 2px; height: 1em; background: currentColor; margin-left: 2px; vertical-align: text-bottom; animation: blink 0.9s steps(1) infinite; }
     @keyframes blink { 50% { opacity: 0; } }
@@ -721,86 +779,22 @@ HTML = r'''
 
     .attachment-chip img { border: 1px solid rgba(0,0,0,0.08); }
 
-    .msg-actions { opacity: 0; transition: opacity 0.15s; }
-    /* addMessageActions() inserts the actions bar as a SIBLING right after the
-       .ai-msg-group wrapper (wrapper.after(bar)), not as a child of it — so a
-       descendant selector like ".ai-msg-group:hover .msg-actions" never matches
-       and the "Báo lỗi" button stayed invisible (opacity: 0) forever, even though
-       it was in the DOM and technically clickable. Use the general sibling
-       combinator (~) instead, and also show it on its own hover/focus so touch
-       devices (which have no :hover on the message) and keyboard users can reach it. */
-    .msg-actions.force-visible,
-    .ai-msg-group:hover ~ .msg-actions,
-    .msg-actions:hover,
-    .msg-actions:focus-within { opacity: 1; }
-
-    /* ---------- Avatar "suy nghĩ" (shimmer chạy từ dưới lên trên) ----------
-       Cùng ý tưởng với hiệu ứng shimmer khi Claude đang suy nghĩ, nhưng thay vì
-       quét ngang qua chữ, ở đây một dải sáng quét dọc từ DƯỚI lên TRÊN, lặp lại,
-       trên chính avatar robot — dùng làm avatar chung của cả website (sidebar,
-       khung chat, chỉ báo đang gõ). Khi AI đang trả lời (class .thinking), dải
-       sáng chạy nhanh & rõ hơn; lúc rảnh (brand-avatar ở sidebar) nó chạy chậm,
-       mờ hơn như một nhịp "thở" cho logo. */
-    .ai-avatar { position: relative; overflow: hidden; isolation: isolate; }
-    .ai-avatar::after {
-      content: '';
-      position: absolute; inset: -60% -20%;
-      background: linear-gradient(0deg,
-        transparent 0%,
-        rgba(255,255,255,0) 38%,
-        rgba(255,255,255,0.95) 50%,
-        rgba(255,255,255,0) 62%,
-        transparent 100%);
-      background-size: 100% 260%;
-      background-position: 0% 160%;
-      mix-blend-mode: overlay;
-      opacity: 0;
-      pointer-events: none;
-      will-change: background-position, opacity;
-    }
-    .ai-avatar.thinking::after { opacity: 1; animation: avatarShimmerUp 1.3s ease-in-out infinite; }
-    .ai-avatar.brand-avatar::after { opacity: 0.55; animation: avatarShimmerUp 3.4s ease-in-out infinite; }
-    @keyframes avatarShimmerUp {
-      0%   { background-position: 0% 160%; }
-      100% { background-position: 0% -160%; }
-    }
-    @media (prefers-reduced-motion: reduce) {
-      .ai-avatar.thinking::after, .ai-avatar.brand-avatar::after { animation: none; opacity: 0.35; }
-    }
-
-    @keyframes memoryToastFade {
-      0% { opacity: 0; transform: translate(-50%, 6px); }
-      10%, 85% { opacity: 1; transform: translate(-50%, 0); }
-      100% { opacity: 0; transform: translate(-50%, 6px); }
-    }
-    .memory-toast { animation: memoryToastFade 3.5s ease forwards; }
-
-    /* ---- Modal system ---- */
-    #modalOverlay.open { display: flex; }
-    .modal-card.open { display: block; }
-    .conv-item { position: relative; }
-    .conv-menu-btn { opacity: 0; }
-    .conv-item:hover .conv-menu-btn, .conv-menu-btn.force-visible { opacity: 1; }
-    .conv-menu-dropdown {
-      position: absolute; right: 0; top: 100%; margin-top: 4px; z-index: 30;
-      min-width: 160px; background: white; border: 1px solid #e5e7eb; border-radius: 0.75rem;
-      box-shadow: 0 10px 25px rgba(0,0,0,0.12); overflow: hidden;
-    }
-    .dark .conv-menu-dropdown { background: #1f2937; border-color: #374151; }
-    .conv-menu-dropdown button {
-      width: 100%; text-align: left; padding: 0.5rem 0.9rem; font-size: 0.8rem;
-      display: flex; align-items: center; gap: 0.5rem;
-    }
-    .conv-menu-dropdown button:hover { background: rgba(0,0,0,0.05); }
-    .dark .conv-menu-dropdown button:hover { background: rgba(255,255,255,0.08); }
-
     #sidebar { transition: transform 0.2s ease; }
     @media (max-width: 1023px) { #sidebar { transform: translateX(-100%); } #sidebar.open { transform: translateX(0); } }
 
-    .conv-item .del-btn { opacity: 0; }
-    .conv-item:hover .del-btn { opacity: 1; }
+    .conv-item .conv-actions { opacity: 0; }
+    .conv-item:hover .conv-actions { opacity: 1; }
 
     textarea#messageInput { max-height: 160px; }
+
+    .modal-panel { animation: modalIn 0.15s ease; }
+    @keyframes modalIn { from { opacity: 0; transform: translateY(8px) scale(0.98); } to { opacity: 1; transform: translateY(0) scale(1); } }
+    .theme-opt { border-color: #e5e7eb; color: inherit; }
+    .dark .theme-opt { border-color: #374151; }
+    .theme-opt.active { border-color: #3b82f6; background: rgba(59,130,246,0.08); color: #2563eb; }
+    .dark .theme-opt.active { color: #93c5fd; }
+
+    .conv-menu { position: absolute; z-index: 45; min-width: 180px; }
   </style>
 </head>
 <body class="h-screen overflow-hidden bg-white dark:bg-[#212121] text-gray-800 dark:text-gray-100">
@@ -811,7 +805,7 @@ HTML = r'''
   <aside id="sidebar" class="fixed lg:static inset-y-0 left-0 z-50 w-72 flex-shrink-0 bg-gray-50 dark:bg-[#171717] border-r border-gray-200 dark:border-gray-800 flex flex-col">
     <div class="p-3 flex items-center justify-between">
       <div class="flex items-center gap-2 px-1">
-        <div class="ai-avatar brand-avatar w-8 h-8 rounded-lg bg-gradient-to-br from-blue-600 to-indigo-600 flex items-center justify-center text-white text-sm"><i class="fas fa-robot"></i></div>
+        <div class="w-8 h-8 rounded-lg bg-gradient-to-br from-blue-600 to-indigo-600 flex items-center justify-center text-white font-bold text-sm">S</div>
         <span class="font-bold text-base">StudyMate AI</span>
       </div>
       <button id="closeSidebarBtn" class="lg:hidden w-8 h-8 flex items-center justify-center rounded-lg hover:bg-gray-200 dark:hover:bg-gray-800 text-gray-500">
@@ -825,31 +819,34 @@ HTML = r'''
       </button>
       <div class="relative">
         <i class="fas fa-magnifying-glass absolute left-3 top-1/2 -translate-y-1/2 text-gray-400 text-xs"></i>
-        <input id="convSearchInput" type="text" data-i18n-placeholder="search_chats" placeholder="Tìm đoạn chat..."
-               class="w-full pl-8 pr-3 py-2 text-sm rounded-xl bg-gray-100 dark:bg-gray-800 border-0 focus:outline-none focus:ring-2 focus:ring-blue-500 dark:text-white">
+        <input id="searchInput" type="text" placeholder="Tìm đoạn chat..." data-i18n-placeholder="search_placeholder"
+          class="w-full pl-8 pr-3 py-2 text-sm bg-gray-100 dark:bg-gray-800 border-0 rounded-xl focus:outline-none focus:ring-2 focus:ring-blue-500 dark:text-white">
       </div>
     </div>
 
-    <div class="px-3 mt-4 mb-1 flex items-center justify-between">
-      <span class="text-xs font-semibold text-gray-400 uppercase tracking-wide" data-i18n="projects">Dự án</span>
-      <button id="newProjectBtn" class="w-5 h-5 flex items-center justify-center rounded hover:bg-gray-200 dark:hover:bg-gray-800 text-gray-400" title="Tạo dự án mới">
-        <i class="fas fa-plus text-xs"></i>
-      </button>
-    </div>
-    <div id="projectList" class="px-3 space-y-0.5 text-sm"></div>
+    <div class="flex-1 overflow-y-auto px-3 pb-3 mt-3 space-y-4 text-sm">
+      <!-- Dự án (giống Claude Projects) -->
+      <div>
+        <div class="flex items-center justify-between mb-1 px-1">
+          <span class="text-xs font-semibold text-gray-400 uppercase tracking-wide" data-i18n="projects">Dự án</span>
+          <button id="newProjectBtn" class="w-5 h-5 flex items-center justify-center rounded hover:bg-gray-200 dark:hover:bg-gray-800 text-gray-400" title="Tạo dự án mới">
+            <i class="fas fa-plus text-xs"></i>
+          </button>
+        </div>
+        <div id="projectList" class="space-y-1"></div>
+      </div>
 
-    <div id="pinnedSection" class="hidden">
-      <div class="px-3 mt-4 mb-1 text-xs font-semibold text-gray-400 uppercase tracking-wide" data-i18n="pinned">Đã ghim</div>
-      <div id="pinnedList" class="px-3 space-y-0.5 text-sm"></div>
-    </div>
+      <!-- Đã ghim -->
+      <div id="pinnedSection" class="hidden">
+        <div class="text-xs font-semibold text-gray-400 uppercase tracking-wide mb-1 px-1" data-i18n="pinned">Đã ghim</div>
+        <div id="pinnedList" class="space-y-1"></div>
+      </div>
 
-    <div class="px-3 mt-4 mb-1 text-xs font-semibold text-gray-400 uppercase tracking-wide" data-i18n="recent">Gần đây</div>
-    <div id="convList" class="flex-1 overflow-y-auto px-3 pb-3 space-y-0.5 text-sm"></div>
-
-    <div id="systemBanner" class="hidden mx-3 mb-2 px-3 py-2 rounded-lg bg-indigo-50 dark:bg-indigo-900/30 border border-indigo-200 dark:border-indigo-800 text-xs text-indigo-700 dark:text-indigo-300 flex items-start gap-2">
-      <i class="fas fa-bullhorn mt-0.5"></i>
-      <span id="systemBannerText" class="flex-1"></span>
-      <button id="systemBannerClose" class="text-indigo-400 hover:text-indigo-600 flex-shrink-0"><i class="fas fa-xmark"></i></button>
+      <!-- Gần đây -->
+      <div>
+        <div class="text-xs font-semibold text-gray-400 uppercase tracking-wide mb-1 px-1" data-i18n="recents">Gần đây</div>
+        <div id="convList" class="space-y-1"></div>
+      </div>
     </div>
 
     <div class="border-t border-gray-200 dark:border-gray-800 p-3 relative">
@@ -859,126 +856,27 @@ HTML = r'''
         <i class="fas fa-chevron-up text-xs text-gray-400"></i>
       </button>
       <div id="userMenu" class="hidden absolute bottom-[64px] left-3 right-3 bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-xl shadow-lg overflow-hidden z-10">
-        <button id="openSettingsBtn" type="button" class="w-full flex items-center gap-2 px-4 py-3 text-sm hover:bg-gray-100 dark:hover:bg-gray-700 text-left">
-          <i class="fas fa-gear text-gray-400 w-4"></i> <span data-i18n="settings">Cài đặt</span>
-        </button>
-        <button id="openHelpBtn" type="button" class="w-full flex items-center gap-2 px-4 py-3 text-sm hover:bg-gray-100 dark:hover:bg-gray-700 text-left">
-          <i class="fas fa-circle-question text-gray-400 w-4"></i> <span data-i18n="help">Trợ giúp &amp; phím tắt</span>
-        </button>
-        <button id="openUpgradeBtn" type="button" class="w-full flex items-center gap-2 px-4 py-3 text-sm hover:bg-gray-100 dark:hover:bg-gray-700 text-left border-b border-gray-100 dark:border-gray-700">
-          <i class="fas fa-arrow-up-right-dots text-gray-400 w-4"></i> <span data-i18n="upgrade">Nâng cấp gói</span>
-        </button>
         {% if is_developer %}
         <a href="/developer" class="flex items-center gap-2 px-4 py-3 text-sm hover:bg-gray-100 dark:hover:bg-gray-700 text-indigo-600 dark:text-indigo-400 border-b border-gray-100 dark:border-gray-700">
-          <i class="fas fa-chart-line w-4"></i> Thống kê (Developer)
+          <i class="fas fa-chart-line"></i> Thống kê (Developer)
         </a>
         {% endif %}
-        <a href="/logout" class="flex items-center gap-2 px-4 py-3 text-sm hover:bg-gray-100 dark:hover:bg-gray-700 text-red-600 dark:text-red-400">
+        <button type="button" onclick="openModal('settingsModal')" class="w-full flex items-center gap-2 px-4 py-3 text-sm hover:bg-gray-100 dark:hover:bg-gray-700 text-left">
+          <i class="fas fa-gear w-4 text-gray-400"></i> <span data-i18n="settings">Cài đặt</span>
+        </button>
+        <button type="button" onclick="openModal('helpModal')" class="w-full flex items-center gap-2 px-4 py-3 text-sm hover:bg-gray-100 dark:hover:bg-gray-700 text-left border-t border-gray-100 dark:border-gray-700">
+          <i class="fas fa-circle-question w-4 text-gray-400"></i> <span data-i18n="help">Trợ giúp &amp; phím tắt</span>
+        </button>
+        <button type="button" onclick="openModal('upgradeModal')" class="w-full flex items-center gap-2 px-4 py-3 text-sm hover:bg-gray-100 dark:hover:bg-gray-700 text-left border-t border-gray-100 dark:border-gray-700">
+          <i class="fas fa-bolt w-4 text-amber-500"></i> <span data-i18n="upgrade">Nâng cấp gói</span>
+        </button>
+        <a href="/logout" class="flex items-center gap-2 px-4 py-3 text-sm hover:bg-gray-100 dark:hover:bg-gray-700 text-red-600 dark:text-red-400 border-t border-gray-100 dark:border-gray-700">
           <i class="fas fa-right-from-bracket w-4"></i> <span data-i18n="logout">Đăng xuất</span>
         </a>
       </div>
     </div>
   </aside>
   <div id="sidebarOverlay" class="hidden fixed inset-0 bg-black/40 z-40 lg:hidden"></div>
-
-  <!-- ===================== MODALS ===================== -->
-  <div id="modalOverlay" class="hidden fixed inset-0 bg-black/50 z-[60] flex items-center justify-center p-4">
-
-    <div id="settingsModal" class="modal-card hidden bg-white dark:bg-gray-900 rounded-2xl shadow-2xl w-full max-w-md max-h-[85vh] overflow-y-auto">
-      <div class="flex items-center justify-between px-5 py-4 border-b border-gray-200 dark:border-gray-800">
-        <h3 class="font-semibold text-lg" data-i18n="settings">Cài đặt</h3>
-        <button class="modal-close-btn text-gray-400 hover:text-gray-600 w-8 h-8 flex items-center justify-center"><i class="fas fa-xmark"></i></button>
-      </div>
-      <div class="p-5 space-y-5 text-sm">
-        <div>
-          <label class="block font-medium mb-1.5" data-i18n="theme">Giao diện</label>
-          <select id="settingTheme" class="w-full px-3 py-2 rounded-lg bg-gray-100 dark:bg-gray-800 border-0 focus:outline-none focus:ring-2 focus:ring-blue-500 dark:text-white">
-            <option value="light" data-i18n="theme_light">Sáng</option>
-            <option value="dark" data-i18n="theme_dark">Tối</option>
-            <option value="system" data-i18n="theme_system">Theo hệ thống</option>
-          </select>
-        </div>
-        <div>
-          <label class="block font-medium mb-1.5" data-i18n="language">Ngôn ngữ</label>
-          <select id="settingLanguage" class="w-full px-3 py-2 rounded-lg bg-gray-100 dark:bg-gray-800 border-0 focus:outline-none focus:ring-2 focus:ring-blue-500 dark:text-white">
-            <option value="vi">Tiếng Việt</option>
-            <option value="en">English</option>
-          </select>
-        </div>
-        <div>
-          <label class="block font-medium mb-1.5" data-i18n="default_subject">Môn học mặc định</label>
-          <select id="settingDefaultSubject" class="w-full px-3 py-2 rounded-lg bg-gray-100 dark:bg-gray-800 border-0 focus:outline-none focus:ring-2 focus:ring-blue-500 dark:text-white">
-            <option value="">— <span data-i18n="none">Không</span> —</option>
-            <option value="Toán">📐 Toán Học</option>
-            <option value="Ngữ Văn">📖 Ngữ Văn</option>
-            <option value="Tiếng Anh">🇬🇧 Tiếng Anh</option>
-            <option value="Vật Lý">⚛️ Vật Lý</option>
-            <option value="Hóa Học">🧪 Hóa Học</option>
-            <option value="Sinh Học">🌱 Sinh Học</option>
-            <option value="Lịch sử & Địa lý">🌍 Lịch sử & Địa lý</option>
-            <option value="Tin Học">💻 Tin Học</option>
-          </select>
-        </div>
-        <div>
-          <label class="block font-medium mb-1.5" data-i18n="default_mode">Chế độ mặc định</label>
-          <select id="settingDefaultMode" class="w-full px-3 py-2 rounded-lg bg-gray-100 dark:bg-gray-800 border-0 focus:outline-none focus:ring-2 focus:ring-blue-500 dark:text-white">
-            <option value="">— <span data-i18n="none">Không</span> —</option>
-            <option value="Giải thích">📘 Giải Thích Dễ Hiểu</option>
-            <option value="Gợi ý">💡 Gợi Ý Từng Bước</option>
-            <option value="Kiểm tra bài làm">✅ Kiểm Tra Bài Làm</option>
-            <option value="Luyện tập">📝 Ra Bài Luyện Tập</option>
-            <option value="Ôn tập">🔄 Tổng Hợp Ôn Tập</option>
-          </select>
-        </div>
-        <div class="pt-3 border-t border-gray-200 dark:border-gray-800 space-y-2">
-          <button id="deleteAllHistoryBtn" class="w-full flex items-center justify-center gap-2 px-4 py-2.5 rounded-lg bg-red-50 dark:bg-red-900/30 text-red-600 dark:text-red-400 hover:bg-red-100 dark:hover:bg-red-900/50 font-medium text-sm">
-            <i class="fas fa-trash-can"></i> <span data-i18n="delete_all_history">Xoá toàn bộ lịch sử</span>
-          </button>
-          <button id="clearMemoriesBtn" class="w-full flex items-center justify-center gap-2 px-4 py-2.5 rounded-lg bg-purple-50 dark:bg-purple-900/30 text-purple-600 dark:text-purple-400 hover:bg-purple-100 dark:hover:bg-purple-900/50 font-medium text-sm">
-            <i class="fas fa-brain"></i> <span data-i18n="clear_my_memories">Xoá bộ nhớ AI của tôi</span>
-          </button>
-        </div>
-      </div>
-    </div>
-
-    <div id="helpModal" class="modal-card hidden bg-white dark:bg-gray-900 rounded-2xl shadow-2xl w-full max-w-md max-h-[85vh] overflow-y-auto">
-      <div class="flex items-center justify-between px-5 py-4 border-b border-gray-200 dark:border-gray-800">
-        <h3 class="font-semibold text-lg" data-i18n="help">Trợ giúp &amp; phím tắt</h3>
-        <button class="modal-close-btn text-gray-400 hover:text-gray-600 w-8 h-8 flex items-center justify-center"><i class="fas fa-xmark"></i></button>
-      </div>
-      <div class="p-5 space-y-3 text-sm">
-        <div class="flex items-center justify-between"><span data-i18n="shortcut_new_chat">Đoạn chat mới</span><kbd class="px-2 py-1 rounded bg-gray-100 dark:bg-gray-800 text-xs font-mono">Ctrl/Cmd + K</kbd></div>
-        <div class="flex items-center justify-between"><span data-i18n="shortcut_help">Mở trợ giúp</span><kbd class="px-2 py-1 rounded bg-gray-100 dark:bg-gray-800 text-xs font-mono">Ctrl/Cmd + /</kbd></div>
-        <div class="flex items-center justify-between"><span data-i18n="shortcut_close">Đóng hộp thoại</span><kbd class="px-2 py-1 rounded bg-gray-100 dark:bg-gray-800 text-xs font-mono">Esc</kbd></div>
-        <div class="flex items-center justify-between"><span data-i18n="shortcut_send">Gửi câu hỏi</span><kbd class="px-2 py-1 rounded bg-gray-100 dark:bg-gray-800 text-xs font-mono">Enter</kbd></div>
-      </div>
-    </div>
-
-    <div id="upgradeModal" class="modal-card hidden bg-white dark:bg-gray-900 rounded-2xl shadow-2xl w-full max-w-md max-h-[85vh] overflow-y-auto">
-      <div class="flex items-center justify-between px-5 py-4 border-b border-gray-200 dark:border-gray-800">
-        <h3 class="font-semibold text-lg" data-i18n="upgrade">Nâng cấp gói</h3>
-        <button class="modal-close-btn text-gray-400 hover:text-gray-600 w-8 h-8 flex items-center justify-center"><i class="fas fa-xmark"></i></button>
-      </div>
-      <div class="p-5 text-sm text-gray-500 dark:text-gray-400 space-y-3">
-        <p data-i18n="upgrade_preview">Tính năng nâng cấp gói đang được xây dựng và hiện chưa hỗ trợ thanh toán. Đây chỉ là bản xem trước giao diện.</p>
-      </div>
-    </div>
-
-    <div id="reportIssueModal" class="modal-card hidden bg-white dark:bg-gray-900 rounded-2xl shadow-2xl w-full max-w-md max-h-[85vh] overflow-y-auto">
-      <div class="flex items-center justify-between px-5 py-4 border-b border-gray-200 dark:border-gray-800">
-        <h3 class="font-semibold text-lg" data-i18n="report_issue">Báo lỗi câu trả lời</h3>
-        <button class="modal-close-btn text-gray-400 hover:text-gray-600 w-8 h-8 flex items-center justify-center"><i class="fas fa-xmark"></i></button>
-      </div>
-      <div class="p-5 space-y-3 text-sm">
-        <p class="text-xs text-gray-400" data-i18n="report_issue_desc">Cho Thầy/Cô biết câu trả lời này có vấn đề gì (sai kiến thức, khó hiểu, lạc đề...) để đội ngũ StudyMate cải thiện AI nhé.</p>
-        <textarea id="reportIssueText" rows="4" maxlength="1000" data-i18n-placeholder="report_issue_placeholder" placeholder="Mô tả vấn đề em gặp phải..."
-          class="w-full px-3 py-2 rounded-lg bg-gray-100 dark:bg-gray-800 border-0 focus:outline-none focus:ring-2 focus:ring-red-500 dark:text-white resize-none"></textarea>
-        <button id="reportIssueSubmitBtn" class="w-full px-4 py-2.5 rounded-lg bg-red-600 hover:bg-red-700 disabled:opacity-50 text-white text-sm font-medium" data-i18n="send_report">Gửi báo cáo</button>
-        <p id="reportIssueStatus" class="text-xs text-green-600 hidden" data-i18n="report_sent">Đã gửi báo cáo, cảm ơn em! ✓</p>
-      </div>
-    </div>
-
-  </div>
 
   <!-- ===================== MAIN ===================== -->
   <div class="flex-1 flex flex-col min-w-0">
@@ -1012,13 +910,16 @@ HTML = r'''
       <button onclick="startVoice()" class="w-9 h-9 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-800 text-gray-600 dark:text-gray-300 flex items-center justify-center" title="Trợ lý giọng nói">
         <i class="fas fa-microphone"></i>
       </button>
-      <button id="installAppBtn" style="display:none;" class="w-9 h-9 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-800 text-gray-600 dark:text-gray-300 flex items-center justify-center" title="Cài đặt StudyMate như ứng dụng">
-        <i class="fas fa-download"></i>
-      </button>
       <button onclick="toggleTheme()" class="w-9 h-9 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-800 text-gray-600 dark:text-gray-300 flex items-center justify-center" title="Đổi giao diện">
         <i id="themeIcon" class="fas fa-moon"></i>
       </button>
     </header>
+
+    <div id="bannerBar" class="hidden items-center gap-2 px-4 py-2 bg-amber-50 dark:bg-amber-900/30 border-b border-amber-200 dark:border-amber-800 text-amber-800 dark:text-amber-200 text-sm">
+      <i class="fas fa-bullhorn flex-shrink-0"></i>
+      <span id="bannerText" class="flex-1"></span>
+      <button onclick="dismissBanner()" class="w-6 h-6 flex items-center justify-center rounded hover:bg-amber-200/60 dark:hover:bg-amber-800/60 flex-shrink-0"><i class="fas fa-xmark text-xs"></i></button>
+    </div>
 
     <div id="chatPanel" class="flex-1 overflow-y-auto scroll-smooth">
       <div class="drag-overlay">
@@ -1049,10 +950,132 @@ HTML = r'''
   </div>
 </div>
 
+<!-- ===================== MODALS ===================== -->
+<div id="modalBackdrop" class="hidden fixed inset-0 bg-black/50 z-[60] flex items-center justify-center p-4" onclick="if(event.target===this) closeAllModals()">
+
+  <!-- Cài đặt -->
+  <div id="settingsModal" class="hidden modal-panel bg-white dark:bg-gray-800 rounded-2xl shadow-2xl w-full max-w-md max-h-[85vh] overflow-y-auto">
+    <div class="flex items-center justify-between px-5 py-4 border-b border-gray-100 dark:border-gray-700">
+      <h3 class="font-bold text-lg flex items-center gap-2"><i class="fas fa-gear text-gray-400"></i> Cài đặt</h3>
+      <button onclick="closeAllModals()" class="w-8 h-8 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 flex items-center justify-center"><i class="fas fa-xmark"></i></button>
+    </div>
+    <div class="p-5 space-y-5">
+      <div>
+        <label class="text-sm font-semibold block mb-2">Giao diện</label>
+        <div class="grid grid-cols-3 gap-2" id="themeOptions">
+          <button type="button" data-theme="light" class="theme-opt px-3 py-2 rounded-xl border text-sm font-medium">☀️ Sáng</button>
+          <button type="button" data-theme="dark" class="theme-opt px-3 py-2 rounded-xl border text-sm font-medium">🌙 Tối</button>
+          <button type="button" data-theme="system" class="theme-opt px-3 py-2 rounded-xl border text-sm font-medium">💻 Hệ thống</button>
+        </div>
+      </div>
+      <div>
+        <label class="text-sm font-semibold block mb-2">Ngôn ngữ / Language</label>
+        <select id="languageSelect" class="w-full px-3 py-2.5 rounded-xl bg-gray-100 dark:bg-gray-700 border-0 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 dark:text-white">
+          <option value="vi">Tiếng Việt</option>
+          <option value="en">English</option>
+        </select>
+      </div>
+      <div class="grid grid-cols-2 gap-3">
+        <div>
+          <label class="text-sm font-semibold block mb-2">Môn học mặc định</label>
+          <select id="defaultSubjectSelect" class="w-full px-3 py-2.5 rounded-xl bg-gray-100 dark:bg-gray-700 border-0 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 dark:text-white">
+            <option value="Toán">Toán Học</option>
+            <option value="Ngữ Văn">Ngữ Văn</option>
+            <option value="Tiếng Anh">Tiếng Anh</option>
+            <option value="Vật Lý">Vật Lý</option>
+            <option value="Hóa Học">Hóa Học</option>
+            <option value="Sinh Học">Sinh Học</option>
+            <option value="Lịch sử & Địa lý">Lịch sử & Địa lý</option>
+            <option value="Tin Học">Tin Học</option>
+          </select>
+        </div>
+        <div>
+          <label class="text-sm font-semibold block mb-2">Chế độ mặc định</label>
+          <select id="defaultModeSelect" class="w-full px-3 py-2.5 rounded-xl bg-gray-100 dark:bg-gray-700 border-0 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 dark:text-white">
+            <option value="Giải thích">Giải Thích</option>
+            <option value="Gợi ý">Gợi Ý</option>
+            <option value="Kiểm tra bài làm">Kiểm Tra</option>
+            <option value="Luyện tập">Luyện Tập</option>
+            <option value="Ôn tập">Ôn Tập</option>
+          </select>
+        </div>
+      </div>
+      <div id="settingsSavedMsg" class="hidden text-sm text-emerald-600 dark:text-emerald-400 flex items-center gap-1"><i class="fas fa-check"></i> Đã lưu</div>
+      <button onclick="savePreferences()" class="w-full bg-blue-600 hover:bg-blue-700 text-white font-semibold py-2.5 rounded-xl transition-colors">Lưu thay đổi</button>
+
+      <div class="border-t border-gray-100 dark:border-gray-700 pt-4">
+        <p class="text-xs font-semibold text-red-500 uppercase mb-2">Khu vực nguy hiểm</p>
+        <button onclick="clearAllHistory()" class="w-full bg-red-50 dark:bg-red-900/20 hover:bg-red-100 dark:hover:bg-red-900/40 text-red-600 dark:text-red-400 font-medium py-2.5 rounded-xl text-sm transition-colors">
+          <i class="fas fa-trash mr-1"></i> Xoá toàn bộ lịch sử trò chuyện
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Trợ giúp -->
+  <div id="helpModal" class="hidden modal-panel bg-white dark:bg-gray-800 rounded-2xl shadow-2xl w-full max-w-md max-h-[85vh] overflow-y-auto">
+    <div class="flex items-center justify-between px-5 py-4 border-b border-gray-100 dark:border-gray-700">
+      <h3 class="font-bold text-lg flex items-center gap-2"><i class="fas fa-circle-question text-gray-400"></i> Trợ giúp &amp; phím tắt</h3>
+      <button onclick="closeAllModals()" class="w-8 h-8 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 flex items-center justify-center"><i class="fas fa-xmark"></i></button>
+    </div>
+    <div class="p-5 space-y-5 text-sm">
+      <div>
+        <p class="font-semibold mb-2">Phím tắt</p>
+        <div class="space-y-1.5">
+          <div class="flex justify-between"><span class="text-gray-500">Gửi câu hỏi</span><kbd class="px-2 py-0.5 bg-gray-100 dark:bg-gray-700 rounded text-xs font-mono">Enter</kbd></div>
+          <div class="flex justify-between"><span class="text-gray-500">Xuống dòng</span><kbd class="px-2 py-0.5 bg-gray-100 dark:bg-gray-700 rounded text-xs font-mono">Shift + Enter</kbd></div>
+          <div class="flex justify-between"><span class="text-gray-500">Đoạn chat mới</span><kbd class="px-2 py-0.5 bg-gray-100 dark:bg-gray-700 rounded text-xs font-mono">Ctrl/⌘ + K</kbd></div>
+          <div class="flex justify-between"><span class="text-gray-500">Mở trợ giúp</span><kbd class="px-2 py-0.5 bg-gray-100 dark:bg-gray-700 rounded text-xs font-mono">Ctrl/⌘ + /</kbd></div>
+        </div>
+      </div>
+      <div>
+        <p class="font-semibold mb-2">Câu hỏi thường gặp</p>
+        <div class="space-y-3 text-gray-600 dark:text-gray-300">
+          <div><p class="font-medium text-gray-800 dark:text-gray-100">StudyMate đọc được file gì?</p><p>PDF, Word (.docx), .txt, .csv và ảnh (PNG/JPG/GIF/WEBP) — kéo-thả trực tiếp vào khung chat hoặc bấm nút 📎.</p></div>
+          <div><p class="font-medium text-gray-800 dark:text-gray-100">Dữ liệu của em có bị mất không?</p><p>Lịch sử trò chuyện được lưu theo tài khoản, vẫn còn khi em đăng nhập lại trên thiết bị khác.</p></div>
+          <div><p class="font-medium text-gray-800 dark:text-gray-100">"Dự án" dùng để làm gì?</p><p>Gom các đoạn chat cùng chủ đề (vd: "Ôn thi Học kỳ 2") lại một chỗ cho dễ tìm, giống thư mục.</p></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Nâng cấp gói -->
+  <div id="upgradeModal" class="hidden modal-panel bg-white dark:bg-gray-800 rounded-2xl shadow-2xl w-full max-w-lg max-h-[85vh] overflow-y-auto">
+    <div class="flex items-center justify-between px-5 py-4 border-b border-gray-100 dark:border-gray-700">
+      <h3 class="font-bold text-lg flex items-center gap-2"><i class="fas fa-bolt text-amber-500"></i> Nâng cấp gói</h3>
+      <button onclick="closeAllModals()" class="w-8 h-8 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 flex items-center justify-center"><i class="fas fa-xmark"></i></button>
+    </div>
+    <div class="p-5">
+      <p class="text-xs text-center text-gray-400 mb-4">🚧 Đây là bản xem trước — chưa có thanh toán thật, chỉ để minh hoạ hướng phát triển.</p>
+      <div class="grid sm:grid-cols-2 gap-4">
+        <div class="border border-gray-200 dark:border-gray-700 rounded-2xl p-4">
+          <p class="font-bold">Free</p>
+          <p class="text-2xl font-extrabold my-2">0₫</p>
+          <ul class="text-sm text-gray-500 space-y-1.5 mb-4">
+            <li><i class="fas fa-check text-emerald-500 mr-1.5"></i> Chat không giới hạn số đoạn</li>
+            <li><i class="fas fa-check text-emerald-500 mr-1.5"></i> Đọc file & ảnh</li>
+            <li><i class="fas fa-check text-emerald-500 mr-1.5"></i> Dự án &amp; ghim đoạn chat</li>
+          </ul>
+          <button disabled class="w-full py-2 rounded-xl bg-gray-100 dark:bg-gray-700 text-gray-400 text-sm font-semibold">Gói hiện tại</button>
+        </div>
+        <div class="border-2 border-blue-500 rounded-2xl p-4 relative">
+          <span class="absolute -top-2.5 left-4 bg-blue-500 text-white text-[10px] font-bold px-2 py-0.5 rounded-full">SẮP RA MẮT</span>
+          <p class="font-bold">Pro</p>
+          <p class="text-2xl font-extrabold my-2">—</p>
+          <ul class="text-sm text-gray-500 space-y-1.5 mb-4">
+            <li><i class="fas fa-check text-emerald-500 mr-1.5"></i> Phản hồi ưu tiên, tốc độ cao hơn</li>
+            <li><i class="fas fa-check text-emerald-500 mr-1.5"></i> Giới hạn câu hỏi/ngày cao hơn</li>
+            <li><i class="fas fa-check text-emerald-500 mr-1.5"></i> Hỗ trợ ưu tiên</li>
+          </ul>
+          <button disabled class="w-full py-2 rounded-xl bg-blue-200 dark:bg-blue-900 text-blue-500 dark:text-blue-300 text-sm font-semibold cursor-not-allowed">Chưa khả dụng</button>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
 <script>
 const CURRENT_USERNAME = {{ username|tojson }};
-let PREFERENCES = {{ preferences|tojson }};
-const INITIAL_BANNER = {{ banner|tojson }};
 let uploadedFileContext = "";
 let uploadedFileName = "";
 let uploadedImageDataUrl = "";
@@ -1060,22 +1083,7 @@ let uploadedImageName = "";
 let currentConversationId = null;
 const html = document.documentElement;
 
-// QUAN TRỌNG: marked được nạp từ CDN (dòng <script src="...marked...">). Nếu mạng của
-// người dùng chặn CDN đó (trình duyệt chặn quảng cáo, mạng trường/công ty lọc domain lạ,
-// mạng chập chờn...) thì biến `marked` sẽ không tồn tại. Gọi thẳng marked.setOptions() lúc
-// đó sẽ ném lỗi "marked is not defined" và làm DỪNG LUÔN toàn bộ đoạn <script> này — mọi
-// dòng addEventListener() nằm phía dưới (kể cả nút "Đoạn chat mới") sẽ KHÔNG BAO GIỜ được
-// gắn, dẫn tới bấm nút không phản hồi gì. Bọc try/catch để lỗi (nếu có) không lan ra ngoài.
-try { marked.setOptions({ breaks: true }); } catch (e) { console.error('marked chưa tải được:', e); }
-
-// Dùng hàm này thay vì gọi marked.parse() trực tiếp — tự động lùi về hiển thị chữ thường
-// (có xuống dòng) nếu vì lý do gì đó marked chưa sẵn sàng, thay vì làm vỡ cả trang.
-function safeMarkdown(text) {
-  try {
-    if (typeof marked !== 'undefined') return marked.parse(text);
-  } catch (e) { console.error('Lỗi render markdown:', e); }
-  return escapeHtml(text).replace(/\n/g, '<br>');
-}
+marked.setOptions({ breaks: true });
 
 // Dựng công thức toán ($$...$$, \(...\), \[...\]) thành hiển thị đẹp bằng KaTeX.
 // throwOnError:false để không vỡ lỗi khi công thức đang gõ dở (lúc đang stream) —
@@ -1096,235 +1104,19 @@ function renderMathIn(el) {
   }
 }
 
-// ---------- PWA: cài app vào máy/điện thoại ----------
-// Đăng ký từ /sw.js (route riêng ở backend, KHÔNG phải file tĩnh trong static/) để scope
-// mặc định của service worker là toàn site "/" chứ không chỉ trong /static/.
-if ('serviceWorker' in navigator) {
-  window.addEventListener('load', () => {
-    navigator.serviceWorker.register('/sw.js').catch(e => console.error('SW lỗi:', e));
-  });
-}
-let deferredInstallPrompt = null;
-const installBtn = document.getElementById('installAppBtn');
-// Sự kiện này chỉ Chrome/Edge/Android bắn ra khi trang đủ điều kiện cài (có manifest hợp lệ +
-// service worker). Safari/iOS không hỗ trợ API này -> nút sẽ tự động luôn ẩn trên iOS, người
-// dùng cài qua Share -> "Thêm vào MH chính" như bình thường của Safari.
-window.addEventListener('beforeinstallprompt', (e) => {
-  e.preventDefault();
-  deferredInstallPrompt = e;
-  if (installBtn) installBtn.style.display = 'flex';
-});
-if (installBtn) {
-  installBtn.addEventListener('click', async () => {
-    if (!deferredInstallPrompt) return;
-    installBtn.style.display = 'none';
-    deferredInstallPrompt.prompt();
-    await deferredInstallPrompt.userChoice;
-    deferredInstallPrompt = null;
-  });
-}
-window.addEventListener('appinstalled', () => { if (installBtn) installBtn.style.display = 'none'; });
-
 document.getElementById('userNameLabel').textContent = CURRENT_USERNAME;
 document.getElementById('userAvatar').textContent = (CURRENT_USERNAME || '?').trim().charAt(0).toUpperCase();
 
-// ---------- i18n (nhẹ) ----------
-const I18N = {
-  vi: {
-    new_chat: 'Đoạn chat mới', search_chats: 'Tìm đoạn chat...', projects: 'Dự án', pinned: 'Đã ghim',
-    recent: 'Gần đây', settings: 'Cài đặt', help: 'Trợ giúp & phím tắt', upgrade: 'Nâng cấp gói',
-    logout: 'Đăng xuất', theme: 'Giao diện', theme_light: 'Sáng', theme_dark: 'Tối', theme_system: 'Theo hệ thống',
-    language: 'Ngôn ngữ', default_subject: 'Môn học mặc định', default_mode: 'Chế độ mặc định', none: 'Không',
-    delete_all_history: 'Xoá toàn bộ lịch sử', shortcut_new_chat: 'Đoạn chat mới', shortcut_help: 'Mở trợ giúp',
-    shortcut_close: 'Đóng hộp thoại', shortcut_send: 'Gửi câu hỏi',
-    upgrade_preview: 'Tính năng nâng cấp gói đang được xây dựng và hiện chưa hỗ trợ thanh toán. Đây chỉ là bản xem trước giao diện.',
-    clear_my_memories: 'Xoá bộ nhớ AI của tôi', report_issue: 'Báo lỗi câu trả lời',
-    report_issue_desc: 'Cho Thầy/Cô biết câu trả lời này có vấn đề gì (sai kiến thức, khó hiểu, lạc đề...) để đội ngũ StudyMate cải thiện AI nhé.',
-    report_issue_placeholder: 'Mô tả vấn đề em gặp phải...', send_report: 'Gửi báo cáo',
-    report_sent: 'Đã gửi báo cáo, cảm ơn em! ✓', report_btn: 'Báo lỗi',
-  },
-  en: {
-    new_chat: 'New chat', search_chats: 'Search chats...', projects: 'Projects', pinned: 'Pinned',
-    recent: 'Recent', settings: 'Settings', help: 'Help & shortcuts', upgrade: 'Upgrade plan',
-    logout: 'Log out', theme: 'Theme', theme_light: 'Light', theme_dark: 'Dark', theme_system: 'System',
-    language: 'Language', default_subject: 'Default subject', default_mode: 'Default mode', none: 'None',
-    delete_all_history: 'Delete all history', shortcut_new_chat: 'New chat', shortcut_help: 'Open help',
-    shortcut_close: 'Close dialog', shortcut_send: 'Send message',
-    upgrade_preview: 'The upgrade flow is a UI preview only — no billing is implemented yet.',
-    clear_my_memories: 'Clear my AI memories', report_issue: 'Report an answer',
-    report_issue_desc: 'Tell us what went wrong with this answer (wrong info, confusing, off-topic...) so we can improve the AI.',
-    report_issue_placeholder: 'Describe the problem...', send_report: 'Send report',
-    report_sent: 'Report sent, thank you! ✓', report_btn: 'Report',
-  },
-};
-function applyLanguage(lang) {
-  const dict = I18N[lang] || I18N.vi;
-  document.querySelectorAll('[data-i18n]').forEach(el => {
-    const key = el.getAttribute('data-i18n');
-    if (dict[key]) el.textContent = dict[key];
-  });
-  document.querySelectorAll('[data-i18n-placeholder]').forEach(el => {
-    const key = el.getAttribute('data-i18n-placeholder');
-    if (dict[key]) el.placeholder = dict[key];
-  });
-}
-
-// ---------- Theme (đồng bộ với preferences) ----------
-function applyTheme(mode) {
-  const icon = document.getElementById('themeIcon');
-  const prefersDark = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
-  const isDark = mode === 'dark' || (mode === 'system' && prefersDark);
-  html.classList.toggle('dark', isDark);
-  if (icon) { icon.classList.toggle('fa-sun', isDark); icon.classList.toggle('fa-moon', !isDark); }
-}
 function toggleTheme() {
-  const isDark = html.classList.contains('dark');
-  const newMode = isDark ? 'light' : 'dark';
-  PREFERENCES.theme = newMode;
-  applyTheme(newMode);
-  savePreferences({ theme: newMode });
-  const sel = document.getElementById('settingTheme');
-  if (sel) sel.value = newMode;
+  // Nút bật/tắt nhanh trên thanh trên — chuyển thẳng sáng/tối và lưu lại vào Cài đặt
+  // của tài khoản để lần đăng nhập sau vẫn giữ nguyên lựa chọn.
+  const nowDark = !html.classList.contains('dark');
+  applyTheme(nowDark ? 'dark' : 'light');
+  fetch('/api/preferences', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ theme: nowDark ? 'dark' : 'light' })
+  }).then(res => res.ok ? res.json() : null).then(prefs => { if (prefs) currentPreferences = prefs; }).catch(() => {});
 }
-
-async function savePreferences(updates) {
-  try {
-    const res = await fetch('/api/preferences', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(updates)
-    });
-    if (res.ok) PREFERENCES = await res.json();
-  } catch (e) { /* im lặng bỏ qua lỗi mạng */ }
-}
-
-function applyPreferencesToUI() {
-  applyTheme(PREFERENCES.theme || 'system');
-  applyLanguage(PREFERENCES.language || 'vi');
-  const themeSel = document.getElementById('settingTheme');
-  const langSel = document.getElementById('settingLanguage');
-  const subjSel = document.getElementById('settingDefaultSubject');
-  const modeSel = document.getElementById('settingDefaultMode');
-  if (themeSel) themeSel.value = PREFERENCES.theme || 'system';
-  if (langSel) langSel.value = PREFERENCES.language || 'vi';
-  if (subjSel) subjSel.value = PREFERENCES.default_subject || '';
-  if (modeSel) modeSel.value = PREFERENCES.default_mode || '';
-  if (PREFERENCES.default_subject) {
-    const s = document.getElementById('subject');
-    if (s && [...s.options].some(o => o.value === PREFERENCES.default_subject)) s.value = PREFERENCES.default_subject;
-  }
-  if (PREFERENCES.default_mode) {
-    const m = document.getElementById('modeSelect');
-    if (m && [...m.options].some(o => o.value === PREFERENCES.default_mode)) m.value = PREFERENCES.default_mode;
-  }
-}
-applyPreferencesToUI();
-if (window.matchMedia) {
-  window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => {
-    if (PREFERENCES.theme === 'system') applyTheme('system');
-  });
-}
-
-document.getElementById('settingTheme').addEventListener('change', (e) => {
-  PREFERENCES.theme = e.target.value; applyTheme(e.target.value); savePreferences({ theme: e.target.value });
-});
-document.getElementById('settingLanguage').addEventListener('change', (e) => {
-  PREFERENCES.language = e.target.value; applyLanguage(e.target.value); savePreferences({ language: e.target.value });
-});
-document.getElementById('settingDefaultSubject').addEventListener('change', (e) => {
-  PREFERENCES.default_subject = e.target.value; savePreferences({ default_subject: e.target.value });
-});
-document.getElementById('settingDefaultMode').addEventListener('change', (e) => {
-  PREFERENCES.default_mode = e.target.value; savePreferences({ default_mode: e.target.value });
-});
-document.getElementById('deleteAllHistoryBtn').addEventListener('click', async () => {
-  const msg = (I18N[PREFERENCES.language || 'vi'].delete_all_history) + '?';
-  if (!confirm(msg + ' ' + (PREFERENCES.language === 'en' ? 'This cannot be undone.' : 'Hành động này không thể hoàn tác.'))) return;
-  try {
-    await fetch('/api/conversations/delete-all', { method: 'POST' });
-    newChat();
-  } catch (e) { /* im lặng bỏ qua lỗi mạng */ }
-});
-
-document.getElementById('clearMemoriesBtn').addEventListener('click', async () => {
-  const isEn = PREFERENCES.language === 'en';
-  if (!confirm(isEn ? 'Clear all AI memories about you? This cannot be undone.' : 'Xoá toàn bộ bộ nhớ AI về em? Hành động này không thể hoàn tác.')) return;
-  try {
-    await fetch('/api/memories', { method: 'DELETE' });
-    alert(isEn ? 'Cleared.' : 'Đã xoá xong.');
-  } catch (e) { /* im lặng bỏ qua lỗi mạng */ }
-});
-
-document.getElementById('reportIssueSubmitBtn').addEventListener('click', async () => {
-  const textEl = document.getElementById('reportIssueText');
-  const statusEl = document.getElementById('reportIssueStatus');
-  const description = textEl.value.trim();
-  if (!description) { textEl.focus(); return; }
-  const btn = document.getElementById('reportIssueSubmitBtn');
-  btn.disabled = true;
-  try {
-    const res = await fetch('/api/report-issue', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        conversationId: reportContext.conversationId,
-        messageExcerpt: reportContext.messageExcerpt,
-        description
-      })
-    });
-    if (res.ok) {
-      statusEl.classList.remove('hidden');
-      setTimeout(closeModal, 1200);
-    } else {
-      const data = await res.json().catch(() => ({}));
-      alert(data.error || 'Không gửi được báo cáo.');
-    }
-  } catch (err) {
-    alert('Lỗi mạng khi gửi báo cáo.');
-  } finally {
-    btn.disabled = false;
-  }
-});
-
-// ---------- Modal system ---------- 
-const modalOverlay = document.getElementById('modalOverlay');
-function openModal(id) {
-  modalOverlay.classList.add('open');
-  document.querySelectorAll('.modal-card').forEach(c => c.classList.remove('open'));
-  document.getElementById(id).classList.add('open');
-}
-function closeModal() {
-  modalOverlay.classList.remove('open');
-  document.querySelectorAll('.modal-card').forEach(c => c.classList.remove('open'));
-}
-modalOverlay.addEventListener('click', (e) => { if (e.target === modalOverlay) closeModal(); });
-document.querySelectorAll('.modal-close-btn').forEach(btn => btn.addEventListener('click', closeModal));
-document.getElementById('openSettingsBtn').addEventListener('click', () => { userMenu.classList.add('hidden'); openModal('settingsModal'); });
-document.getElementById('openHelpBtn').addEventListener('click', () => { userMenu.classList.add('hidden'); openModal('helpModal'); });
-document.getElementById('openUpgradeBtn').addEventListener('click', () => { userMenu.classList.add('hidden'); openModal('upgradeModal'); });
-
-// ---------- Phím tắt ----------
-document.addEventListener('keydown', (e) => {
-  const cmd = e.ctrlKey || e.metaKey;
-  if (cmd && e.key.toLowerCase() === 'k') { e.preventDefault(); newChat(); }
-  else if (cmd && e.key === '/') { e.preventDefault(); openModal('helpModal'); }
-  else if (e.key === 'Escape') { closeModal(); }
-});
-
-// ---------- Banner hệ thống ----------
-function renderBanner(banner) {
-  const el = document.getElementById('systemBanner');
-  const dismissedText = sessionStorage.getItem('bannerDismissedText');
-  if (banner && banner.active && banner.text && banner.text !== dismissedText) {
-    document.getElementById('systemBannerText').textContent = banner.text;
-    el.classList.remove('hidden');
-  } else {
-    el.classList.add('hidden');
-  }
-}
-renderBanner(INITIAL_BANNER);
-document.getElementById('systemBannerClose').addEventListener('click', () => {
-  const text = document.getElementById('systemBannerText').textContent;
-  sessionStorage.setItem('bannerDismissedText', text);
-  document.getElementById('systemBanner').classList.add('hidden');
-});
 
 // ---------- Sidebar (mobile) ----------
 const sidebar = document.getElementById('sidebar');
@@ -1340,6 +1132,148 @@ const userMenuBtn = document.getElementById('userMenuBtn');
 const userMenu = document.getElementById('userMenu');
 userMenuBtn.addEventListener('click', (e) => { e.stopPropagation(); userMenu.classList.toggle('hidden'); });
 document.addEventListener('click', () => userMenu.classList.add('hidden'));
+
+// ---------- Modals (Cài đặt / Trợ giúp / Nâng cấp) ----------
+const modalBackdrop = document.getElementById('modalBackdrop');
+function openModal(id) {
+  userMenu.classList.add('hidden');
+  document.querySelectorAll('.modal-panel').forEach(m => m.classList.add('hidden'));
+  document.getElementById(id).classList.remove('hidden');
+  modalBackdrop.classList.remove('hidden');
+  modalBackdrop.classList.add('flex');
+}
+function closeAllModals() {
+  modalBackdrop.classList.add('hidden');
+  modalBackdrop.classList.remove('flex');
+  document.querySelectorAll('.modal-panel').forEach(m => m.classList.add('hidden'));
+}
+
+// ---------- Ngôn ngữ (i18n nhẹ cho các nhãn chính trong giao diện) ----------
+const I18N = {
+  vi: {
+    new_chat: 'Đoạn chat mới', search_placeholder: 'Tìm đoạn chat...', projects: 'Dự án',
+    pinned: 'Đã ghim', recents: 'Gần đây', settings: 'Cài đặt', help: 'Trợ giúp & phím tắt',
+    upgrade: 'Nâng cấp gói', logout: 'Đăng xuất'
+  },
+  en: {
+    new_chat: 'New chat', search_placeholder: 'Search chats...', projects: 'Projects',
+    pinned: 'Pinned', recents: 'Recents', settings: 'Settings', help: 'Help & shortcuts',
+    upgrade: 'Upgrade plan', logout: 'Log out'
+  }
+};
+function applyLanguage(lang) {
+  const dict = I18N[lang] || I18N.vi;
+  document.querySelectorAll('[data-i18n]').forEach(el => {
+    const key = el.getAttribute('data-i18n');
+    if (dict[key]) el.textContent = dict[key];
+  });
+  document.querySelectorAll('[data-i18n-placeholder]').forEach(el => {
+    const key = el.getAttribute('data-i18n-placeholder');
+    if (dict[key]) el.placeholder = dict[key];
+  });
+}
+
+// ---------- Giao diện (theme: sáng / tối / theo hệ thống) ----------
+function applyTheme(theme) {
+  const systemDark = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
+  const shouldDark = theme === 'dark' || (theme === 'system' && systemDark);
+  html.classList.toggle('dark', shouldDark);
+  const icon = document.getElementById('themeIcon');
+  icon.classList.toggle('fa-moon', !shouldDark);
+  icon.classList.toggle('fa-sun', shouldDark);
+  document.querySelectorAll('.theme-opt').forEach(btn => {
+    btn.classList.toggle('active', btn.dataset.theme === theme);
+  });
+}
+document.getElementById('themeOptions').addEventListener('click', (e) => {
+  const btn = e.target.closest('.theme-opt');
+  if (btn) applyTheme(btn.dataset.theme);
+});
+
+// ---------- Tuỳ chỉnh cá nhân (Cài đặt) — lưu theo tài khoản qua /api/preferences ----------
+let currentPreferences = null;
+async function loadPreferences() {
+  try {
+    const res = await fetch('/api/preferences');
+    if (!res.ok) return;
+    currentPreferences = await res.json();
+    applyTheme(currentPreferences.theme || 'system');
+    applyLanguage(currentPreferences.language || 'vi');
+    document.getElementById('languageSelect').value = currentPreferences.language || 'vi';
+    document.getElementById('defaultSubjectSelect').value = currentPreferences.default_subject || 'Toán';
+    document.getElementById('defaultModeSelect').value = currentPreferences.default_mode || 'Giải thích';
+    const subjectEl = document.getElementById('subject');
+    const modeEl = document.getElementById('modeSelect');
+    if (currentPreferences.default_subject) subjectEl.value = currentPreferences.default_subject;
+    if (currentPreferences.default_mode) modeEl.value = currentPreferences.default_mode;
+  } catch (e) { /* dùng mặc định nếu không tải được */ }
+}
+
+async function savePreferences() {
+  const activeThemeBtn = document.querySelector('.theme-opt.active');
+  const payload = {
+    theme: activeThemeBtn ? activeThemeBtn.dataset.theme : 'system',
+    language: document.getElementById('languageSelect').value,
+    default_subject: document.getElementById('defaultSubjectSelect').value,
+    default_mode: document.getElementById('defaultModeSelect').value,
+  };
+  try {
+    const res = await fetch('/api/preferences', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload)
+    });
+    if (res.ok) {
+      currentPreferences = await res.json();
+      applyLanguage(currentPreferences.language);
+      const msg = document.getElementById('settingsSavedMsg');
+      msg.classList.remove('hidden');
+      setTimeout(() => msg.classList.add('hidden'), 2000);
+    }
+  } catch (e) { alert('Không lưu được cài đặt, em thử lại nhé.'); }
+}
+
+async function clearAllHistory() {
+  if (!confirm('Xoá TOÀN BỘ lịch sử trò chuyện? Hành động này không thể hoàn tác.')) return;
+  try {
+    await fetch('/api/conversations/all', { method: 'DELETE' });
+    closeAllModals();
+    newChat();
+    loadConversations();
+  } catch (e) { alert('Không xoá được lịch sử, em thử lại nhé.'); }
+}
+
+// ---------- Thông báo hệ thống (banner do developer đặt) ----------
+let bannerDismissed = false;
+async function loadBanner() {
+  if (bannerDismissed) return;
+  try {
+    const res = await fetch('/api/banner');
+    if (!res.ok) return;
+    const data = await res.json();
+    const bar = document.getElementById('bannerBar');
+    if (data.message) {
+      document.getElementById('bannerText').textContent = data.message;
+      bar.classList.remove('hidden');
+      bar.classList.add('flex');
+    } else {
+      bar.classList.add('hidden');
+      bar.classList.remove('flex');
+    }
+  } catch (e) { /* bỏ qua */ }
+}
+function dismissBanner() {
+  bannerDismissed = true;
+  const bar = document.getElementById('bannerBar');
+  bar.classList.add('hidden');
+  bar.classList.remove('flex');
+}
+
+// ---------- Phím tắt bàn phím ----------
+document.addEventListener('keydown', (e) => {
+  const ctrlOrCmd = e.ctrlKey || e.metaKey;
+  if (ctrlOrCmd && e.key.toLowerCase() === 'k') { e.preventDefault(); newChat(); }
+  else if (ctrlOrCmd && e.key === '/') { e.preventDefault(); openModal('helpModal'); }
+  else if (e.key === 'Escape') { closeAllModals(); }
+});
 
 function escapeHtml(str) {
   const div = document.createElement('div');
@@ -1358,8 +1292,8 @@ function showTypingIndicator() {
   const wrapper = document.createElement('div');
   wrapper.id = 'typingIndicator';
   wrapper.className = 'flex gap-3 items-start';
-  wrapper.innerHTML = `<div class="ai-avatar thinking w-8 h-8 rounded-full bg-gradient-to-br from-blue-600 to-indigo-600 flex items-center justify-center text-white text-sm flex-shrink-0 mt-0.5"><i class="fas fa-robot"></i></div>
-    <div class="ai-content flex-1 min-w-0 leading-relaxed pt-1.5"><span class="inline-flex items-center gap-2"><span class="typing-indicator inline-flex items-center"><span></span><span></span><span></span></span><span class="typing-label">StudyMate đang soạn câu trả lời...</span></span></div>`;
+  wrapper.innerHTML = `<div class="w-8 h-8 rounded-full bg-gradient-to-br from-blue-600 to-indigo-600 flex items-center justify-center text-white text-sm flex-shrink-0 mt-0.5"><i class="fas fa-robot"></i></div>
+    <div class="ai-content flex-1 min-w-0 leading-relaxed pt-1.5"><span class="typing-indicator inline-flex items-center gap-1 text-gray-400"><span></span><span></span><span></span></span></div>`;
   chat.appendChild(wrapper);
   scrollChatToBottom();
 }
@@ -1368,7 +1302,7 @@ function removeTypingIndicator() {
   if (el) el.remove();
 }
 
-function addMessage(sender, content, isMarkdown = false, actionsCtx = null) {
+function addMessage(sender, content, isMarkdown = false) {
   const chat = document.getElementById('chat');
   if (sender === 'user') {
     const div = document.createElement('div');
@@ -1379,18 +1313,17 @@ function addMessage(sender, content, isMarkdown = false, actionsCtx = null) {
     return div;
   }
   const wrapper = document.createElement('div');
-  wrapper.className = 'ai-msg-group flex gap-3 items-start';
+  wrapper.className = 'flex gap-3 items-start';
   const avatar = document.createElement('div');
-  avatar.className = 'ai-avatar w-8 h-8 rounded-full bg-gradient-to-br from-blue-600 to-indigo-600 flex items-center justify-center text-white text-sm flex-shrink-0 mt-0.5';
+  avatar.className = 'w-8 h-8 rounded-full bg-gradient-to-br from-blue-600 to-indigo-600 flex items-center justify-center text-white text-sm flex-shrink-0 mt-0.5';
   avatar.innerHTML = '<i class="fas fa-robot"></i>';
   const bubble = document.createElement('div');
   bubble.className = 'ai-content flex-1 min-w-0 leading-relaxed pt-1.5';
-  bubble.innerHTML = isMarkdown ? safeMarkdown(content) : escapeHtml(content).replace(/\n/g, '<br>');
+  bubble.innerHTML = isMarkdown ? marked.parse(content) : escapeHtml(content).replace(/\n/g, '<br>');
   if (isMarkdown) renderMathIn(bubble);
   wrapper.appendChild(avatar);
   wrapper.appendChild(bubble);
   chat.appendChild(wrapper);
-  if (actionsCtx) addMessageActions(wrapper, actionsCtx.conversationId, () => content);
   scrollChatToBottom();
   return bubble;
 }
@@ -1398,93 +1331,27 @@ function addMessage(sender, content, isMarkdown = false, actionsCtx = null) {
 function createAiStreamBubble() {
   const chat = document.getElementById('chat');
   const wrapper = document.createElement('div');
-  wrapper.className = 'ai-msg-group flex gap-3 items-start';
-  wrapper.innerHTML = `<div class="ai-avatar thinking w-8 h-8 rounded-full bg-gradient-to-br from-blue-600 to-indigo-600 flex items-center justify-center text-white text-sm flex-shrink-0 mt-0.5"><i class="fas fa-robot"></i></div>
-    <div class="ai-content flex-1 min-w-0 leading-relaxed pt-1.5"><span class="inline-flex items-center gap-2"><span class="typing-indicator inline-flex items-center"><span></span><span></span><span></span></span><span class="typing-label">StudyMate đang soạn câu trả lời...</span></span></div>`;
+  wrapper.className = 'flex gap-3 items-start';
+  wrapper.innerHTML = `<div class="w-8 h-8 rounded-full bg-gradient-to-br from-blue-600 to-indigo-600 flex items-center justify-center text-white text-sm flex-shrink-0 mt-0.5"><i class="fas fa-robot"></i></div>
+    <div class="ai-content flex-1 min-w-0 leading-relaxed pt-1.5"><span class="typing-indicator inline-flex items-center gap-1 text-gray-400"><span></span><span></span><span></span></span></div>`;
   chat.appendChild(wrapper);
   scrollChatToBottom();
   return wrapper.querySelector('.ai-content');
 }
 function updateAiStreamBubble(bubble, text, showCursor) {
-  bubble.innerHTML = safeMarkdown(text) + (showCursor ? '<span class="stream-cursor"></span>' : '');
+  bubble.innerHTML = marked.parse(text) + (showCursor ? '<span class="stream-cursor"></span>' : '');
   renderMathIn(bubble);
   scrollChatToBottom();
-}
-
-// ---------- Hành động dưới câu trả lời AI (Báo lỗi...) ----------
-function addMessageActions(wrapper, conversationId, getText) {
-  const bar = document.createElement('div');
-  bar.className = 'msg-actions flex items-center gap-1 mt-1 ml-11';
-  const btn = document.createElement('button');
-  btn.type = 'button';
-  btn.className = 'text-xs text-gray-400 hover:text-red-500 px-2 py-1 -ml-2 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-800 flex items-center gap-1.5';
-  btn.title = 'Báo lỗi câu trả lời này';
-  btn.innerHTML = '<i class="fas fa-flag"></i> <span data-i18n="report_btn">Báo lỗi</span>';
-  btn.addEventListener('click', () => openReportModal(conversationId, getText()));
-  bar.appendChild(btn);
-  wrapper.after(bar);
-  applyLanguage(PREFERENCES.language || 'vi');
-  return bar;
-}
-
-let reportContext = { conversationId: null, messageExcerpt: '' };
-function openReportModal(conversationId, messageExcerpt) {
-  reportContext = { conversationId: conversationId || null, messageExcerpt: (messageExcerpt || '').slice(0, 2000) };
-  const textEl = document.getElementById('reportIssueText');
-  const statusEl = document.getElementById('reportIssueStatus');
-  textEl.value = '';
-  statusEl.classList.add('hidden');
-  openModal('reportIssueModal');
-  setTimeout(() => textEl.focus(), 50);
-}
-
-function showMemoryToast(text) {
-  const toast = document.createElement('div');
-  toast.className = 'memory-toast fixed bottom-24 left-1/2 z-50 bg-gray-900 dark:bg-gray-100 text-white dark:text-gray-900 text-xs px-4 py-2 rounded-full shadow-lg flex items-center gap-2 max-w-[90vw]';
-  toast.innerHTML = `<i class="fas fa-brain text-purple-400"></i> <span class="truncate">Đã ghi nhớ: ${escapeHtml(text.slice(0, 80))}</span>`;
-  document.body.appendChild(toast);
-  setTimeout(() => toast.remove(), 3600);
 }
 
 function showWelcome() {
   addMessage('ai', '👋 Chào em! Thầy/Cô là **StudyMate AI Pro**.\n\nEm chọn **Môn học** và **Chế độ** ở phía trên, gõ câu hỏi rồi bấm Enter (hoặc nút gửi) nhé! Em cũng có thể đính kèm file (PDF/Word/txt/csv) hoặc ảnh bằng nút 📎, hay kéo-thả trực tiếp vào khung chat. 🚀', true);
 }
 
-// ---------- Dự án (Projects) ----------
-let PROJECTS = [];
-async function loadProjects() {
-  try {
-    const res = await fetch('/api/projects');
-    if (!res.ok) return;
-    PROJECTS = await res.json();
-    renderProjectList();
-  } catch (e) { /* im lặng bỏ qua lỗi mạng */ }
-}
-function renderProjectList() {
-  const container = document.getElementById('projectList');
-  container.innerHTML = '';
-  PROJECTS.forEach(p => {
-    const item = document.createElement('div');
-    item.className = 'flex items-center gap-2 rounded-xl px-3 py-1.5 hover:bg-gray-200 dark:hover:bg-gray-800 cursor-pointer text-gray-600 dark:text-gray-300';
-    item.innerHTML = `<i class="fas fa-folder text-xs text-gray-400"></i><span class="flex-1 truncate">${escapeHtml(p.name)}</span>`;
-    item.addEventListener('click', () => { activeProjectFilter = (activeProjectFilter === p.id ? null : p.id); loadConversations(); });
-    container.appendChild(item);
-  });
-}
-document.getElementById('newProjectBtn').addEventListener('click', async () => {
-  const name = prompt(PREFERENCES.language === 'en' ? 'Project name:' : 'Tên dự án:');
-  if (!name || !name.trim()) return;
-  try {
-    const res = await fetch('/api/projects', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: name.trim() })
-    });
-    if (res.ok) loadProjects();
-  } catch (e) { /* im lặng bỏ qua lỗi mạng */ }
-});
-
-// ---------- Lịch sử hội thoại (theo tài khoản) ----------
-let ALL_CONVERSATIONS = [];
-let activeProjectFilter = null;
+// ---------- Lịch sử hội thoại (theo tài khoản) + Dự án + Ghim + Tìm kiếm ----------
+let allConversations = [];
+let allProjects = [];
+let activeProjectFilter = null; // null = tất cả, số = lọc theo dự án, 'none' = chưa gắn dự án nào
 let openConvMenuId = null;
 
 async function loadConversations() {
@@ -1492,101 +1359,180 @@ async function loadConversations() {
     const res = await fetch('/api/conversations');
     if (res.status === 401) { window.location.href = '/login'; return; }
     if (!res.ok) return;
-    ALL_CONVERSATIONS = await res.json();
-    renderConversationList();
+    allConversations = await res.json();
+    renderSidebarLists();
   } catch (e) { /* im lặng bỏ qua lỗi mạng khi tải danh sách */ }
 }
 
-function renderConversationList() {
-  const query = (document.getElementById('convSearchInput').value || '').trim().toLowerCase();
-  let list = ALL_CONVERSATIONS;
-  if (query) list = list.filter(c => (c.title || '').toLowerCase().includes(query));
-  if (activeProjectFilter) list = list.filter(c => c.project_id === activeProjectFilter);
-
-  const pinned = list.filter(c => c.pinned);
-  const recent = list.filter(c => !c.pinned);
-
-  document.getElementById('pinnedSection').classList.toggle('hidden', pinned.length === 0);
-  renderConvGroup('pinnedList', pinned);
-  renderConvGroup('convList', recent, recent.length === 0 && pinned.length === 0);
+async function loadProjects() {
+  try {
+    const res = await fetch('/api/projects');
+    if (!res.ok) return;
+    allProjects = await res.json();
+    renderProjectList();
+  } catch (e) { /* im lặng bỏ qua lỗi mạng */ }
 }
 
-function renderConvGroup(containerId, list, showEmptyState) {
+function renderProjectList() {
+  const container = document.getElementById('projectList');
+  container.innerHTML = '';
+  const allBtn = document.createElement('div');
+  allBtn.className = 'flex items-center gap-2 rounded-xl px-3 py-2 cursor-pointer text-sm ' +
+    (activeProjectFilter === null ? 'bg-gray-200 dark:bg-gray-800 font-medium' : 'hover:bg-gray-200 dark:hover:bg-gray-800 text-gray-500');
+  allBtn.innerHTML = '<i class="fas fa-inbox w-4 text-center"></i><span>Tất cả đoạn chat</span>';
+  allBtn.addEventListener('click', () => { activeProjectFilter = null; renderSidebarLists(); renderProjectList(); });
+  container.appendChild(allBtn);
+
+  allProjects.forEach(proj => {
+    const row = document.createElement('div');
+    row.className = 'conv-item group flex items-center gap-2 rounded-xl px-3 py-2 cursor-pointer text-sm ' +
+      (activeProjectFilter === proj.id ? 'bg-gray-200 dark:bg-gray-800 font-medium' : 'hover:bg-gray-200 dark:hover:bg-gray-800');
+    row.innerHTML = `<i class="fas fa-folder w-4 text-center text-amber-500"></i>
+      <span class="flex-1 truncate">${escapeHtml(proj.name)}</span>
+      <button class="conv-actions text-gray-400 hover:text-red-500 w-6 h-6 flex items-center justify-center flex-shrink-0" title="Xoá dự án">
+        <i class="fas fa-trash-can text-xs"></i>
+      </button>`;
+    row.addEventListener('click', () => { activeProjectFilter = proj.id; renderSidebarLists(); renderProjectList(); });
+    row.querySelector('button').addEventListener('click', async (e) => {
+      e.stopPropagation();
+      if (!confirm(`Xoá dự án "${proj.name}"? Các đoạn chat bên trong sẽ không bị xoá.`)) return;
+      await fetch(`/api/projects/${proj.id}`, { method: 'DELETE' });
+      if (activeProjectFilter === proj.id) activeProjectFilter = null;
+      loadProjects();
+      loadConversations();
+    });
+    container.appendChild(row);
+  });
+}
+
+document.getElementById('newProjectBtn').addEventListener('click', async () => {
+  const name = prompt('Tên dự án mới (vd: Ôn thi Học kỳ 2):');
+  if (!name || !name.trim()) return;
+  try {
+    await fetch('/api/projects', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: name.trim() })
+    });
+    loadProjects();
+  } catch (e) { alert('Không tạo được dự án, em thử lại nhé.'); }
+});
+
+document.getElementById('searchInput').addEventListener('input', () => renderSidebarLists());
+
+function renderSidebarLists() {
+  const search = document.getElementById('searchInput').value.trim().toLowerCase();
+  let filtered = allConversations;
+  if (activeProjectFilter !== null) filtered = filtered.filter(c => c.project_id === activeProjectFilter);
+  if (search) filtered = filtered.filter(c => (c.title || '').toLowerCase().includes(search));
+
+  const pinned = filtered.filter(c => c.pinned);
+  const recent = filtered.filter(c => !c.pinned);
+
+  const pinnedSection = document.getElementById('pinnedSection');
+  if (pinned.length) {
+    pinnedSection.classList.remove('hidden');
+    renderConvGroup('pinnedList', pinned);
+  } else {
+    pinnedSection.classList.add('hidden');
+  }
+  renderConvGroup('convList', recent, recent.length ? null : 'Chưa có đoạn chat nào');
+}
+
+function renderConvGroup(containerId, list, emptyText) {
   const container = document.getElementById(containerId);
   container.innerHTML = '';
   if (!list.length) {
-    if (showEmptyState) container.innerHTML = '<div class="text-gray-400 text-xs px-2 py-4 text-center">Chưa có đoạn chat nào</div>';
+    if (emptyText) container.innerHTML = `<div class="text-gray-400 text-xs px-2 py-4 text-center">${emptyText}</div>`;
     return;
   }
   list.forEach(conv => {
     const item = document.createElement('div');
     const active = conv.id === currentConversationId;
-    item.className = 'conv-item group flex items-center gap-1 rounded-xl px-3 py-2 cursor-pointer transition-colors ' +
+    item.className = 'conv-item group relative flex items-center gap-1 rounded-xl px-3 py-2 cursor-pointer transition-colors ' +
       (active ? 'bg-gray-200 dark:bg-gray-800' : 'hover:bg-gray-200 dark:hover:bg-gray-800');
     item.innerHTML = `
-      ${conv.pinned ? '<i class="fas fa-thumbtack text-xs text-gray-400"></i>' : ''}
+      ${conv.pinned ? '<i class="fas fa-thumbtack text-[10px] text-blue-500 flex-shrink-0"></i>' : ''}
       <span class="flex-1 truncate">${escapeHtml(conv.title || 'Đoạn chat mới')}</span>
-      <button class="conv-menu-btn text-gray-400 hover:text-gray-600 w-6 h-6 flex items-center justify-center flex-shrink-0 transition-opacity" title="Tùy chọn">
+      <button class="conv-actions text-gray-400 hover:text-gray-700 dark:hover:text-gray-200 w-6 h-6 flex items-center justify-center flex-shrink-0 transition-opacity" title="Tuỳ chọn">
         <i class="fas fa-ellipsis text-xs"></i>
       </button>`;
     item.querySelector('span').addEventListener('click', () => openConversation(conv.id));
-    item.querySelector('.conv-menu-btn').addEventListener('click', (e) => {
-      e.stopPropagation();
-      toggleConvMenu(item, conv);
-    });
+    item.querySelector('button').addEventListener('click', (e) => { e.stopPropagation(); toggleConvMenu(conv, item); });
     container.appendChild(item);
   });
 }
 
-function toggleConvMenu(item, conv) {
-  const existing = item.querySelector('.conv-menu-dropdown');
-  document.querySelectorAll('.conv-menu-dropdown').forEach(d => d.remove());
-  if (existing) { openConvMenuId = null; return; }
+function toggleConvMenu(conv, anchorEl) {
+  document.querySelectorAll('.conv-menu').forEach(m => m.remove());
+  if (openConvMenuId === conv.id) { openConvMenuId = null; return; }
   openConvMenuId = conv.id;
-  const dd = document.createElement('div');
-  dd.className = 'conv-menu-dropdown';
-  const pinLabel = conv.pinned ? (PREFERENCES.language === 'en' ? 'Unpin' : 'Bỏ ghim') : (PREFERENCES.language === 'en' ? 'Pin' : 'Ghim');
-  const renameLabel = PREFERENCES.language === 'en' ? 'Rename' : 'Đổi tên';
-  const moveLabel = PREFERENCES.language === 'en' ? 'Move to project' : 'Chuyển vào dự án';
-  const delLabel = PREFERENCES.language === 'en' ? 'Delete' : 'Xóa';
-  dd.innerHTML = `
-    <button data-act="pin"><i class="fas fa-thumbtack w-3"></i>${pinLabel}</button>
-    <button data-act="rename"><i class="fas fa-pen w-3"></i>${renameLabel}</button>
-    ${PROJECTS.length ? `<button data-act="move"><i class="fas fa-folder w-3"></i>${moveLabel}</button>` : ''}
-    <button data-act="delete" class="text-red-500"><i class="fas fa-trash-can w-3"></i>${delLabel}</button>`;
-  dd.querySelector('[data-act="pin"]').addEventListener('click', (e) => { e.stopPropagation(); pinConversation(conv); });
-  dd.querySelector('[data-act="rename"]').addEventListener('click', (e) => { e.stopPropagation(); renameConversation(conv); });
-  const moveBtn = dd.querySelector('[data-act="move"]');
-  if (moveBtn) moveBtn.addEventListener('click', (e) => { e.stopPropagation(); moveConversation(conv); });
-  dd.querySelector('[data-act="delete"]').addEventListener('click', (e) => { e.stopPropagation(); deleteConversation(conv.id); });
-  item.appendChild(dd);
+
+  const menu = document.createElement('div');
+  menu.className = 'conv-menu bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-xl shadow-lg overflow-hidden text-sm';
+  const projectOptions = allProjects.map(p =>
+    `<button data-project-id="${p.id}" class="move-opt w-full text-left px-4 py-2 hover:bg-gray-100 dark:hover:bg-gray-700 flex items-center gap-2"><i class="fas fa-folder text-amber-500 w-4"></i>${escapeHtml(p.name)}</button>`
+  ).join('');
+
+  menu.innerHTML = `
+    <button class="pin-opt w-full text-left px-4 py-2.5 hover:bg-gray-100 dark:hover:bg-gray-700 flex items-center gap-2">
+      <i class="fas fa-thumbtack w-4 text-gray-400"></i> ${conv.pinned ? 'Bỏ ghim' : 'Ghim đoạn chat'}
+    </button>
+    <button class="rename-opt w-full text-left px-4 py-2.5 hover:bg-gray-100 dark:hover:bg-gray-700 flex items-center gap-2 border-t border-gray-100 dark:border-gray-700">
+      <i class="fas fa-pen w-4 text-gray-400"></i> Đổi tên
+    </button>
+    <div class="border-t border-gray-100 dark:border-gray-700">
+      <div class="px-4 pt-2 pb-1 text-[11px] font-semibold text-gray-400 uppercase">Chuyển vào dự án</div>
+      ${projectOptions || '<div class="px-4 py-2 text-gray-400 text-xs">Chưa có dự án nào</div>'}
+      ${conv.project_id ? '<button data-project-id="" class="move-opt w-full text-left px-4 py-2 hover:bg-gray-100 dark:hover:bg-gray-700 flex items-center gap-2 text-gray-500"><i class="fas fa-inbox w-4"></i>Bỏ khỏi dự án</button>' : ''}
+    </div>
+    <button class="delete-opt w-full text-left px-4 py-2.5 hover:bg-gray-100 dark:hover:bg-gray-700 flex items-center gap-2 text-red-600 dark:text-red-400 border-t border-gray-100 dark:border-gray-700">
+      <i class="fas fa-trash-can w-4"></i> Xoá đoạn chat
+    </button>`;
+
+  document.body.appendChild(menu);
+  const rect = anchorEl.getBoundingClientRect();
+  menu.style.top = Math.min(rect.bottom + 4, window.innerHeight - 260) + 'px';
+  menu.style.left = Math.min(rect.right - 200, window.innerWidth - 210) + 'px';
+
+  menu.querySelector('.pin-opt').addEventListener('click', async (e) => {
+    e.stopPropagation();
+    await patchConversation(conv.id, { pinned: !conv.pinned });
+    menu.remove(); openConvMenuId = null;
+    loadConversations();
+  });
+  menu.querySelector('.rename-opt').addEventListener('click', async (e) => {
+    e.stopPropagation();
+    const title = prompt('Đổi tên đoạn chat:', conv.title || '');
+    if (title && title.trim()) await patchConversation(conv.id, { title: title.trim() });
+    menu.remove(); openConvMenuId = null;
+    loadConversations();
+  });
+  menu.querySelectorAll('.move-opt').forEach(btn => {
+    btn.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      const pid = btn.dataset.projectId ? parseInt(btn.dataset.projectId, 10) : null;
+      await patchConversation(conv.id, { project_id: pid });
+      menu.remove(); openConvMenuId = null;
+      loadConversations();
+    });
+  });
+  menu.querySelector('.delete-opt').addEventListener('click', (e) => {
+    e.stopPropagation();
+    menu.remove(); openConvMenuId = null;
+    deleteConversation(conv.id);
+  });
 }
-document.addEventListener('click', () => { document.querySelectorAll('.conv-menu-dropdown').forEach(d => d.remove()); openConvMenuId = null; });
+document.addEventListener('click', () => {
+  document.querySelectorAll('.conv-menu').forEach(m => m.remove());
+  openConvMenuId = null;
+});
 
 async function patchConversation(id, updates) {
   try {
-    const res = await fetch(`/api/conversations/${id}`, {
+    await fetch(`/api/conversations/${id}`, {
       method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(updates)
     });
-    if (res.ok) loadConversations();
-  } catch (e) { /* im lặng bỏ qua lỗi mạng */ }
+  } catch (e) { alert('Không cập nhật được đoạn chat, em thử lại nhé.'); }
 }
-function pinConversation(conv) { patchConversation(conv.id, { pinned: !conv.pinned }); }
-function renameConversation(conv) {
-  const title = prompt(PREFERENCES.language === 'en' ? 'New title:' : 'Tên mới:', conv.title || '');
-  if (title === null || !title.trim()) return;
-  patchConversation(conv.id, { title: title.trim() });
-}
-function moveConversation(conv) {
-  const options = PROJECTS.map((p, i) => `${i + 1}. ${p.name}`).join('\n');
-  const choice = prompt((PREFERENCES.language === 'en' ? 'Move to which project?\n' : 'Chuyển vào dự án nào?\n') + options);
-  if (!choice) return;
-  const idx = parseInt(choice, 10) - 1;
-  if (isNaN(idx) || !PROJECTS[idx]) return;
-  patchConversation(conv.id, { project_id: PROJECTS[idx].id });
-}
-
-document.getElementById('convSearchInput').addEventListener('input', renderConversationList);
 
 async function openConversation(id) {
   try {
@@ -1596,12 +1542,7 @@ async function openConversation(id) {
     const messages = await res.json();
     currentConversationId = id;
     document.getElementById('chat').innerHTML = '';
-    messages.forEach(m => addMessage(
-      m.role === 'user' ? 'user' : 'ai',
-      m.content,
-      m.role !== 'user',
-      m.role !== 'user' ? { conversationId: id } : null
-    ));
+    messages.forEach(m => addMessage(m.role === 'user' ? 'user' : 'ai', m.content, m.role !== 'user'));
     clearAttachments();
     closeSidebar();
     loadConversations();
@@ -1628,7 +1569,6 @@ function newChat() {
   loadConversations();
 }
 document.getElementById('newChatBtn').addEventListener('click', newChat);
-loadProjects();
 
 // ---------- Gửi tin nhắn (streaming) ----------
 async function sendMessage() {
@@ -1698,8 +1638,6 @@ async function sendMessage() {
 
           if (payload.conversationId) {
             currentConversationId = payload.conversationId;
-          } else if (payload.memory) {
-            showMemoryToast(payload.memory);
           } else if (payload.error) {
             updateAiStreamBubble(aiBubble, (fullText ? fullText + '\n\n' : '') + '⚠️ **Lỗi:** ' + payload.error, false);
             handledError = true;
@@ -1716,17 +1654,10 @@ async function sendMessage() {
       if (!gotFirstToken && !handledError) {
         updateAiStreamBubble(aiBubble, '⚠️ Thầy/Cô chưa nhận được phản hồi. Em thử lại nhé!', false);
       }
-
-      if (gotFirstToken && !handledError) {
-        addMessageActions(aiBubble.parentElement, currentConversationId, () => fullText);
-      }
     }
   } catch (error) {
     updateAiStreamBubble(aiBubble, fullText || '🔌 Đã mất kết nối. Em kiểm tra lại mạng nhé!', false);
   } finally {
-    // Tắt hiệu ứng "đang suy nghĩ" trên avatar khi đã có kết quả (xong hoặc lỗi).
-    const avatarEl = aiBubble.parentElement && aiBubble.parentElement.querySelector('.ai-avatar');
-    if (avatarEl) avatarEl.classList.remove('thinking');
     input.disabled = false;
     sendBtn.disabled = false;
     sendBtn.innerHTML = '<i class="fas fa-arrow-up"></i>';
@@ -1885,7 +1816,10 @@ chatPanel.addEventListener('drop', (e) => {
 
 window.onload = () => {
   showWelcome();
+  loadPreferences();
+  loadProjects();
   loadConversations();
+  loadBanner();
 };
 </script>
 </body>
@@ -2241,14 +2175,20 @@ DEV_STATS_HTML = r'''
 
   <main class="max-w-6xl mx-auto px-4 sm:px-6 py-6 space-y-6">
 
-    {% if open_issues_count > 0 %}
-    <a href="#issue-reports" class="block bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-900/50 rounded-2xl px-5 py-3 text-sm font-medium text-red-700 dark:text-red-300 flex items-center gap-2 hover:bg-red-100 dark:hover:bg-red-900/30 transition-colors">
-      <i class="fas fa-flag"></i> Có {{ open_issues_count }} báo cáo lỗi đang chờ xử lý — xem bên dưới ↓
-    </a>
+    {% with flashed = get_flashed_messages() %}
+    {% if flashed %}
+    <div class="space-y-2">
+      {% for msg in flashed %}
+      <div class="px-4 py-3 rounded-xl bg-indigo-50 dark:bg-indigo-900/30 border border-indigo-200 dark:border-indigo-800 text-indigo-700 dark:text-indigo-300 text-sm flex items-center gap-2">
+        <i class="fas fa-circle-info"></i> {{ msg }}
+      </div>
+      {% endfor %}
+    </div>
     {% endif %}
+    {% endwith %}
 
     <!-- Thẻ tổng quan -->
-    <div class="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-5 gap-4">
+    <div class="grid grid-cols-2 lg:grid-cols-4 gap-4">
       <div class="bg-white dark:bg-[#1c1c1c] rounded-2xl border border-gray-100 dark:border-gray-800 p-5 shadow-sm">
         <div class="flex items-center justify-between">
           <span class="text-xs font-semibold text-gray-400 uppercase">Tổng tài khoản</span>
@@ -2280,14 +2220,6 @@ DEV_STATS_HTML = r'''
         </div>
         <p class="text-3xl font-extrabold mt-2">{{ error_rate }}%</p>
         <p class="text-xs text-gray-400 mt-1">{{ error_count }} lượt gặp lỗi / {{ total_usage }} lượt</p>
-      </div>
-      <div class="bg-white dark:bg-[#1c1c1c] rounded-2xl border border-gray-100 dark:border-gray-800 p-5 shadow-sm">
-        <div class="flex items-center justify-between">
-          <span class="text-xs font-semibold text-gray-400 uppercase">Báo lỗi đang mở</span>
-          <i class="fas fa-flag text-red-500"></i>
-        </div>
-        <p class="text-3xl font-extrabold mt-2">{{ open_issues_count }}</p>
-        <p class="text-xs text-gray-400 mt-1">{{ total_issues_count }} báo cáo tổng cộng</p>
       </div>
     </div>
 
@@ -2378,151 +2310,110 @@ DEV_STATS_HTML = r'''
     </div>
 
     <!-- Quản lý hệ thống -->
-    <div class="bg-white dark:bg-[#1c1c1c] rounded-2xl border border-gray-100 dark:border-gray-800 p-5 shadow-sm">
-      <h2 class="font-bold mb-4 flex items-center gap-2"><i class="fas fa-sliders text-gray-500"></i> Quản lý hệ thống</h2>
-
-      <div class="grid md:grid-cols-2 gap-6">
-        <div>
-          <div class="text-sm font-semibold mb-2">Banner thông báo toàn hệ thống</div>
-          <form id="bannerForm" class="space-y-2">
-            <textarea id="bannerTextInput" rows="2" maxlength="300" placeholder="Nội dung thông báo hiển thị cho mọi người dùng..."
-              class="w-full px-3 py-2 text-sm rounded-lg bg-gray-100 dark:bg-gray-800 border-0 focus:outline-none focus:ring-2 focus:ring-indigo-500 dark:text-white">{{ banner.text }}</textarea>
-            <label class="flex items-center gap-2 text-sm">
-              <input type="checkbox" id="bannerActiveInput" {% if banner.active %}checked{% endif %}>
-              Bật banner
-            </label>
-            <button type="submit" class="px-4 py-2 rounded-lg bg-indigo-600 hover:bg-indigo-700 text-white text-sm font-medium">Lưu banner</button>
-            <span id="bannerSaveStatus" class="text-xs text-green-600 ml-2 hidden">Đã lưu ✓</span>
-          </form>
-        </div>
-
-        <div>
-          <div class="text-sm font-semibold mb-2">Đăng nhập Google (runtime)</div>
-          {% if google_oauth_configured %}
-          <p class="text-xs text-gray-400 mb-2">Client ID/Secret đã cấu hình trong .env. Bạn có thể tạm tắt nút "Đăng nhập với Google" mà không cần sửa .env.</p>
-          <div class="flex gap-2">
-            <button data-mode="on" class="google-toggle-btn px-3 py-2 rounded-lg text-sm font-medium {{ 'bg-green-600 text-white' if google_login_on else 'bg-gray-100 dark:bg-gray-800 text-gray-600 dark:text-gray-300' }}">Bật</button>
-            <button data-mode="off" class="google-toggle-btn px-3 py-2 rounded-lg text-sm font-medium {{ 'bg-red-600 text-white' if not google_login_on else 'bg-gray-100 dark:bg-gray-800 text-gray-600 dark:text-gray-300' }}">Tắt</button>
-            <button data-mode="default" class="google-toggle-btn px-3 py-2 rounded-lg text-sm font-medium bg-gray-100 dark:bg-gray-800 text-gray-600 dark:text-gray-300">Mặc định (.env)</button>
-          </div>
-          <p class="text-xs text-gray-400 mt-2">Trạng thái hiện tại: <strong>{{ 'BẬT' if google_login_on else 'TẮT' }}</strong></p>
-          {% else %}
-          <p class="text-xs text-gray-400">Chưa cấu hình GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET trong .env — không có gì để bật/tắt.</p>
-          {% endif %}
-
-          <div class="mt-5">
-            <div class="text-sm font-semibold mb-2">Xuất dữ liệu</div>
-            <a href="/developer/export.csv" class="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-gray-100 dark:bg-gray-800 hover:bg-gray-200 dark:hover:bg-gray-700 text-sm font-medium">
-              <i class="fas fa-file-csv"></i> Tải usage_logs.csv
-            </a>
-          </div>
-        </div>
+    <div class="grid lg:grid-cols-2 gap-6">
+      <div class="bg-white dark:bg-[#1c1c1c] rounded-2xl border border-gray-100 dark:border-gray-800 p-5 shadow-sm">
+        <h2 class="font-bold mb-1 flex items-center gap-2"><i class="fas fa-bullhorn text-amber-500"></i> Thông báo hệ thống</h2>
+        <p class="text-xs text-gray-400 mb-3">Hiển thị dạng banner cho tất cả người dùng ngay khi vào trang chat. Để trống rồi bấm Lưu để xoá thông báo.</p>
+        <form method="POST" action="{{ url_for('developer_set_banner') }}" class="space-y-3">
+          <textarea name="banner_message" rows="2" maxlength="300" placeholder="VD: Server sẽ bảo trì lúc 22h tối nay..."
+            class="w-full px-3 py-2.5 rounded-xl bg-gray-100 dark:bg-gray-800 border-0 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 dark:text-white">{{ banner_message }}</textarea>
+          <button type="submit" class="px-4 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-white text-sm font-semibold">Lưu thông báo</button>
+        </form>
       </div>
-    </div>
 
-    <!-- Báo cáo lỗi từ học sinh -->
-    <div id="issue-reports" class="bg-white dark:bg-[#1c1c1c] rounded-2xl border border-gray-100 dark:border-gray-800 p-5 shadow-sm scroll-mt-20">
-      <div class="flex items-center justify-between mb-1 flex-wrap gap-2">
-        <h2 class="font-bold flex items-center gap-2"><i class="fas fa-flag text-red-500"></i> Báo cáo lỗi từ học sinh</h2>
-        <span class="text-xs text-gray-400">{{ open_issues_count }} đang mở / {{ total_issues_count }} tổng cộng</span>
-      </div>
-      <p class="text-xs text-gray-400 mb-4">Học sinh bấm "Báo lỗi" dưới 1 câu trả lời trong khung chat để gửi báo cáo về đây.</p>
-      <div class="space-y-3">
-        {% for r in issue_reports %}
-        <div class="border border-gray-100 dark:border-gray-800 rounded-xl p-4 {{ 'opacity-50' if r.status == 'resolved' else '' }}" data-issue-id="{{ r.id }}">
-          <div class="flex items-start justify-between gap-3 flex-wrap">
-            <div class="min-w-0">
-              <div class="flex items-center gap-2 text-xs text-gray-400 mb-1 flex-wrap">
-                <span class="font-semibold text-gray-600 dark:text-gray-300">{{ r.username }}</span>
-                <span>•</span><span>{{ r.created_at }}</span>
-                {% if r.status == 'resolved' %}
-                <span class="px-1.5 py-0.5 rounded-full bg-emerald-100 dark:bg-emerald-900 text-emerald-600 dark:text-emerald-300 text-[10px] font-semibold uppercase">Đã xử lý</span>
-                {% else %}
-                <span class="px-1.5 py-0.5 rounded-full bg-red-100 dark:bg-red-900 text-red-600 dark:text-red-300 text-[10px] font-semibold uppercase">Đang mở</span>
-                {% endif %}
-              </div>
-              <p class="text-sm font-medium">{{ r.description }}</p>
-              {% if r.message_excerpt %}
-              <p class="text-xs text-gray-400 mt-1.5 italic">Liên quan tới câu trả lời: "{{ r.message_excerpt[:160] }}{{ '…' if r.message_excerpt|length > 160 else '' }}"</p>
-              {% endif %}
-            </div>
-            <button class="issue-resolve-btn flex-shrink-0 text-xs font-medium px-3 py-1.5 rounded-lg bg-gray-100 dark:bg-gray-800 hover:bg-gray-200 dark:hover:bg-gray-700 whitespace-nowrap">
-              {{ 'Mở lại' if r.status == 'resolved' else 'Đánh dấu đã xử lý' }}
-            </button>
-          </div>
-        </div>
-        {% else %}
-        <p class="text-sm text-gray-400">Chưa có báo cáo lỗi nào. 🎉</p>
-        {% endfor %}
-      </div>
-    </div>
-
-    <!-- Bộ nhớ AI -->
-    <div class="bg-white dark:bg-[#1c1c1c] rounded-2xl border border-gray-100 dark:border-gray-800 p-5 shadow-sm overflow-x-auto">
-      <h2 class="font-bold mb-1 flex items-center gap-2"><i class="fas fa-brain text-purple-500"></i> Bộ nhớ AI gần đây ({{ total_memories }} tổng)</h2>
-      <p class="text-xs text-gray-400 mb-4">Những điều học sinh chủ động nhờ AI ghi nhớ (vd: "ghi nhớ giúp em là...") hoặc hệ thống tự
-        nhận diện (vd: lớp học) — dùng để cá nhân hoá câu trả lời ở các lượt chat sau.</p>
-      <div class="space-y-2.5">
-        {% for m in recent_memories_admin %}
-        <div class="flex items-start gap-3 text-sm border-b border-gray-50 dark:border-gray-900 pb-2.5">
-          <div class="w-6 h-6 rounded-full bg-purple-100 dark:bg-purple-900 text-purple-600 dark:text-purple-300 flex items-center justify-center text-xs font-bold flex-shrink-0 mt-0.5">{{ m.username[0]|upper if m.username != '—' else '?' }}</div>
-          <div class="min-w-0 flex-1">
-            <p class="break-words"><span class="font-semibold">{{ m.username }}</span> — {{ m.content }}</p>
-            <p class="text-xs text-gray-400 mt-0.5">{{ m.created_at }} · {{ 'tự động nhận diện' if m.source == 'auto' else 'học sinh yêu cầu' }}</p>
-          </div>
-        </div>
-        {% else %}
-        <p class="text-sm text-gray-400">Chưa có bộ nhớ nào được ghi nhận.</p>
-        {% endfor %}
+      <div class="bg-white dark:bg-[#1c1c1c] rounded-2xl border border-gray-100 dark:border-gray-800 p-5 shadow-sm">
+        <h2 class="font-bold mb-1 flex items-center gap-2"><i class="fas fa-toggle-on text-emerald-500"></i> Đăng nhập bằng Google</h2>
+        <p class="text-xs text-gray-400 mb-3">
+          Cấu hình trong .env: <strong>{{ "đã thiết lập" if google_configured else "chưa thiết lập" }}</strong>.
+          {% if not google_configured %}Cần đặt GOOGLE_CLIENT_ID/SECRET trước khi có thể bật.{% endif %}
+        </p>
+        <form method="POST" action="{{ url_for('developer_toggle_google_login') }}" class="flex flex-wrap gap-2">
+          <button name="value" value="" type="submit" class="px-3 py-2 rounded-xl text-sm font-semibold {{ 'bg-gray-800 text-white' if google_override == '' else 'bg-gray-100 dark:bg-gray-800 text-gray-500' }}">Theo .env</button>
+          <button name="value" value="on" type="submit" {{ 'disabled' if not google_configured else '' }} class="px-3 py-2 rounded-xl text-sm font-semibold disabled:opacity-40 {{ 'bg-emerald-600 text-white' if google_override == 'on' else 'bg-gray-100 dark:bg-gray-800 text-gray-500' }}">Bật</button>
+          <button name="value" value="off" type="submit" class="px-3 py-2 rounded-xl text-sm font-semibold {{ 'bg-red-600 text-white' if google_override == 'off' else 'bg-gray-100 dark:bg-gray-800 text-gray-500' }}">Tắt</button>
+        </form>
       </div>
     </div>
 
     <!-- Toàn bộ tài khoản -->
     <div class="bg-white dark:bg-[#1c1c1c] rounded-2xl border border-gray-100 dark:border-gray-800 p-5 shadow-sm overflow-x-auto">
-      <div class="flex items-center justify-between mb-4 flex-wrap gap-2">
+      <div class="flex flex-wrap items-center justify-between gap-3 mb-4">
         <h2 class="font-bold flex items-center gap-2"><i class="fas fa-address-card text-gray-500"></i> Toàn bộ tài khoản ({{ total_users }})</h2>
-        <form method="GET" class="flex items-center gap-2">
-          <input type="text" name="q" value="{{ search_q }}" placeholder="Tìm theo tên đăng nhập..."
-            class="px-3 py-1.5 text-sm rounded-lg bg-gray-100 dark:bg-gray-800 border-0 focus:outline-none focus:ring-2 focus:ring-indigo-500 dark:text-white">
-          <button type="submit" class="px-3 py-1.5 rounded-lg bg-gray-100 dark:bg-gray-800 text-sm"><i class="fas fa-magnifying-glass"></i></button>
-        </form>
+        <div class="flex items-center gap-2">
+          <input id="userSearchInput" type="text" placeholder="Tìm theo tên đăng nhập..." oninput="filterUserTable()"
+            class="px-3 py-1.5 rounded-lg bg-gray-100 dark:bg-gray-800 border-0 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 dark:text-white">
+          <a href="{{ url_for('developer_export_csv') }}" class="text-xs font-semibold px-3 py-1.5 rounded-lg bg-gray-100 dark:bg-gray-800 hover:bg-gray-200 dark:hover:bg-gray-700 whitespace-nowrap">
+            <i class="fas fa-download mr-1"></i> Xuất CSV
+          </a>
+          {% if is_super_admin %}
+          <a href="{{ url_for('developer_audit_log') }}" class="text-xs font-semibold px-3 py-1.5 rounded-lg bg-gray-100 dark:bg-gray-800 hover:bg-gray-200 dark:hover:bg-gray-700 whitespace-nowrap">
+            <i class="fas fa-scroll mr-1"></i> Nhật ký hệ thống
+          </a>
+          {% endif %}
+        </div>
       </div>
-      <table class="w-full text-sm min-w-[520px]">
+      <table class="w-full text-sm min-w-[720px]">
         <thead>
           <tr class="text-left text-gray-400 text-xs uppercase border-b border-gray-100 dark:border-gray-800">
             <th class="py-2 pr-3">ID</th>
             <th class="py-2 pr-3">Người dùng</th>
             <th class="py-2 pr-3">Vai trò</th>
             <th class="py-2 pr-3">Ngày tạo</th>
-            <th class="py-2">Hành động</th>
+            <th class="py-2 text-right">Hành động</th>
           </tr>
         </thead>
-        <tbody>
+        <tbody id="usersTableBody">
           {% for u in all_users %}
-          <tr class="border-b border-gray-50 dark:border-gray-900" data-user-id="{{ u.id }}" data-username="{{ u.username }}">
+          <tr class="border-b border-gray-50 dark:border-gray-900" data-username="{{ u.username|lower }}">
             <td class="py-2.5 pr-3 text-gray-400">#{{ u.id }}</td>
             <td class="py-2.5 pr-3 font-medium">{{ u.username }}</td>
-            <td class="py-2.5 pr-3 role-cell">
-              {% if u.role == 'developer' %}
-                <span class="text-[11px] font-semibold px-2 py-0.5 rounded-full bg-indigo-100 dark:bg-indigo-900 text-indigo-600 dark:text-indigo-300">developer</span>
-              {% else %}
-                <span class="text-[11px] font-semibold px-2 py-0.5 rounded-full bg-gray-100 dark:bg-gray-800 text-gray-500 dark:text-gray-400">user</span>
-              {% endif %}
+            <td class="py-2.5 pr-3">
+              <span class="text-[11px] font-semibold px-2 py-0.5 rounded-full {{ role_meta[u.role].badge }}">
+                {{ role_meta[u.role].icon }} {{ role_meta[u.role].label }}
+              </span>
+              {% if u.is_locked %}<span class="ml-1 text-[10px] font-semibold px-1.5 py-0.5 rounded bg-red-600 text-white">ĐÃ KHOÁ</span>{% endif %}
             </td>
             <td class="py-2.5 pr-3 text-gray-400">{{ u.created_at[:10] }}</td>
-            <td class="py-2.5">
-              {% if u.username != current_username %}
-              <button class="role-toggle-btn text-xs font-medium px-2.5 py-1 rounded-lg bg-gray-100 dark:bg-gray-800 hover:bg-gray-200 dark:hover:bg-gray-700"
-                      data-current-role="{{ u.role }}">
-                {{ 'Hạ xuống user' if u.role == 'developer' else 'Nâng lên developer' }}
-              </button>
+            <td class="py-2.5 text-right">
+              {% if u.id == current_user_id_val %}
+                <span class="text-xs text-gray-400 italic">(bạn)</span>
+              {% elif u.role == 'super_admin' %}
+                <span class="text-xs text-gray-400 italic">—</span>
+              {% elif u.role == 'admin' and not is_super_admin %}
+                <span class="text-xs text-gray-400 italic">Chỉ Super Admin quản lý được</span>
               {% else %}
-              <span class="text-xs text-gray-400">(bạn)</span>
+              <div class="flex items-center justify-end gap-1.5 flex-wrap">
+                <form method="POST" action="{{ url_for('developer_change_role', user_id=u.id) }}" class="inline-flex items-center gap-1">
+                  <select name="role" class="text-xs px-2 py-1.5 rounded-lg bg-gray-100 dark:bg-gray-800 border-0 focus:outline-none focus:ring-1 focus:ring-indigo-500">
+                    <option value="user" {{ 'selected' if u.role == 'user' else '' }}>Người dùng</option>
+                    <option value="developer" {{ 'selected' if u.role == 'developer' else '' }}>Developer</option>
+                    {% if is_super_admin %}
+                    <option value="admin" {{ 'selected' if u.role == 'admin' else '' }}>Admin</option>
+                    {% endif %}
+                  </select>
+                  <button type="submit" class="text-xs font-semibold px-2.5 py-1.5 rounded-lg bg-indigo-50 dark:bg-indigo-900/30 text-indigo-600 dark:text-indigo-400 hover:bg-indigo-100">Cập nhật</button>
+                </form>
+
+                <form method="POST" action="{{ url_for('developer_toggle_lock', user_id=u.id) }}" class="inline"
+                  onsubmit="return {{ 'true' if u.is_locked else 'confirm(\'Khoá tài khoản này?\')' }};">
+                  <button type="submit" class="text-xs font-semibold px-2.5 py-1.5 rounded-lg {{ 'bg-emerald-50 dark:bg-emerald-900/30 text-emerald-600 hover:bg-emerald-100' if u.is_locked else 'bg-amber-50 dark:bg-amber-900/30 text-amber-600 hover:bg-amber-100' }}">
+                    {{ 'Mở khoá' if u.is_locked else 'Khoá' }}
+                  </button>
+                </form>
+
+                <form method="POST" action="{{ url_for('developer_reset_session', user_id=u.id) }}" class="inline" onsubmit="return confirm('Đăng xuất mọi phiên đăng nhập của tài khoản này?');">
+                  <button type="submit" class="text-xs font-semibold px-2.5 py-1.5 rounded-lg bg-gray-100 dark:bg-gray-800 text-gray-600 dark:text-gray-300 hover:bg-gray-200">Reset session</button>
+                </form>
+
+                {% if u.role != 'admin' %}
+                <form method="POST" action="{{ url_for('developer_delete_user', user_id=u.id) }}" class="inline" onsubmit="return confirm('XOÁ VĨNH VIỄN tài khoản này? Không thể hoàn tác.');">
+                  <button type="submit" class="text-xs font-semibold px-2.5 py-1.5 rounded-lg bg-red-600 text-white hover:bg-red-700">Xoá</button>
+                </form>
+                {% endif %}
+              </div>
               {% endif %}
             </td>
           </tr>
-          {% else %}
-          <tr><td colspan="5" class="py-4 text-center text-gray-400">Không tìm thấy tài khoản nào.</td></tr>
           {% endfor %}
         </tbody>
       </table>
@@ -2533,75 +2424,14 @@ DEV_STATS_HTML = r'''
     </p>
   </main>
 
-<script>
-  document.getElementById('bannerForm').addEventListener('submit', async (e) => {
-    e.preventDefault();
-    const text = document.getElementById('bannerTextInput').value.trim();
-    const active = document.getElementById('bannerActiveInput').checked;
-    try {
-      const res = await fetch('/developer/banner', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text, active })
+  <script>
+    function filterUserTable() {
+      const q = document.getElementById('userSearchInput').value.trim().toLowerCase();
+      document.querySelectorAll('#usersTableBody tr').forEach(row => {
+        row.style.display = row.dataset.username.includes(q) ? '' : 'none';
       });
-      if (res.ok) {
-        const status = document.getElementById('bannerSaveStatus');
-        status.classList.remove('hidden');
-        setTimeout(() => status.classList.add('hidden'), 2000);
-      } else {
-        alert('Không lưu được banner.');
-      }
-    } catch (err) { alert('Lỗi mạng khi lưu banner.'); }
-  });
-
-  document.querySelectorAll('.google-toggle-btn').forEach(btn => {
-    btn.addEventListener('click', async () => {
-      try {
-        const res = await fetch('/developer/google-login', {
-          method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ mode: btn.dataset.mode })
-        });
-        if (res.ok) window.location.reload();
-        else alert('Không đổi được trạng thái đăng nhập Google.');
-      } catch (err) { alert('Lỗi mạng.'); }
-    });
-  });
-
-  document.querySelectorAll('.issue-resolve-btn').forEach(btn => {
-    btn.addEventListener('click', async () => {
-      const card = btn.closest('[data-issue-id]');
-      const id = card.dataset.issueId;
-      btn.disabled = true;
-      try {
-        const res = await fetch(`/developer/issues/${id}/resolve`, { method: 'POST' });
-        if (res.ok) window.location.reload();
-        else { alert('Không cập nhật được trạng thái báo cáo.'); btn.disabled = false; }
-      } catch (err) { alert('Lỗi mạng.'); btn.disabled = false; }
-    });
-  });
-
-  document.querySelectorAll('.role-toggle-btn').forEach(btn => {
-    btn.addEventListener('click', async () => {
-      const row = btn.closest('tr');
-      const userId = row.dataset.userId;
-      const username = row.dataset.username;
-      const currentRole = btn.dataset.currentRole;
-      const newRole = currentRole === 'developer' ? 'user' : 'developer';
-      const confirmMsg = newRole === 'developer'
-        ? `Nâng "${username}" lên quyền developer?`
-        : `Hạ quyền developer của "${username}" xuống user?`;
-      if (!confirm(confirmMsg)) return;
-      try {
-        const res = await fetch(`/developer/users/${userId}/role`, {
-          method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ role: newRole })
-        });
-        const data = await res.json();
-        if (!res.ok) { alert(data.error || 'Không cập nhật được vai trò.'); return; }
-        window.location.reload();
-      } catch (err) { alert('Lỗi mạng khi cập nhật vai trò.'); }
-    });
-  });
-</script>
+    }
+  </script>
 </body>
 </html>
 '''
@@ -2661,12 +2491,12 @@ def _login_session_for(user):
     session.clear()
     session['user_id'] = user['id']
     session['username'] = user['username']
-    session['role'] = user['role'] if 'role' in user.keys() else 'user'
+    session['session_version'] = user['session_version'] if 'session_version' in user.keys() else 0
 
 
 @app.route('/auth/<provider>')
 def oauth_start(provider):
-    if provider != 'google' or not oauth or not hasattr(oauth, provider) or not google_login_effective():
+    if provider != 'google' or not oauth or not hasattr(oauth, provider) or not google_login_effective_enabled():
         flash('Phương thức đăng nhập này hiện chưa được bật.')
         return redirect(url_for('login_page'))
     redirect_uri = url_for('oauth_callback', provider=provider, _external=True)
@@ -2676,7 +2506,7 @@ def oauth_start(provider):
 
 @app.route('/auth/<provider>/callback')
 def oauth_callback(provider):
-    if provider != 'google' or not oauth or not hasattr(oauth, provider):
+    if provider != 'google' or not oauth or not hasattr(oauth, provider) or not google_login_effective_enabled():
         flash('Phương thức đăng nhập này hiện chưa được bật.')
         return redirect(url_for('login_page'))
 
@@ -2701,6 +2531,10 @@ def oauth_callback(provider):
         return redirect(url_for('login_page'))
 
     user = get_or_create_oauth_user(provider, str(oauth_id), email, name)
+    if user['is_locked']:
+        reason = (user['lock_reason'] or '').strip()
+        flash('Tài khoản này đã bị khoá.' + (f' Lý do: {reason}' if reason else ''))
+        return redirect(url_for('login_page'))
     _login_session_for(user)
     return redirect(url_for('home'))
 
@@ -2709,7 +2543,7 @@ def oauth_callback(provider):
 # 4. ĐỊNH TUYẾN TÀI KHOẢN (Đăng ký / Đăng nhập / Đăng xuất)
 # ==========================================
 def _auth_ctx(**extra):
-    ctx = {'google_enabled': google_login_effective()}
+    ctx = {'google_enabled': google_login_effective_enabled()}
     ctx.update(extra)
     return ctx
 
@@ -2742,10 +2576,8 @@ def register_page():
                     (username, pw_hash, now_iso())
                 )
                 db.commit()
-                session.clear()
-                session['user_id'] = cur.lastrowid
-                session['username'] = username
-                session['role'] = 'user'
+                new_user = db.execute('SELECT * FROM users WHERE id = ?', (cur.lastrowid,)).fetchone()
+                _login_session_for(new_user)
                 return redirect(url_for('home'))
 
         return render_template_string(AUTH_HTML, mode='register', username=username, **_auth_ctx())
@@ -2772,6 +2604,10 @@ def login_page():
             return render_template_string(AUTH_HTML, mode='login', username=username, **_auth_ctx())
 
         if user and user['password_hash'] and check_password_hash(user['password_hash'], password):
+            if user['is_locked']:
+                reason = (user['lock_reason'] or '').strip()
+                flash('Tài khoản này đã bị khoá.' + (f' Lý do: {reason}' if reason else ''))
+                return render_template_string(AUTH_HTML, mode='login', username=username, **_auth_ctx())
             _login_session_for(user)
             return redirect(url_for('home'))
 
@@ -2788,55 +2624,20 @@ def logout():
 
 
 # ==========================================
-# 4.5. PWA — Service Worker (route riêng, KHÔNG đặt trong static/, để scope = toàn site "/")
-# ==========================================
-SERVICE_WORKER_JS = """
-const CACHE_NAME = 'studymate-static-v1';
-const PRECACHE_URLS = ['/static/manifest.json', '/static/icons/icon-192.png', '/static/icons/icon-512.png'];
-
-self.addEventListener('install', (event) => {
-  event.waitUntil(caches.open(CACHE_NAME).then((cache) => cache.addAll(PRECACHE_URLS)));
-  self.skipWaiting();
-});
-
-self.addEventListener('activate', (event) => {
-  event.waitUntil(
-    caches.keys().then((keys) => Promise.all(keys.filter((k) => k !== CACHE_NAME).map((k) => caches.delete(k))))
-  );
-  self.clients.claim();
-});
-
-// CHỈ cache-first cho tài nguyên tĩnh trong /static/ (icon, manifest...). Trang chat "/" và
-// mọi endpoint "/api/*" (kể cả stream trả lời AI) luôn đi thẳng ra mạng, KHÔNG bao giờ cache
-// — để không hiện nhầm trang cũ / dữ liệu của phiên đăng nhập khác, và không làm hỏng luồng
-// streaming của /api/chat.
-self.addEventListener('fetch', (event) => {
-  const url = new URL(event.request.url);
-  if (event.request.method !== 'GET' || url.origin !== self.location.origin || !url.pathname.startsWith('/static/')) {
-    return;
-  }
-  event.respondWith(caches.match(event.request).then((cached) => cached || fetch(event.request)));
-});
-"""
-
-
-@app.route('/sw.js')
-def service_worker():
-    return Response(SERVICE_WORKER_JS, mimetype='application/javascript')
-
-
-# ==========================================
 # 5. ĐỊNH TUYẾN CHÍNH (Trang chủ gia sư AI)
 # ==========================================
 @app.route('/')
 @login_required
 def home():
+    role = current_user_role()
     return render_template_string(
         HTML,
         username=session.get('username', ''),
-        is_developer=(current_user_role() == 'developer'),
-        preferences=get_preferences(current_user_id()),
-        banner=get_banner(),
+        role=role,
+        role_icon=role_meta(role)['icon'],
+        role_label=role_meta(role)['label'],
+        is_developer=(role_rank(role) >= role_rank('developer')),
+        is_admin=(role_rank(role) >= role_rank('admin')),
     )
 
 
@@ -2934,60 +2735,16 @@ def developer_stats():
             'last_used': last_used[:16].replace('T', ' ') if last_used else None,
         })
 
-    q = (request.args.get('q') or '').strip()
-    if q:
-        all_users = db.execute(
-            'SELECT id, username, role, created_at FROM users WHERE username LIKE ? ORDER BY id ASC',
-            (f'%{q}%',)
-        ).fetchall()
-    else:
-        all_users = db.execute(
-            'SELECT id, username, role, created_at FROM users ORDER BY id ASC'
-        ).fetchall()
+    all_users = db.execute(
+        'SELECT id, username, role, created_at, is_locked, lock_reason FROM users ORDER BY id ASC'
+    ).fetchall()
 
-    developer_count = db.execute("SELECT COUNT(*) c FROM users WHERE role = 'developer'").fetchone()['c']
+    token_row = db.execute(
+        'SELECT COALESCE(SUM(message_chars),0) AS mc, COALESCE(SUM(response_chars),0) AS rc FROM usage_logs'
+    ).fetchone()
+    estimated_tokens = round((token_row['mc'] + token_row['rc']) / 4)
 
-    # ---- Báo lỗi từ học sinh ----
-    open_issues_count = db.execute("SELECT COUNT(*) c FROM issue_reports WHERE status = 'open'").fetchone()['c']
-    total_issues_count = db.execute('SELECT COUNT(*) c FROM issue_reports').fetchone()['c']
-    issue_rows = db.execute('''
-        SELECT r.id AS id, r.description AS description, r.message_excerpt AS message_excerpt,
-               r.status AS status, r.created_at AS created_at,
-               u.username AS username
-        FROM issue_reports r
-        LEFT JOIN users u ON u.id = r.user_id
-        ORDER BY (r.status = 'open') DESC, r.created_at DESC
-        LIMIT 30
-    ''').fetchall()
-    issue_reports = []
-    for r in issue_rows:
-        issue_reports.append({
-            'id': r['id'],
-            'description': r['description'],
-            'message_excerpt': r['message_excerpt'] or '',
-            'status': r['status'],
-            'username': r['username'] or '—',
-            'created_at': r['created_at'][:16].replace('T', ' ') if r['created_at'] else '',
-        })
-
-    # ---- Bộ nhớ AI (memories) — tổng hợp cho developer xem ----
-    total_memories = db.execute('SELECT COUNT(*) c FROM memories').fetchone()['c']
-    memory_rows = db.execute('''
-        SELECT m.content AS content, m.source AS source, m.created_at AS created_at,
-               u.username AS username
-        FROM memories m
-        LEFT JOIN users u ON u.id = m.user_id
-        ORDER BY m.created_at DESC
-        LIMIT 10
-    ''').fetchall()
-    recent_memories_admin = []
-    for r in memory_rows:
-        recent_memories_admin.append({
-            'content': r['content'],
-            'source': r['source'],
-            'username': r['username'] or '—',
-            'created_at': r['created_at'][:16].replace('T', ' ') if r['created_at'] else '',
-        })
+    role = current_user_role()
 
     return render_template_string(
         DEV_STATS_HTML,
@@ -2999,122 +2756,287 @@ def developer_stats():
         avg_per_day_7d=avg_per_day_7d,
         error_rate=error_rate,
         error_count=error_count,
+        estimated_tokens=estimated_tokens,
         daily_counts=daily_counts,
         subject_stats=subject_stats,
         mode_stats=mode_stats,
         top_users=top_users,
         all_users=[dict(u) for u in all_users],
-        search_q=q,
-        current_username=session.get('username', ''),
-        developer_count=developer_count,
-        banner=get_banner(),
-        google_oauth_configured=GOOGLE_OAUTH_ENABLED,
-        google_login_on=google_login_effective(),
-        open_issues_count=open_issues_count,
-        total_issues_count=total_issues_count,
-        issue_reports=issue_reports,
-        total_memories=total_memories,
-        recent_memories_admin=recent_memories_admin,
+        role_meta=ROLE_META,
+        role_rank_map={r: role_rank(r) for r in ROLE_ORDER},
+        current_role=role,
+        is_admin=(role_rank(role) >= role_rank('admin')),
+        is_super_admin=(role_rank(role) >= role_rank('super_admin')),
+        current_user_id_val=current_user_id(),
+        banner_message=get_setting('banner_message', '') or '',
+        google_configured=bool(GOOGLE_OAUTH_ENABLED),
+        google_override=get_setting('google_login_override', ''),
+        maintenance_mode=(get_setting('maintenance_mode', 'off') == 'on'),
+        ai_model_override=get_setting('ai_model_override', '') or '',
+        ai_temperature_override=get_setting('ai_temperature_override', '') or '',
+        global_system_addendum=get_setting('global_system_addendum', '') or '',
+        default_model=CONSOLEX_MODEL,
     )
 
 
 @app.route('/developer/users/<int:user_id>/role', methods=['POST'])
-@developer_required
-def developer_set_role(user_id):
-    """Thăng/hạ quyền developer cho 1 tài khoản. Chặn: tự hạ quyền chính mình,
-    và hạ quyền developer cuối cùng của hệ thống (luôn phải còn ít nhất 1 developer)."""
+@admin_required
+def developer_change_role(user_id):
+    """Đổi vai trò 1 tài khoản. Admin chỉ đổi qua lại User<->Developer; chỉ Super Admin mới
+    được cấp/thu hồi Admin trở lên. Luôn giữ lại ít nhất 1 tài khoản Admin/Super Admin."""
     db = get_db()
-    target = db.execute('SELECT id, username, role FROM users WHERE id = ?', (user_id,)).fetchone()
+    target = db.execute('SELECT id, role, username FROM users WHERE id = ?', (user_id,)).fetchone()
     if not target:
-        return jsonify({"error": "Không tìm thấy tài khoản này."}), 404
+        flash('Không tìm thấy tài khoản.')
+        return redirect(url_for('developer_stats'))
 
-    data = request.get_json(silent=True) or {}
-    new_role = data.get('role')
-    if new_role not in ('user', 'developer'):
-        return jsonify({"error": "Vai trò không hợp lệ."}), 400
+    new_role = (request.form.get('role') or '').strip()
+    actor = current_user()
+    ok, err = can_manage_role(actor['role'], target['role'], new_role)
+    if not ok:
+        flash(err)
+        return redirect(url_for('developer_stats'))
 
-    if target['role'] == new_role:
-        return jsonify({"success": True, "role": new_role})
-
-    if new_role == 'user':
-        if target['id'] == current_user_id():
-            return jsonify({"error": "Bạn không thể tự hạ quyền chính mình."}), 400
-        dev_count = db.execute("SELECT COUNT(*) c FROM users WHERE role = 'developer'").fetchone()['c']
-        if target['role'] == 'developer' and dev_count <= 1:
-            return jsonify({"error": "Không thể hạ quyền — hệ thống cần ít nhất 1 tài khoản developer."}), 400
+    if role_rank(target['role']) >= role_rank('admin') and role_rank(new_role) < role_rank('admin'):
+        remaining = db.execute(
+            "SELECT COUNT(*) c FROM users WHERE role IN ('admin','super_admin') AND id != ?", (user_id,)
+        ).fetchone()['c']
+        if remaining == 0:
+            flash('Không thể hạ quyền — đây là tài khoản Admin/Super Admin cuối cùng của hệ thống.')
+            return redirect(url_for('developer_stats'))
 
     db.execute('UPDATE users SET role = ? WHERE id = ?', (new_role, user_id))
     db.commit()
-    return jsonify({"success": True, "role": new_role})
+    write_audit('change_role', target['username'], f"{target['role']} → {new_role}")
+    flash(f"Đã đổi vai trò của '{target['username']}' thành {role_meta(new_role)['label']}.")
+    return redirect(url_for('developer_stats'))
+
+
+@app.route('/developer/users/<int:user_id>/lock', methods=['POST'])
+@admin_required
+def developer_toggle_lock(user_id):
+    """Khoá / mở khoá tài khoản. Chỉ Super Admin được khoá tài khoản Admin/Super Admin."""
+    db = get_db()
+    target = db.execute('SELECT id, role, username, is_locked FROM users WHERE id = ?', (user_id,)).fetchone()
+    if not target:
+        flash('Không tìm thấy tài khoản.')
+        return redirect(url_for('developer_stats'))
+
+    actor = current_user()
+    if actor['role'] != 'super_admin' and role_rank(target['role']) >= role_rank('admin'):
+        flash('Chỉ Super Admin mới có thể khoá tài khoản Admin/Super Admin.')
+        return redirect(url_for('developer_stats'))
+    if target['id'] == current_user_id():
+        flash('Không thể tự khoá tài khoản của chính mình.')
+        return redirect(url_for('developer_stats'))
+
+    new_locked = 0 if target['is_locked'] else 1
+    reason = (request.form.get('reason') or '').strip()[:200] if new_locked else ''
+    db.execute('UPDATE users SET is_locked = ?, lock_reason = ? WHERE id = ?', (new_locked, reason, user_id))
+    db.commit()
+    write_audit('lock' if new_locked else 'unlock', target['username'], reason)
+    flash(('Đã khoá' if new_locked else 'Đã mở khoá') + f" tài khoản '{target['username']}'.")
+    return redirect(url_for('developer_stats'))
+
+
+@app.route('/developer/users/<int:user_id>/reset-session', methods=['POST'])
+@admin_required
+def developer_reset_session(user_id):
+    """Đăng xuất tài khoản này khỏi TẤT CẢ thiết bị đang đăng nhập (tăng session_version)."""
+    db = get_db()
+    target = db.execute('SELECT id, role, username FROM users WHERE id = ?', (user_id,)).fetchone()
+    if not target:
+        flash('Không tìm thấy tài khoản.')
+        return redirect(url_for('developer_stats'))
+
+    actor = current_user()
+    if actor['role'] != 'super_admin' and role_rank(target['role']) >= role_rank('admin'):
+        flash('Chỉ Super Admin mới có thể reset session của tài khoản Admin/Super Admin.')
+        return redirect(url_for('developer_stats'))
+
+    db.execute('UPDATE users SET session_version = session_version + 1 WHERE id = ?', (user_id,))
+    db.commit()
+    write_audit('reset_session', target['username'])
+    flash(f"Đã đăng xuất toàn bộ phiên đăng nhập của '{target['username']}'.")
+    return redirect(url_for('developer_stats'))
+
+
+@app.route('/developer/users/<int:user_id>/delete', methods=['POST'])
+@admin_required
+def developer_delete_user(user_id):
+    """Xoá tài khoản + toàn bộ dữ liệu liên quan. Không cho xoá Admin/Super Admin qua UI này
+    (an toàn hệ thống) và không cho tự xoá chính mình."""
+    db = get_db()
+    target = db.execute('SELECT id, role, username FROM users WHERE id = ?', (user_id,)).fetchone()
+    if not target:
+        flash('Không tìm thấy tài khoản.')
+        return redirect(url_for('developer_stats'))
+    if role_rank(target['role']) >= role_rank('admin'):
+        flash('Không thể xoá tài khoản Admin/Super Admin qua giao diện này.')
+        return redirect(url_for('developer_stats'))
+    if target['id'] == current_user_id():
+        flash('Không thể tự xoá tài khoản của chính mình.')
+        return redirect(url_for('developer_stats'))
+
+    conv_ids = [r['id'] for r in db.execute(
+        'SELECT id FROM conversations WHERE user_id = ?', (user_id,)
+    ).fetchall()]
+    if conv_ids:
+        placeholders = ','.join('?' * len(conv_ids))
+        db.execute(f'DELETE FROM messages WHERE conversation_id IN ({placeholders})', conv_ids)
+    db.execute('DELETE FROM conversations WHERE user_id = ?', (user_id,))
+    db.execute('DELETE FROM projects WHERE user_id = ?', (user_id,))
+    db.execute('DELETE FROM custom_tutors WHERE owner_id = ?', (user_id,))
+    db.execute('DELETE FROM api_keys WHERE user_id = ?', (user_id,))
+    db.execute('DELETE FROM users WHERE id = ?', (user_id,))
+    db.commit()
+    write_audit('delete_account', target['username'])
+    flash(f"Đã xoá tài khoản '{target['username']}'.")
+    return redirect(url_for('developer_stats'))
 
 
 @app.route('/developer/banner', methods=['POST'])
-@developer_required
+@admin_required
 def developer_set_banner():
-    data = request.get_json(silent=True) or {}
-    text = (data.get('text') or '').strip()[:300]
-    active = bool(data.get('active'))
-    set_setting('banner_text', text)
-    set_setting('banner_active', '1' if active else '0')
-    return jsonify({"success": True, "banner": get_banner()})
+    message = (request.form.get('banner_message') or '').strip()[:300]
+    set_setting('banner_message', message)
+    write_audit('set_banner', detail=message)
+    flash('Đã cập nhật thông báo hệ thống.' if message else 'Đã xoá thông báo hệ thống.')
+    return redirect(url_for('developer_stats'))
+
+
+@app.route('/developer/maintenance', methods=['POST'])
+@admin_required
+def developer_toggle_maintenance():
+    """Chế độ bảo trì: chặn học sinh thường gửi câu hỏi AI, Admin/Super Admin vẫn dùng được
+    bình thường để kiểm tra hệ thống trước khi mở lại cho tất cả."""
+    value = 'on' if (request.form.get('value') == 'on') else 'off'
+    set_setting('maintenance_mode', value)
+    write_audit('toggle_maintenance', detail=value)
+    flash('Đã bật chế độ BẢO TRÌ — học sinh tạm thời không gửi được câu hỏi.' if value == 'on'
+          else 'Đã tắt chế độ bảo trì.')
+    return redirect(url_for('developer_stats'))
+
+
+@app.route('/developer/ai-config', methods=['POST'])
+@admin_required
+def developer_ai_config():
+    """Ghi đè model / temperature / hướng dẫn hệ thống chung mà KHÔNG cần sửa .env hay restart."""
+    model_override = (request.form.get('model_override') or '').strip()[:80]
+    temp_raw = (request.form.get('temperature_override') or '').strip()
+    addendum = (request.form.get('system_addendum') or '').strip()[:2000]
+
+    set_setting('ai_model_override', model_override)
+    set_setting('global_system_addendum', addendum)
+    try:
+        if temp_raw:
+            t = max(0.0, min(1.0, float(temp_raw)))
+            set_setting('ai_temperature_override', str(t))
+        else:
+            set_setting('ai_temperature_override', '')
+    except ValueError:
+        flash('Giá trị temperature không hợp lệ (phải là số từ 0 đến 1).')
+        return redirect(url_for('developer_stats'))
+
+    write_audit('update_ai_config', detail=f"model={model_override or '(mặc định)'}; temp={temp_raw or '(mặc định)'}")
+    flash('Đã cập nhật cấu hình AI.')
+    return redirect(url_for('developer_stats'))
 
 
 @app.route('/developer/google-login', methods=['POST'])
-@developer_required
-def developer_set_google_login():
-    data = request.get_json(silent=True) or {}
-    mode = data.get('mode')
-    if mode not in ('on', 'off', 'default'):
-        return jsonify({"error": "Giá trị không hợp lệ."}), 400
-    if mode == 'default':
-        set_setting('google_login_override', '')
-    else:
-        set_setting('google_login_override', mode)
-    return jsonify({"success": True, "google_login_on": google_login_effective()})
-
-
-@app.route('/developer/issues/<int:issue_id>/resolve', methods=['POST'])
-@developer_required
-def developer_resolve_issue(issue_id):
-    """Đánh dấu 1 báo cáo lỗi là đã xử lý (hoặc mở lại nếu bấm lần nữa)."""
-    db = get_db()
-    row = db.execute('SELECT id, status FROM issue_reports WHERE id = ?', (issue_id,)).fetchone()
-    if not row:
-        return jsonify({"error": "Không tìm thấy báo cáo này."}), 404
-    new_status = 'open' if row['status'] == 'resolved' else 'resolved'
-    resolved_at = now_iso() if new_status == 'resolved' else None
-    db.execute('UPDATE issue_reports SET status = ?, resolved_at = ? WHERE id = ?',
-               (new_status, resolved_at, issue_id))
-    db.commit()
-    return jsonify({"success": True, "status": new_status})
+@admin_required
+def developer_toggle_google_login():
+    value = (request.form.get('value') or '').strip()
+    if value not in ('on', 'off', ''):
+        value = ''
+    set_setting('google_login_override', value)
+    write_audit('toggle_google_login', detail=value or '(theo .env)')
+    flash('Đã cập nhật trạng thái đăng nhập Google.')
+    return redirect(url_for('developer_stats'))
 
 
 @app.route('/developer/export.csv')
-@developer_required
+@admin_required
 def developer_export_csv():
-    import csv as csv_module
+    """Xuất toàn bộ usage_logs ra CSV (chỉ số liệu tổng hợp, không có nội dung câu hỏi/trả lời)."""
     db = get_db()
-    rows = db.execute('''
-        SELECT l.id, u.username AS username, l.endpoint, l.subject, l.mode,
-               l.message_chars, l.response_chars, l.had_file, l.had_image, l.status, l.created_at
-        FROM usage_logs l LEFT JOIN users u ON u.id = l.user_id
-        ORDER BY l.id ASC
-    ''').fetchall()
+    rows = db.execute('SELECT * FROM usage_logs ORDER BY id DESC').fetchall()
+    header = ['id', 'user_id', 'endpoint', 'subject', 'mode', 'message_chars',
+              'response_chars', 'had_file', 'had_image', 'status', 'created_at']
 
-    buf = io.StringIO()
-    writer = csv_module.writer(buf)
-    writer.writerow(['id', 'username', 'endpoint', 'subject', 'mode', 'message_chars',
-                      'response_chars', 'had_file', 'had_image', 'status', 'created_at'])
-    for r in rows:
-        writer.writerow([r['id'], r['username'] or '', r['endpoint'], r['subject'] or '',
-                          r['mode'] or '', r['message_chars'], r['response_chars'],
-                          r['had_file'], r['had_image'], r['status'], r['created_at']])
+    def _csv_field(value):
+        s = '' if value is None else str(value)
+        if any(c in s for c in (',', '"', '\n')):
+            s = '"' + s.replace('"', '""') + '"'
+        return s
+
+    def generate_csv():
+        yield ','.join(header) + '\n'
+        for r in rows:
+            yield ','.join(_csv_field(r[h]) for h in header) + '\n'
 
     return Response(
-        buf.getvalue(),
+        generate_csv(),
         mimetype='text/csv',
-        headers={'Content-Disposition': 'attachment; filename=usage_logs.csv'}
+        headers={'Content-Disposition': 'attachment; filename=studymate_usage_logs.csv'},
     )
+
+
+AUDIT_LOG_HTML = r'''
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Nhật ký hệ thống - StudyMate AI Pro</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.6.0/css/all.min.css">
+</head>
+<body class="bg-[#0f0f0f] text-gray-200 min-h-screen">
+  <nav class="sticky top-0 z-10 bg-[#0f0f0f]/90 backdrop-blur border-b border-gray-800 px-4 sm:px-6 py-3 flex items-center justify-between">
+    <div class="flex items-center gap-2 font-bold"><i class="fas fa-scroll text-red-400"></i> Nhật ký hệ thống (Super Admin)</div>
+    <a href="/developer" class="text-sm text-indigo-400 hover:underline"><i class="fas fa-arrow-left mr-1"></i>Về Dashboard</a>
+  </nav>
+  <main class="max-w-5xl mx-auto px-4 sm:px-6 py-6">
+    <p class="text-xs text-gray-500 mb-4">Ghi lại các thao tác nhạy cảm: đổi vai trò, khoá/mở khoá, xoá tài khoản, reset session, cấu hình hệ thống. 200 dòng gần nhất.</p>
+    <div class="bg-[#1a1a1a] rounded-2xl border border-gray-800 overflow-x-auto">
+      <table class="w-full text-sm min-w-[640px]">
+        <thead>
+          <tr class="text-left text-gray-500 text-xs uppercase border-b border-gray-800">
+            <th class="py-2.5 px-4">Thời gian</th>
+            <th class="py-2.5 px-4">Người thực hiện</th>
+            <th class="py-2.5 px-4">Hành động</th>
+            <th class="py-2.5 px-4">Đối tượng</th>
+            <th class="py-2.5 px-4">Chi tiết</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for log in logs %}
+          <tr class="border-b border-gray-900">
+            <td class="py-2.5 px-4 text-gray-500 whitespace-nowrap">{{ log.created_at[:16].replace('T',' ') }}</td>
+            <td class="py-2.5 px-4 font-medium">{{ log.actor_username or '(hệ thống)' }}</td>
+            <td class="py-2.5 px-4"><span class="text-xs font-semibold px-2 py-0.5 rounded-full bg-gray-800">{{ log.action }}</span></td>
+            <td class="py-2.5 px-4 text-gray-400">{{ log.target }}</td>
+            <td class="py-2.5 px-4 text-gray-500">{{ log.detail }}</td>
+          </tr>
+          {% else %}
+          <tr><td colspan="5" class="py-8 text-center text-gray-500">Chưa có nhật ký nào.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </main>
+</body>
+</html>
+'''
+
+
+@app.route('/developer/audit')
+@super_admin_required
+def developer_audit_log():
+    db = get_db()
+    logs = db.execute('SELECT * FROM audit_logs ORDER BY id DESC LIMIT 200').fetchall()
+    return render_template_string(AUDIT_LOG_HTML, logs=[dict(l) for l in logs])
 
 
 # ==========================================
@@ -3134,13 +3056,23 @@ def stream_consolex_ai(system_prompt: str, user_content):
         "Authorization": f"Bearer {XAI_API_KEY}",
         "Content-Type": "application/json",
     }
+
+    # Admin/Super Admin có thể ghi đè model & temperature từ /developer mà không cần sửa .env
+    # hay khởi động lại server (đọc từ bảng settings, có cache 1 request qua get_setting -> get_db/g).
+    model = get_setting('ai_model_override', '') or CONSOLEX_MODEL
+    temp_override = get_setting('ai_temperature_override', '')
+    try:
+        temperature = float(temp_override) if temp_override else 0.7
+    except ValueError:
+        temperature = 0.7
+
     payload = {
-        "model": CONSOLEX_MODEL,
+        "model": model,
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_content},
         ],
-        "temperature": 0.7,
+        "temperature": temperature,
         "max_tokens": 800,
         "stream": True,
     }
@@ -3173,14 +3105,16 @@ def stream_consolex_ai(system_prompt: str, user_content):
 # ==========================================
 # 8. UPLOAD FILE / ẢNH
 # ==========================================
-def _truncate_text(full_text: str) -> str:
+def _truncate_text(full_text: str, unlimited: bool = False) -> str:
+    if unlimited:
+        return full_text
     truncated = full_text[:MAX_FILE_CHARS]
     if len(full_text) > MAX_FILE_CHARS:
         truncated += "\n\n[... nội dung bị cắt bớt do quá dài ...]"
     return truncated
 
 
-def handle_pdf_upload(f):
+def handle_pdf_upload(f, unlimited=False):
     try:
         reader = PdfReader(f.stream)
         num_pages = len(reader.pages)
@@ -3197,12 +3131,12 @@ def handle_pdf_upload(f):
                          "Em thử gõ trực tiếp câu hỏi hoặc nội dung cần hỏi nhé!"
             }), 200
 
-        return jsonify({"text": _truncate_text(full_text), "pages": num_pages})
+        return jsonify({"text": _truncate_text(full_text, unlimited), "pages": num_pages})
     except Exception as e:
         return jsonify({"error": f"Không đọc được file PDF: {e}"}), 500
 
 
-def handle_docx_upload(f):
+def handle_docx_upload(f, unlimited=False):
     if docx_lib is None:
         return jsonify({
             "error": "Server chưa cài thư viện đọc Word. Vui lòng chạy: pip install python-docx"
@@ -3221,12 +3155,12 @@ def handle_docx_upload(f):
         if not full_text:
             return jsonify({"error": "File Word này không có nội dung văn bản để đọc."}), 200
 
-        return jsonify({"text": _truncate_text(full_text), "pages": None})
+        return jsonify({"text": _truncate_text(full_text, unlimited), "pages": None})
     except Exception as e:
         return jsonify({"error": f"Không đọc được file Word: {e}"}), 500
 
 
-def handle_text_upload(f):
+def handle_text_upload(f, unlimited=False):
     try:
         raw = f.read()
         try:
@@ -3238,14 +3172,14 @@ def handle_text_upload(f):
         if not text:
             return jsonify({"error": "File này không có nội dung."}), 200
 
-        return jsonify({"text": _truncate_text(text), "pages": None})
+        return jsonify({"text": _truncate_text(text, unlimited), "pages": None})
     except Exception as e:
         return jsonify({"error": f"Không đọc được file: {e}"}), 500
 
 
-def handle_image_upload(f, filename, ext):
+def handle_image_upload(f, filename, ext, unlimited=False):
     raw = f.read()
-    if len(raw) > MAX_IMAGE_BYTES:
+    if not unlimited and len(raw) > MAX_IMAGE_BYTES:
         return jsonify({
             "error": f"Ảnh quá lớn (>{MAX_IMAGE_BYTES // (1024 * 1024)}MB). Em thử ảnh nhỏ hơn nhé!"
         }), 400
@@ -3296,14 +3230,18 @@ def upload_file():
     filename = f.filename or ''
     ext = os.path.splitext(filename.lower())[1]
 
+    # Admin trở lên: không bị giới hạn dung lượng ảnh (6MB) hay độ dài văn bản trích xuất (12,000
+    # ký tự) — chỉ còn bị giới hạn bởi mức trần cứng của toàn server (MAX_CONTENT_LENGTH, 50MB/request).
+    unlimited = role_rank(current_user_role()) >= role_rank('admin')
+
     if ext in ALLOWED_IMAGE_EXT:
-        return handle_image_upload(f, filename, ext)
+        return handle_image_upload(f, filename, ext, unlimited)
     if ext == '.pdf':
-        return handle_pdf_upload(f)
+        return handle_pdf_upload(f, unlimited)
     if ext == '.docx':
-        return handle_docx_upload(f)
+        return handle_docx_upload(f, unlimited)
     if ext in ('.txt', '.csv'):
-        return handle_text_upload(f)
+        return handle_text_upload(f, unlimited)
 
     return jsonify({
         "error": f"Định dạng {ext or 'không xác định'} chưa được hỗ trợ. "
@@ -3319,134 +3257,11 @@ def upload_file():
 def list_conversations():
     db = get_db()
     rows = db.execute(
-        'SELECT id, title, updated_at, pinned, project_id FROM conversations WHERE user_id = ? '
-        'ORDER BY pinned DESC, updated_at DESC',
+        'SELECT id, title, updated_at, pinned, project_id FROM conversations '
+        'WHERE user_id = ? ORDER BY pinned DESC, updated_at DESC',
         (current_user_id(),)
     ).fetchall()
     return jsonify([dict(r) for r in rows])
-
-
-@app.route('/api/conversations/<int:conv_id>', methods=['PATCH'])
-@login_required
-def update_conversation(conv_id):
-    db = get_db()
-    conv = db.execute(
-        'SELECT id FROM conversations WHERE id = ? AND user_id = ?', (conv_id, current_user_id())
-    ).fetchone()
-    if not conv:
-        return jsonify({"error": "Không tìm thấy đoạn chat này."}), 404
-
-    data = request.get_json(silent=True) or {}
-    fields, params = [], []
-
-    if 'title' in data:
-        title = (data.get('title') or '').strip()
-        if not title:
-            return jsonify({"error": "Tên đoạn chat không được để trống."}), 400
-        fields.append('title = ?')
-        params.append(title[:120])
-
-    if 'pinned' in data:
-        fields.append('pinned = ?')
-        params.append(1 if data.get('pinned') else 0)
-
-    if 'project_id' in data:
-        project_id = data.get('project_id')
-        if project_id is not None:
-            proj = db.execute(
-                'SELECT id FROM projects WHERE id = ? AND user_id = ?', (project_id, current_user_id())
-            ).fetchone()
-            if not proj:
-                return jsonify({"error": "Không tìm thấy dự án này."}), 404
-        fields.append('project_id = ?')
-        params.append(project_id)
-
-    if not fields:
-        return jsonify({"error": "Không có gì để cập nhật."}), 400
-
-    params.append(conv_id)
-    db.execute(f"UPDATE conversations SET {', '.join(fields)} WHERE id = ?", params)
-    db.commit()
-    return jsonify({"success": True})
-
-
-@app.route('/api/conversations/delete-all', methods=['POST'])
-@login_required
-def delete_all_conversations():
-    db = get_db()
-    conv_ids = [r['id'] for r in db.execute(
-        'SELECT id FROM conversations WHERE user_id = ?', (current_user_id(),)
-    ).fetchall()]
-    if conv_ids:
-        placeholders = ','.join('?' * len(conv_ids))
-        db.execute(f'DELETE FROM messages WHERE conversation_id IN ({placeholders})', conv_ids)
-        db.execute(f'DELETE FROM conversations WHERE id IN ({placeholders})', conv_ids)
-        db.commit()
-    return jsonify({"success": True, "deleted": len(conv_ids)})
-
-
-# ---- Dự án (Projects) ----
-@app.route('/api/projects', methods=['GET'])
-@login_required
-def list_projects():
-    db = get_db()
-    rows = db.execute(
-        'SELECT id, name, created_at FROM projects WHERE user_id = ? ORDER BY created_at DESC',
-        (current_user_id(),)
-    ).fetchall()
-    return jsonify([dict(r) for r in rows])
-
-
-@app.route('/api/projects', methods=['POST'])
-@login_required
-def create_project():
-    data = request.get_json(silent=True) or {}
-    name = (data.get('name') or '').strip()
-    if not name:
-        return jsonify({"error": "Tên dự án không được để trống."}), 400
-    db = get_db()
-    cur = db.execute(
-        'INSERT INTO projects (user_id, name, created_at) VALUES (?, ?, ?)',
-        (current_user_id(), name[:80], now_iso())
-    )
-    db.commit()
-    return jsonify({"id": cur.lastrowid, "name": name[:80]})
-
-
-@app.route('/api/projects/<int:project_id>', methods=['DELETE'])
-@login_required
-def delete_project(project_id):
-    db = get_db()
-    proj = db.execute(
-        'SELECT id FROM projects WHERE id = ? AND user_id = ?', (project_id, current_user_id())
-    ).fetchone()
-    if not proj:
-        return jsonify({"error": "Không tìm thấy dự án này."}), 404
-    db.execute('UPDATE conversations SET project_id = NULL WHERE project_id = ?', (project_id,))
-    db.execute('DELETE FROM projects WHERE id = ?', (project_id,))
-    db.commit()
-    return jsonify({"success": True})
-
-
-# ---- Tùy chọn cá nhân (Preferences) ----
-@app.route('/api/preferences', methods=['GET'])
-@login_required
-def api_get_preferences():
-    return jsonify(get_preferences(current_user_id()))
-
-
-@app.route('/api/preferences', methods=['POST'])
-@login_required
-def api_set_preferences():
-    data = request.get_json(silent=True) or {}
-    return jsonify(set_preferences(current_user_id(), data))
-
-
-# ---- Banner hệ thống (chỉ đọc, cho mọi người dùng đã đăng nhập) ----
-@app.route('/api/banner', methods=['GET'])
-@login_required
-def api_get_banner():
-    return jsonify(get_banner())
 
 
 @app.route('/api/conversations/<int:conv_id>/messages', methods=['GET'])
@@ -3465,6 +3280,50 @@ def get_conversation_messages(conv_id):
     return jsonify([dict(r) for r in rows])
 
 
+@app.route('/api/conversations/<int:conv_id>', methods=['PATCH'])
+@login_required
+def update_conversation(conv_id):
+    """Cập nhật 1 đoạn chat: đổi tên, ghim/bỏ ghim, hoặc chuyển vào một dự án."""
+    db = get_db()
+    conv = db.execute(
+        'SELECT id FROM conversations WHERE id = ? AND user_id = ?', (conv_id, current_user_id())
+    ).fetchone()
+    if not conv:
+        return jsonify({"error": "Không tìm thấy đoạn chat này."}), 404
+
+    data = request.get_json(silent=True) or {}
+    set_clauses, values = [], []
+
+    if 'title' in data:
+        title = (data.get('title') or '').strip()[:120]
+        if title:
+            set_clauses.append('title = ?')
+            values.append(title)
+
+    if 'pinned' in data:
+        set_clauses.append('pinned = ?')
+        values.append(1 if data.get('pinned') else 0)
+
+    if 'project_id' in data:
+        project_id = data.get('project_id')
+        if project_id is not None:
+            proj = db.execute(
+                'SELECT id FROM projects WHERE id = ? AND user_id = ?', (project_id, current_user_id())
+            ).fetchone()
+            if not proj:
+                return jsonify({"error": "Không tìm thấy dự án."}), 404
+        set_clauses.append('project_id = ?')
+        values.append(project_id)
+
+    if not set_clauses:
+        return jsonify({"error": "Không có nội dung nào để cập nhật."}), 400
+
+    values.append(conv_id)
+    db.execute(f'UPDATE conversations SET {", ".join(set_clauses)} WHERE id = ?', values)
+    db.commit()
+    return jsonify({"success": True})
+
+
 @app.route('/api/conversations/<int:conv_id>', methods=['DELETE'])
 @login_required
 def delete_conversation(conv_id):
@@ -3481,64 +3340,243 @@ def delete_conversation(conv_id):
     return jsonify({"success": True})
 
 
-# ==========================================
-# 10. CHAT (STREAMING QUA SERVER-SENT EVENTS) + LƯU LỊCH SỬ
-# ==========================================
-@app.route('/api/report-issue', methods=['POST'])
+@app.route('/api/conversations/all', methods=['DELETE'])
 @login_required
-def report_issue():
-    """Học sinh báo lỗi 1 câu trả lời cụ thể (hoặc báo lỗi chung). Lưu lại để developer xem
-    và xử lý ở trang /developer."""
-    data = request.get_json(silent=True) or {}
-    description = (data.get('description') or '').strip()
-    message_excerpt = (data.get('messageExcerpt') or '').strip()[:2000]
-    raw_conv_id = data.get('conversationId')
-
-    if not description:
-        return jsonify({"error": "Em mô tả lỗi cụ thể giúp Thầy/Cô nhé."}), 400
-    if len(description) > 1000:
-        return jsonify({"error": "Mô tả hơi dài, em rút gọn lại giúp Thầy/Cô nhé!"}), 400
-
-    conv_id = None
-    if raw_conv_id is not None:
-        try:
-            conv_id = int(raw_conv_id)
-        except (TypeError, ValueError):
-            conv_id = None
-
+def delete_all_conversations():
+    """Xoá toàn bộ lịch sử trò chuyện của tài khoản hiện tại (dùng trong Cài đặt)."""
     db = get_db()
-    db.execute(
-        '''INSERT INTO issue_reports
-           (user_id, conversation_id, message_excerpt, description, status, created_at)
-           VALUES (?, ?, ?, ?, 'open', ?)''',
-        (current_user_id(), conv_id, message_excerpt, description, now_iso())
+    conv_ids = [r['id'] for r in db.execute(
+        'SELECT id FROM conversations WHERE user_id = ?', (current_user_id(),)
+    ).fetchall()]
+    if conv_ids:
+        placeholders = ','.join('?' * len(conv_ids))
+        db.execute(f'DELETE FROM messages WHERE conversation_id IN ({placeholders})', conv_ids)
+        db.execute('DELETE FROM conversations WHERE user_id = ?', (current_user_id(),))
+        db.commit()
+    return jsonify({"success": True, "deleted": len(conv_ids)})
+
+
+# ==========================================
+# 9.1 "DỰ ÁN" (giống Claude Projects) — nhóm các đoạn chat theo chủ đề
+# ==========================================
+@app.route('/api/projects', methods=['GET'])
+@login_required
+def list_projects():
+    db = get_db()
+    rows = db.execute(
+        'SELECT id, name FROM projects WHERE user_id = ? ORDER BY name ASC', (current_user_id(),)
+    ).fetchall()
+    return jsonify([dict(r) for r in rows])
+
+
+@app.route('/api/projects', methods=['POST'])
+@login_required
+def create_project():
+    data = request.get_json(silent=True) or {}
+    name = (data.get('name') or '').strip()[:60]
+    if not name:
+        return jsonify({"error": "Tên dự án không hợp lệ."}), 400
+    db = get_db()
+    cur = db.execute(
+        'INSERT INTO projects (user_id, name, created_at) VALUES (?, ?, ?)',
+        (current_user_id(), name, now_iso())
     )
+    db.commit()
+    return jsonify({"id": cur.lastrowid, "name": name})
+
+
+@app.route('/api/projects/<int:proj_id>', methods=['DELETE'])
+@login_required
+def delete_project(proj_id):
+    db = get_db()
+    proj = db.execute(
+        'SELECT id FROM projects WHERE id = ? AND user_id = ?', (proj_id, current_user_id())
+    ).fetchone()
+    if not proj:
+        return jsonify({"error": "Không tìm thấy dự án."}), 404
+    # Xoá dự án không xoá đoạn chat bên trong — chỉ gỡ nhóm, đoạn chat quay lại mục "Gần đây".
+    db.execute('UPDATE conversations SET project_id = NULL WHERE project_id = ?', (proj_id,))
+    db.execute('DELETE FROM projects WHERE id = ?', (proj_id,))
     db.commit()
     return jsonify({"success": True})
 
 
-@app.route('/api/memories', methods=['GET'])
+# ==========================================
+# 9.2 TUỲ CHỈNH CÁ NHÂN (Cài đặt) + THÔNG BÁO HỆ THỐNG
+# ==========================================
+@app.route('/api/preferences', methods=['GET'])
 @login_required
-def api_list_memories():
+def get_preferences():
+    return jsonify(get_user_preferences(current_user_id()))
+
+
+@app.route('/api/preferences', methods=['POST'])
+@login_required
+def update_preferences():
+    data = request.get_json(silent=True) or {}
+    prefs = save_user_preferences(current_user_id(), data)
+    return jsonify(prefs)
+
+
+@app.route('/api/banner', methods=['GET'])
+@login_required
+def get_banner():
+    return jsonify({
+        "message": get_setting('banner_message', '') or '',
+        "maintenance": get_setting('maintenance_mode', 'off') == 'on',
+    })
+
+
+# ==========================================
+# 9.3 AI TUTOR TUỲ CHỈNH (Developer trở lên)
+# ==========================================
+@app.route('/api/tutors', methods=['GET'])
+@developer_required
+def list_tutors():
     db = get_db()
     rows = db.execute(
-        'SELECT id, content, source, created_at FROM memories WHERE user_id = ? ORDER BY created_at DESC',
+        'SELECT id, name, system_prompt, created_at FROM custom_tutors WHERE owner_id = ? ORDER BY id DESC',
         (current_user_id(),)
     ).fetchall()
     return jsonify([dict(r) for r in rows])
 
 
-@app.route('/api/memories', methods=['DELETE'])
-@login_required
-def api_clear_memories():
-    """Xoá toàn bộ 'bộ nhớ' AI của chính học sinh này (quyền riêng tư — mỗi người chỉ xoá
-    được bộ nhớ của mình)."""
+@app.route('/api/tutors', methods=['POST'])
+@developer_required
+def create_tutor():
+    data = request.get_json(silent=True) or {}
+    name = (data.get('name') or '').strip()[:60]
+    system_prompt = (data.get('system_prompt') or '').strip()[:4000]
+    if not name or not system_prompt:
+        return jsonify({"error": "Cần nhập tên và nội dung hướng dẫn (system prompt) cho Tutor."}), 400
     db = get_db()
-    db.execute('DELETE FROM memories WHERE user_id = ?', (current_user_id(),))
+    cur = db.execute(
+        'INSERT INTO custom_tutors (owner_id, name, system_prompt, created_at) VALUES (?, ?, ?, ?)',
+        (current_user_id(), name, system_prompt, now_iso())
+    )
+    db.commit()
+    return jsonify({"id": cur.lastrowid, "name": name, "system_prompt": system_prompt})
+
+
+@app.route('/api/tutors/<int:tutor_id>', methods=['DELETE'])
+@developer_required
+def delete_tutor(tutor_id):
+    db = get_db()
+    tutor = db.execute(
+        'SELECT id FROM custom_tutors WHERE id = ? AND owner_id = ?', (tutor_id, current_user_id())
+    ).fetchone()
+    if not tutor:
+        return jsonify({"error": "Không tìm thấy AI Tutor này."}), 404
+    db.execute('DELETE FROM custom_tutors WHERE id = ?', (tutor_id,))
     db.commit()
     return jsonify({"success": True})
 
 
+# ==========================================
+# 9.4 API KEY (Developer trở lên) — quản lý key + endpoint xác thực demo
+# ==========================================
+def _hash_api_key(raw_key):
+    import hashlib
+    return hashlib.sha256(raw_key.encode('utf-8')).hexdigest()
+
+
+@app.route('/api/keys', methods=['GET'])
+@developer_required
+def list_api_keys():
+    db = get_db()
+    rows = db.execute(
+        'SELECT id, name, key_prefix, created_at, last_used_at, revoked FROM api_keys '
+        'WHERE user_id = ? ORDER BY id DESC',
+        (current_user_id(),)
+    ).fetchall()
+    return jsonify([dict(r) for r in rows])
+
+
+@app.route('/api/keys', methods=['POST'])
+@developer_required
+def create_api_key():
+    data = request.get_json(silent=True) or {}
+    name = (data.get('name') or 'Key không tên').strip()[:60]
+    raw_key = 'sm_' + secrets.token_urlsafe(32)
+    key_hash = _hash_api_key(raw_key)
+    key_prefix = raw_key[:12] + '…'
+    db = get_db()
+    cur = db.execute(
+        'INSERT INTO api_keys (user_id, name, key_prefix, key_hash, created_at) VALUES (?, ?, ?, ?, ?)',
+        (current_user_id(), name, key_prefix, key_hash, now_iso())
+    )
+    db.commit()
+    # Key gốc CHỈ hiển thị đúng 1 lần lúc tạo — sau đó server chỉ còn giữ bản băm (hash).
+    return jsonify({"id": cur.lastrowid, "name": name, "key": raw_key, "key_prefix": key_prefix})
+
+
+@app.route('/api/keys/<int:key_id>', methods=['DELETE'])
+@developer_required
+def revoke_api_key(key_id):
+    db = get_db()
+    key_row = db.execute(
+        'SELECT id FROM api_keys WHERE id = ? AND user_id = ?', (key_id, current_user_id())
+    ).fetchone()
+    if not key_row:
+        return jsonify({"error": "Không tìm thấy API Key này."}), 404
+    db.execute('UPDATE api_keys SET revoked = 1 WHERE id = ?', (key_id,))
+    db.commit()
+    return jsonify({"success": True})
+
+
+@app.route('/api/v1/ping', methods=['GET'])
+def api_v1_ping():
+    """Endpoint demo để xác nhận cơ chế xác thực bằng API Key hoạt động thật (không phải giả lập).
+    Header: Authorization: Bearer <api_key>. Đây là điểm khởi đầu hạ tầng — chưa có endpoint
+    /api/v1/chat đầy đủ (xem ghi chú 'Chưa làm' trong README)."""
+    auth_header = request.headers.get('Authorization', '')
+    if not auth_header.startswith('Bearer '):
+        return jsonify({"error": "Thiếu API Key (header Authorization: Bearer <key>)."}), 401
+    raw_key = auth_header[len('Bearer '):].strip()
+    key_hash = _hash_api_key(raw_key)
+    db = get_db()
+    row = db.execute(
+        'SELECT ak.id, u.username FROM api_keys ak JOIN users u ON u.id = ak.user_id '
+        'WHERE ak.key_hash = ? AND ak.revoked = 0',
+        (key_hash,)
+    ).fetchone()
+    if not row:
+        return jsonify({"error": "API Key không hợp lệ hoặc đã bị thu hồi."}), 401
+    db.execute('UPDATE api_keys SET last_used_at = ? WHERE id = ?', (now_iso(), row['id']))
+    db.commit()
+    return jsonify({"ok": True, "user": row['username'], "message": "API Key hợp lệ."})
+
+
+# ==========================================
+# 9.5 PLAYGROUND (Developer trở lên) — thử prompt trực tiếp, không lưu vào lịch sử chat
+# ==========================================
+@app.route('/api/playground', methods=['POST'])
+@developer_required
+def playground_run():
+    data = request.get_json(silent=True) or {}
+    system_prompt = (data.get('system_prompt') or 'Bạn là một trợ lý AI hữu ích.').strip()[:4000]
+    user_message = (data.get('message') or '').strip()[:4000]
+    if not user_message:
+        return jsonify({"error": "Nhập nội dung để thử nghiệm."}), 400
+
+    def generate():
+        try:
+            for token in stream_consolex_ai(system_prompt, user_message):
+                yield f"data: {json.dumps({'token': token})}\n\n"
+            yield f"data: {json.dumps({'done': True})}\n\n"
+        except Exception as e:
+            yield f"data: {json.dumps({'error': str(e)})}\n\n"
+
+    return Response(
+        stream_with_context(generate()),
+        mimetype='text/event-stream',
+        headers={'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no', 'Connection': 'keep-alive'},
+    )
+
+
+# ==========================================
+# 10. CHAT (STREAMING QUA SERVER-SENT EVENTS) + LƯU LỊCH SỬ
+# ==========================================
 @app.route('/api/chat', methods=['POST'])
 @login_required
 def chat():
@@ -3550,18 +3588,40 @@ def chat():
     file_name = (data.get('fileName') or '').strip()
     image_data = (data.get('imageData') or '').strip()
     raw_conv_id = data.get('conversationId')
+    raw_tutor_id = data.get('tutorId')
+
+    role = current_user_role()
+    unlimited = role_rank(role) >= role_rank('admin')  # Admin/Super Admin: không giới hạn độ dài tin nhắn
+
+    # Chế độ bảo trì: chặn học sinh thường, Admin trở lên vẫn dùng được để kiểm tra hệ thống.
+    if get_setting('maintenance_mode', 'off') == 'on' and role_rank(role) < role_rank('admin'):
+        return jsonify({"error": "Hệ thống đang bảo trì, em quay lại sau ít phút nhé! 🛠️"}), 503
 
     if not user_message:
         return jsonify({"error": "Em chưa nhập câu hỏi nào cả."}), 400
 
     # Input validation cơ bản để tránh payload bất thường.
-    if len(user_message) > 4000:
+    if not unlimited and len(user_message) > 4000:
         return jsonify({"error": "Câu hỏi quá dài, em rút gọn lại giúp Thầy/Cô nhé!"}), 400
     if image_data and not image_data.startswith('data:image/'):
         return jsonify({"error": "Dữ liệu ảnh không hợp lệ."}), 400
 
     user_id = current_user_id()
     db = get_db()
+
+    # AI Tutor tuỳ chỉnh (Developer trở lên): nếu chọn 1 tutor riêng, dùng system prompt của
+    # tutor đó thay cho prompt mặc định theo Môn học/Chế độ.
+    custom_tutor = None
+    if raw_tutor_id and role_rank(role) >= role_rank('developer'):
+        try:
+            tutor_id = int(raw_tutor_id)
+        except (TypeError, ValueError):
+            tutor_id = None
+        if tutor_id is not None:
+            custom_tutor = db.execute(
+                'SELECT id, name, system_prompt FROM custom_tutors WHERE id = ? AND owner_id = ?',
+                (tutor_id, user_id)
+            ).fetchone()
 
     # Xác định (hoặc tạo mới) đoạn hội thoại để lưu lịch sử theo tài khoản.
     conv_id = None
@@ -3592,12 +3652,18 @@ def chat():
     )
     db.commit()
 
-    # "Bộ nhớ" AI: phát hiện + lưu 1 mục mới từ tin nhắn này (nếu có), rồi lấy những gì
-    # đã ghi nhớ trước đó để cá nhân hoá câu trả lời.
-    new_memory = extract_and_save_memory(user_id, user_message)
-    recent_memories = get_recent_memories(user_id)
-
-    system_prompt = f"""
+    if custom_tutor:
+        system_prompt = f"""
+    Bạn là "{custom_tutor['name']}", một AI Tutor tuỳ chỉnh do chính người dùng tạo ra trên StudyMate AI Pro.
+    Hãy làm theo đúng hướng dẫn/vai trò sau đây do người tạo đặt ra:
+    ---
+    {custom_tutor['system_prompt']}
+    ---
+    Vẫn dùng Markdown để trình bày rõ ràng, dễ đọc.
+    Với công thức/phép toán: đặt trong cú pháp LaTeX chuẩn ("$$...$$" cho dòng riêng, "\\(...\\)" cho công thức ngắn giữa câu).
+    """
+    else:
+        system_prompt = f"""
     Bạn là StudyMate AI Pro, gia sư THCS (lớp 6-9) tận tâm.
     Môn học: {subject}. Chế độ: {mode}.
     Quy tắc:
@@ -3614,14 +3680,16 @@ def chat():
        "\\(...\\)". Không viết công thức dưới dạng chữ thường lẫn trong đoạn văn.
     """
 
-    if recent_memories:
-        mem_lines = "\n".join(f"    - {m}" for m in recent_memories)
+    # Admin có thể thêm 1 đoạn hướng dẫn chung áp dụng cho MỌI cuộc trò chuyện (vd: quy định
+    # riêng của trường/lớp) từ trang /developer, không cần sửa code.
+    global_addendum = get_setting('global_system_addendum', '')
+    if global_addendum:
         system_prompt += f"""
 
-    Những điều Thầy/Cô đã ghi nhớ về học sinh này từ các lần trò chuyện trước:
-{mem_lines}
-    Hãy tận dụng thông tin này để cá nhân hoá câu trả lời khi phù hợp (vd: đúng trình độ
-    lớp học), nhưng đừng nhắc lại y nguyên nếu không cần thiết.
+    Hướng dẫn bổ sung từ quản trị viên hệ thống (áp dụng cho mọi cuộc trò chuyện):
+    ---
+    {global_addendum}
+    ---
     """
 
     if file_context:
@@ -3651,8 +3719,6 @@ def chat():
 
     def generate():
         yield f"data: {json.dumps({'conversationId': conv_id})}\n\n"
-        if new_memory:
-            yield f"data: {json.dumps({'memory': new_memory})}\n\n"
         collected = []
         try:
             for token in stream_consolex_ai(system_prompt, user_content):
@@ -3711,13 +3777,4 @@ if __name__ == '__main__':
     print("🛡️ Để xem bảng báo cáo bảo mật... Truy cập: http://localhost:5000/security")
     # debug=True chỉ dùng khi phát triển trên máy cá nhân — KHÔNG bật khi deploy thật
     # (xem README phần "Deploy lên production" để chạy bằng gunicorn thay vì app.run).
-    # use_reloader=False: khi debug=True, Werkzeug mặc định tự khởi động lại
-    # (restart) tiến trình mỗi khi phát hiện một file trong thư mục dự án thay
-    # đổi. studymate.db (SQLite) bị ghi liên tục mỗi khi có tin nhắn mới, nên
-    # nó cũng bị coi là "file thay đổi" và làm server tự restart ngay giữa lúc
-    # đang stream câu trả lời — kết nối SQLite của request đó bị đóng đột ngột,
-    # gây lỗi "Cannot operate on a closed database." mà em thấy trong khung chat.
-    # Tắt use_reloader để tránh restart ngoài ý muốn này (vẫn giữ debug=True để
-    # còn thấy traceback lỗi khi phát triển). Khi sửa code .py, chỉ cần dừng
-    # (Ctrl+C) và chạy lại `python app.py` thủ công.
-    app.run(host='0.0.0.0', port=5000, debug=True, threaded=True, use_reloader=False)
+    app.run(host='0.0.0.0', port=5000, debug=True, threaded=True)
