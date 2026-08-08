@@ -5,10 +5,13 @@ import json
 import base64
 import secrets
 import sqlite3
+import hmac
+import hashlib
 import requests
 import importlib
 from datetime import datetime, timezone, timedelta
 from functools import wraps
+from urllib.parse import urlencode, quote_plus
 from dotenv import load_dotenv
 from flask import (
     Flask, render_template_string, request, jsonify, Response,
@@ -47,6 +50,16 @@ app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 1024 * 1024 * 1024 + 8 * 1024 * 1024  # 1GB + đệm cho overhead multipart
 app.config['SESSION_COOKIE_HTTPONLY'] = True
 app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
+
+
+@app.template_filter('vnd')
+def _format_vnd(amount):
+    """Format số tiền kiểu Việt Nam: dấu chấm ngăn cách hàng nghìn (vd: 30000 -> '30.000')."""
+    try:
+        return f"{int(amount):,}".replace(',', '.')
+    except (TypeError, ValueError):
+        return str(amount)
+
 
 from werkzeug.middleware.proxy_fix import ProxyFix
 
@@ -247,6 +260,13 @@ def init_db():
         conn.execute("ALTER TABLE users ADD COLUMN plan TEXT NOT NULL DEFAULT 'free'")
         conn.commit()
 
+    # Gói Premium/Max giờ tính THEO THÁNG (không phải vĩnh viễn) — plan_expires_at là mốc
+    # hết hạn. Hết hạn mà chưa gia hạn thì effective_plan() tự coi như 'free' (không cần job
+    # nền dọn dẹp gì cả, tính "lazy" ngay lúc đọc — xem effective_plan() ở mục 0.25).
+    if 'plan_expires_at' not in existing_cols:
+        conn.execute("ALTER TABLE users ADD COLUMN plan_expires_at TEXT")
+        conn.commit()
+
     # "AI Tutor" tuỳ chỉnh do developer trở lên tự tạo (tên + system prompt riêng).
     conn.execute('''
         CREATE TABLE IF NOT EXISTS custom_tutors (
@@ -295,6 +315,83 @@ def init_db():
             kind TEXT NOT NULL,
             size_bytes INTEGER DEFAULT 0,
             created_at TEXT NOT NULL,
+            FOREIGN KEY (user_id) REFERENCES users (id)
+        )
+    ''')
+    # Đơn nâng cấp gói (thanh toán). "method" = 'vnpay' (ATM/Visa/Mastercard/JCB qua cổng
+    # VNPAY) hoặc 'bank_transfer' (chuyển khoản quét mã VietQR, xác nhận thủ công bởi Admin).
+    # "order_code" vừa là mã tra cứu, vừa dùng làm vnp_TxnRef / nội dung chuyển khoản.
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS payment_orders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            order_code TEXT UNIQUE NOT NULL,
+            user_id INTEGER NOT NULL,
+            plan TEXT NOT NULL,
+            amount INTEGER NOT NULL,
+            base_amount INTEGER NOT NULL DEFAULT 0,
+            is_discounted INTEGER NOT NULL DEFAULT 0,
+            method TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            provider_txn_id TEXT,
+            created_at TEXT NOT NULL,
+            paid_at TEXT,
+            note TEXT,
+            FOREIGN KEY (user_id) REFERENCES users (id)
+        )
+    ''')
+    payment_cols = [r[1] for r in conn.execute('PRAGMA table_info(payment_orders)').fetchall()]
+    if 'base_amount' not in payment_cols:
+        conn.execute("ALTER TABLE payment_orders ADD COLUMN base_amount INTEGER NOT NULL DEFAULT 0")
+        conn.commit()
+    if 'is_discounted' not in payment_cols:
+        conn.execute("ALTER TABLE payment_orders ADD COLUMN is_discounted INTEGER NOT NULL DEFAULT 0")
+        conn.commit()
+    # "Bộ nhớ" AI — điều đáng nhớ về 1 học sinh (môn yếu, mục tiêu, cách giải thích ưa thích...)
+    # để cá nhân hoá câu trả lời ở các lượt chat sau. category giúp phân loại khi hiển thị.
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS memories (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            content TEXT NOT NULL,
+            category TEXT NOT NULL DEFAULT 'general',
+            source TEXT NOT NULL DEFAULT 'auto',
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (user_id) REFERENCES users (id)
+        )
+    ''')
+    # Báo lỗi câu trả lời từ học sinh — gắn với 1 đoạn chat cụ thể (nếu có) để Admin xem lại.
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS issue_reports (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            conversation_id INTEGER,
+            message_excerpt TEXT,
+            description TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'open',
+            created_at TEXT NOT NULL,
+            resolved_at TEXT,
+            resolved_by TEXT,
+            FOREIGN KEY (user_id) REFERENCES users (id)
+        )
+    ''')
+    # Gamification nhẹ: XP + streak (số ngày học liên tiếp) theo tài khoản.
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS user_stats (
+            user_id INTEGER PRIMARY KEY,
+            xp INTEGER NOT NULL DEFAULT 0,
+            streak_days INTEGER NOT NULL DEFAULT 0,
+            longest_streak INTEGER NOT NULL DEFAULT 0,
+            last_active_date TEXT,
+            FOREIGN KEY (user_id) REFERENCES users (id)
+        )
+    ''')
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS achievements (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            code TEXT NOT NULL,
+            earned_at TEXT NOT NULL,
+            UNIQUE(user_id, code),
             FOREIGN KEY (user_id) REFERENCES users (id)
         )
     ''')
@@ -546,6 +643,427 @@ PLAN_LIMITS = {
 }
 UPLOAD_QUOTA_WINDOW_HOURS = 24
 
+# Giá nâng cấp gói (VNĐ/THÁNG) — Premium 30.000đ/tháng, Max 50.000đ/tháng. Đây là subscription
+# THEO THÁNG: mỗi đơn thanh toán thành công chỉ cấp đúng 1 THÁNG quyền lợi (xem add_one_month()
+# + grant_plan_upgrade()), hết hạn tự rơi về Free nếu không thanh toán tiếp — KHÔNG tự động trừ
+# tiền định kỳ (app không lưu thông tin thẻ để làm việc đó), học sinh cần tự vào lại nâng cấp
+# mỗi tháng. Free không cần thanh toán nên không có trong bảng giá.
+PLAN_PRICING = {
+    'premium': 30000,
+    'max': 50000,
+}
+
+# Ưu đãi lần đầu: 3 THÁNG ĐẦU TIÊN học sinh từng thanh toán thành công (bất kể gói Premium hay
+# Max) được giảm giá; từ tháng thanh toán thứ 4 trở đi tính giá bình thường. Đếm theo TỔNG SỐ
+# đơn đã thanh toán thành công trong lịch sử tài khoản (payment_orders.status='paid'), không
+# phân biệt loại gói — nâng cấp/hạ cấp giữa Premium <-> Max vẫn tính chung 1 "tháng đã dùng ưu đãi".
+FIRST_TIME_DISCOUNT_PCT = 50       # % giảm — có thể chỉnh lại nếu ý bạn là mức khác
+FIRST_TIME_DISCOUNT_MONTHS = 3     # số THÁNG đầu được hưởng ưu đãi
+
+# ==========================================
+# 0.26. THANH TOÁN NÂNG CẤP GÓI — VNPAY (ATM/Visa/Mastercard/JCB) + Chuyển khoản VietQR
+# ==========================================
+# VNPAY: cổng thanh toán thẻ (ATM nội địa qua NAPAS, thẻ quốc tế Visa/Mastercard/JCB, ví
+# VNPAY QR). Cần đăng ký tài khoản merchant tại https://vnpay.vn để lấy vnp_TmnCode +
+# vnp_HashSecret — CHƯA đăng ký thì tính năng này tự ẩn khỏi giao diện (app vẫn chạy bình
+# thường, chỉ còn phương thức Chuyển khoản VietQR bên dưới).
+VNPAY_TMN_CODE = os.environ.get('VNPAY_TMN_CODE', '').strip()
+VNPAY_HASH_SECRET = os.environ.get('VNPAY_HASH_SECRET', '').strip()
+VNPAY_PAYMENT_URL = os.environ.get('VNPAY_PAYMENT_URL', 'https://sandbox.vnpayment.vn/paymentv2/vpcpay.html').strip()
+VNPAY_ENABLED = bool(VNPAY_TMN_CODE and VNPAY_HASH_SECRET)
+if not VNPAY_ENABLED:
+    print("ℹ️  Thanh toán VNPAY (thẻ ATM/Visa/Mastercard) đang TẮT — chưa cấu hình "
+          "VNPAY_TMN_CODE/VNPAY_HASH_SECRET trong .env. Xem README mục 14 để đăng ký & bật.")
+
+# Chuyển khoản ngân hàng qua mã VietQR (img.vietqr.io — dịch vụ công khai, MIỄN PHÍ, không
+# cần API key: chỉ cần đúng số tài khoản NGÂN HÀNG CỦA BẠN thì ảnh QR tạo ra mới chuyển tiền
+# vào đúng chỗ). Học sinh quét bằng app ngân hàng bất kỳ, hoặc MoMo/ZaloPay (2 ví này đều hỗ
+# trợ quét mã VietQR chuẩn NAPAS để chuyển thẳng vào tài khoản ngân hàng — không cần tích hợp
+# API riêng của MoMo/ZaloPay). Việc xác nhận "đã nhận tiền" hiện làm THỦ CÔNG bởi Admin (bấm
+# 1 nút ở /developer) vì app không có quyền đọc sao kê ngân hàng tự động.
+VIETQR_BANK_ID = os.environ.get('VIETQR_BANK_ID', '').strip()       # vd: 'mbbank', 'vietinbank', hoặc mã BIN '970422'
+VIETQR_ACCOUNT_NO = os.environ.get('VIETQR_ACCOUNT_NO', '').strip()
+VIETQR_ACCOUNT_NAME = os.environ.get('VIETQR_ACCOUNT_NAME', '').strip()
+BANK_TRANSFER_ENABLED = bool(VIETQR_BANK_ID and VIETQR_ACCOUNT_NO and VIETQR_ACCOUNT_NAME)
+if not BANK_TRANSFER_ENABLED:
+    print("ℹ️  Thanh toán Chuyển khoản VietQR đang TẮT — chưa cấu hình VIETQR_BANK_ID/"
+          "VIETQR_ACCOUNT_NO/VIETQR_ACCOUNT_NAME trong .env. Xem README mục 14 để bật.")
+
+PAYMENT_METHODS_ENABLED = VNPAY_ENABLED or BANK_TRANSFER_ENABLED
+
+
+def generate_order_code():
+    """Mã đơn hàng ngắn, duy nhất — dùng làm vnp_TxnRef (VNPAY) và nội dung chuyển khoản
+    (VietQR) nên phải NGẮN, chỉ chữ+số (không dấu, không khoảng trắng) để tránh lỗi ký tự
+    đặc biệt khi ngân hàng/VNPAY xử lý nội dung giao dịch."""
+    return 'SM' + datetime.now(timezone.utc).strftime('%y%m%d') + secrets.token_hex(3).upper()
+
+
+def add_one_month(dt):
+    """Cộng đúng 1 THÁNG LỊCH (không phải 30 ngày) — vd 31/1 + 1 tháng = 28 hoặc 29/2 (tự
+    kẹp về ngày cuối cùng của tháng đích nếu tháng đích ngắn hơn). Chỉ dùng thư viện chuẩn
+    (datetime + calendar), không cần cài thêm dateutil."""
+    import calendar
+    year = dt.year + (dt.month // 12)
+    month = dt.month % 12 + 1
+    last_day = calendar.monthrange(year, month)[1]
+    day = min(dt.day, last_day)
+    return dt.replace(year=year, month=month, day=day)
+
+
+def compute_checkout_price(user_id, plan):
+    """Tính giá THÁNG NÀY cho 1 gói, áp dụng ưu đãi lần đầu nếu còn hạn mức (xem
+    FIRST_TIME_DISCOUNT_PCT/FIRST_TIME_DISCOUNT_MONTHS). Trả về (amount, base_amount,
+    is_discounted, paid_months_so_far)."""
+    base_amount = PLAN_PRICING[plan]
+    conn = open_write_db()
+    try:
+        paid_count = conn.execute(
+            "SELECT COUNT(*) c FROM payment_orders WHERE user_id = ? AND status = 'paid'", (user_id,)
+        ).fetchone()['c']
+    finally:
+        conn.close()
+    is_discounted = paid_count < FIRST_TIME_DISCOUNT_MONTHS
+    amount = round(base_amount * (100 - FIRST_TIME_DISCOUNT_PCT) / 100) if is_discounted else base_amount
+    return amount, base_amount, is_discounted, paid_count
+
+
+def vietqr_image_url(amount, order_code):
+    """Trả về link ảnh QR chuyển khoản (dịch vụ công khai img.vietqr.io, không cần API key).
+    Học sinh quét mã này bằng app ngân hàng hoặc MoMo/ZaloPay để chuyển thẳng vào tài khoản
+    ngân hàng đã cấu hình — số tiền + nội dung chuyển khoản được điền sẵn trong mã QR."""
+    from urllib.parse import quote
+    return (
+        f"https://img.vietqr.io/image/{quote(VIETQR_BANK_ID)}-{quote(VIETQR_ACCOUNT_NO)}-compact2.png"
+        f"?amount={int(amount)}&addInfo={quote(order_code)}&accountName={quote(VIETQR_ACCOUNT_NAME)}"
+    )
+
+
+def vnpay_sign(params: dict) -> str:
+    """Ký (hoặc xác thực) dữ liệu theo đúng thuật toán VNPAY yêu cầu: sắp xếp key theo
+    alphabet, nối thành query string đã URL-encode giá trị, rồi HMAC-SHA512 với vnp_HashSecret.
+    Dùng chung cho cả lúc TẠO link thanh toán lẫn lúc XÁC THỰC callback (Return URL / IPN)."""
+    sorted_items = sorted(params.items())
+    query_string = urlencode(sorted_items, quote_via=quote_plus)
+    return hmac.new(
+        VNPAY_HASH_SECRET.encode('utf-8'), query_string.encode('utf-8'), hashlib.sha512
+    ).hexdigest()
+
+
+def vnpay_build_payment_url(order_code, amount, order_info, ip_addr, return_url):
+    now = datetime.now(timezone(timedelta(hours=7)))  # giờ Việt Nam (ICT, UTC+7) theo yêu cầu VNPAY
+    expire = now + timedelta(minutes=15)
+    params = {
+        'vnp_Version': '2.1.0',
+        'vnp_Command': 'pay',
+        'vnp_TmnCode': VNPAY_TMN_CODE,
+        'vnp_Amount': str(int(amount) * 100),  # VNPAY yêu cầu nhân 100 (không thập phân)
+        'vnp_CurrCode': 'VND',
+        'vnp_TxnRef': order_code,
+        'vnp_OrderInfo': order_info,
+        'vnp_OrderType': 'other',
+        'vnp_Locale': 'vn',
+        'vnp_ReturnUrl': return_url,
+        'vnp_IpAddr': ip_addr or '127.0.0.1',
+        'vnp_CreateDate': now.strftime('%Y%m%d%H%M%S'),
+        'vnp_ExpireDate': expire.strftime('%Y%m%d%H%M%S'),
+    }
+    secure_hash = vnpay_sign(params)
+    query_string = urlencode(sorted(params.items()), quote_via=quote_plus)
+    return f"{VNPAY_PAYMENT_URL}?{query_string}&vnp_SecureHash={secure_hash}"
+
+
+def vnpay_verify_return(args: dict) -> bool:
+    """Xác thực chữ ký vnp_SecureHash trên dữ liệu VNPAY gửi về (Return URL hoặc IPN).
+    PHẢI gọi hàm này trước khi tin bất kỳ thông tin nào (mã đơn, trạng thái...) trong `args` —
+    tuyệt đối không tự ý cập nhật đơn hàng thành "đã thanh toán" nếu chữ ký sai."""
+    received_hash = args.get('vnp_SecureHash', '')
+    check_params = {k: v for k, v in args.items() if k not in ('vnp_SecureHash', 'vnp_SecureHashType')}
+    expected_hash = vnpay_sign(check_params)
+    return hmac.compare_digest(received_hash, expected_hash)
+
+
+def grant_plan_upgrade(user_id, plan, order_code, actor='system', months=1):
+    """Gán gói THEO THÁNG cho tài khoản — hạn dùng luôn tính lại từ THỜI ĐIỂM GÁN (không cộng
+    dồn vào hạn cũ nếu gia hạn sớm, để tránh rắc rối tính toán khi đổi qua lại Premium/Max).
+    Gọi khi: thanh toán được xác nhận (VNPAY IPN tự động, hoặc Admin xác nhận chuyển khoản thủ
+    công), hoặc Admin "tặng" 1 tháng miễn phí cho tài khoản không phải Developer trở lên (xem
+    developer_change_plan()). Dùng open_write_db() vì VNPAY IPN có thể tới bất kỳ lúc nào,
+    không nhất thiết trong 1 request context bình thường có sẵn `g`."""
+    expires_at = add_one_month(datetime.now(timezone.utc)) if months == 1 else \
+        datetime.now(timezone.utc) + timedelta(days=30 * months)
+    conn = open_write_db()
+    try:
+        conn.execute('UPDATE users SET plan = ?, plan_expires_at = ? WHERE id = ?',
+                     (plan, expires_at.isoformat(), user_id))
+        conn.commit()
+    finally:
+        conn.close()
+    write_audit('grant_plan_upgrade', target=str(user_id),
+                detail=f"{plan} tới {expires_at.strftime('%d/%m/%Y')} (đơn {order_code}, xác nhận bởi {actor})")
+
+
+def plan_price(plan):
+    return PLAN_PRICING.get(plan)
+
+
+# ==========================================
+# 0.27. "BỘ NHỚ" AI — ghi nhớ cách học của từng học sinh, cá nhân hoá câu trả lời
+# ==========================================
+# Không gọi thêm API AI nào để trích xuất — chỉ dùng quy tắc (regex) đơn giản, nhanh và
+# miễn phí. Độ chính xác vì vậy phụ thuộc vào cách học sinh diễn đạt, không phải AI tự suy
+# luận/tổng hợp như một hệ thống Memory "đầy đủ" sẽ cần (xem ghi chú trong README).
+MEMORY_TRIGGER_RE = re.compile(
+    r'(?:ghi\s*nhớ|hãy\s*nhớ|nhớ\s*giúp|note\s*giúp|lưu\s*ý\s*giúp)(?:\s*(?:em|mình|giúp|rằng|là))*\s*[:,-]?\s*(.+)',
+    re.IGNORECASE
+)
+GRADE_LEVEL_RE = re.compile(r'\blớp\s*(6|7|8|9|10|11|12)\b', re.IGNORECASE)
+WEAK_HINT_RE = re.compile(r'yếu|kém|khó\s*hiểu|hay\s*sai|hay\s*nhầm', re.IGNORECASE)
+GOAL_HINT_RE = re.compile(r'mục\s*tiêu|muốn\s*(đạt|thi|ôn)|ôn\s*thi|thi\s*vào', re.IGNORECASE)
+STYLE_HINT_RE = re.compile(r'thích.*giải\s*thích|giải\s*thích.*(ngắn|dài|kỹ|đơn giản|chi tiết)', re.IGNORECASE)
+
+MAX_MEMORY_LEN = 300
+MAX_MEMORIES_IN_PROMPT = 6
+
+MEMORY_CATEGORY_LABELS = {
+    'weak_subject':     ('📉', 'Môn/chủ đề còn yếu'),
+    'goal':             ('🎯', 'Mục tiêu học tập'),
+    'style_preference': ('🎨', 'Cách giải thích ưa thích'),
+    'topic_covered':    ('📚', 'Chủ đề đã luyện tập'),
+    'general':          ('📝', 'Khác'),
+}
+
+
+def _guess_memory_category(text):
+    if WEAK_HINT_RE.search(text):
+        return 'weak_subject'
+    if GOAL_HINT_RE.search(text):
+        return 'goal'
+    if STYLE_HINT_RE.search(text):
+        return 'style_preference'
+    return 'general'
+
+
+def save_memory(user_id, content, category='general', source='auto'):
+    """Lưu 1 mục bộ nhớ. Dùng open_write_db() vì hàm này còn được gọi từ BÊN TRONG generator
+    streaming của /api/chat (xem giải thích ở docstring open_write_db())."""
+    content = (content or '').strip()
+    if not content:
+        return
+    content = content[:MAX_MEMORY_LEN]
+    try:
+        conn = open_write_db()
+        try:
+            conn.execute(
+                'INSERT INTO memories (user_id, content, category, source, created_at) VALUES (?, ?, ?, ?, ?)',
+                (user_id, content, category, source, now_iso())
+            )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception:
+        pass
+
+
+def extract_and_save_memory(user_id, user_message):
+    """Phát hiện + lưu 1 'bộ nhớ' mới từ tin nhắn của học sinh (nếu có). Trả về nội dung vừa
+    ghi nhớ (để báo lại cho học sinh biết qua 1 toast nhỏ), hoặc None nếu không có gì."""
+    text = (user_message or '').strip()
+    if not text:
+        return None
+
+    # 1) Học sinh chủ động yêu cầu ghi nhớ — ưu tiên cao nhất, tự đoán category theo từ khoá.
+    m = MEMORY_TRIGGER_RE.search(text)
+    if m:
+        content = m.group(1).strip(' .!?')
+        if content:
+            save_memory(user_id, content, category=_guess_memory_category(content), source='explicit')
+            return content
+
+    # 2) Tự nhận diện lớp học (chỉ lưu 1 lần, tránh lặp lại mỗi khi học sinh gõ "lớp 8").
+    g = GRADE_LEVEL_RE.search(text)
+    if g:
+        try:
+            conn = open_write_db()
+            try:
+                existing = conn.execute(
+                    "SELECT id FROM memories WHERE user_id = ? AND content LIKE 'Học sinh đang học lớp%'",
+                    (user_id,)
+                ).fetchone()
+                if not existing:
+                    content = f"Học sinh đang học lớp {g.group(1)}."
+                    conn.execute(
+                        'INSERT INTO memories (user_id, content, category, source, created_at) VALUES (?, ?, ?, ?, ?)',
+                        (user_id, content, 'general', 'auto', now_iso())
+                    )
+                    conn.commit()
+                    return content
+            finally:
+                conn.close()
+        except Exception:
+            pass
+
+    return None
+
+
+def track_topic_practice(user_id, subject, mode):
+    """Tín hiệu 'chủ đề đã luyện tập' đơn giản: nếu học sinh làm 'Kiểm tra bài làm' từ 3 lần
+    trở lên ở cùng 1 môn, tự ghi 1 mục bộ nhớ. KHÔNG suy diễn lỗi sai cụ thể là gì (muốn làm
+    được vậy cần AI phân tích riêng câu trả lời — xem mục "Mistake Book" trong README)."""
+    if mode != 'Kiểm tra bài làm' or not subject:
+        return
+    try:
+        conn = open_write_db()
+        try:
+            marker = f"Học sinh luyện tập nhiều bài kiểm tra môn {subject}."
+            existing = conn.execute(
+                'SELECT id FROM memories WHERE user_id = ? AND content = ?', (user_id, marker)
+            ).fetchone()
+            if existing:
+                return
+            count_row = conn.execute(
+                "SELECT COUNT(*) c FROM usage_logs WHERE user_id = ? AND subject = ? AND mode = 'Kiểm tra bài làm'",
+                (user_id, subject)
+            ).fetchone()
+            if count_row['c'] >= 3:
+                conn.execute(
+                    'INSERT INTO memories (user_id, content, category, source, created_at) VALUES (?, ?, ?, ?, ?)',
+                    (user_id, marker, 'topic_covered', 'auto', now_iso())
+                )
+                conn.commit()
+        finally:
+            conn.close()
+    except Exception:
+        pass
+
+
+def get_recent_memories(user_id, limit=MAX_MEMORIES_IN_PROMPT):
+    conn = open_write_db()
+    try:
+        rows = conn.execute(
+            'SELECT content FROM memories WHERE user_id = ? ORDER BY created_at DESC LIMIT ?',
+            (user_id, limit)
+        ).fetchall()
+        return [r['content'] for r in reversed(rows)]  # cũ -> mới, đọc tự nhiên hơn trong prompt
+    finally:
+        conn.close()
+
+
+# ==========================================
+# 0.28. GAMIFICATION NHẸ — XP + Streak (chuỗi ngày học liên tiếp) + Thành tựu
+# ==========================================
+XP_PER_TURN = 10
+XP_PER_LEVEL = 100
+ACHIEVEMENTS_META = {
+    'first_lesson':  {'icon': '🧠', 'label': 'Bài học đầu tiên', 'desc': 'Hoàn thành lượt hỏi AI đầu tiên.'},
+    'streak_7':      {'icon': '🔥', 'label': 'Chuỗi 7 ngày', 'desc': 'Học liên tục 7 ngày không nghỉ.'},
+    'streak_30':     {'icon': '🏆', 'label': 'Chuỗi 30 ngày', 'desc': 'Học liên tục 30 ngày không nghỉ.'},
+    'questions_100': {'icon': '📚', 'label': '100 câu hỏi', 'desc': 'Đã hỏi AI 100 lượt.'},
+}
+
+
+def award_xp_and_streak(user_id):
+    """Cộng XP + cập nhật streak sau 1 lượt chat THÀNH CÔNG. Gọi từ bên trong generator
+    streaming của /api/chat nên dùng open_write_db() (xem docstring open_write_db()). Trả về
+    dict mô tả những gì vừa xảy ra (lên cấp? thành tựu mới?) để báo ngay trên giao diện."""
+    result = {'leveled_up': False, 'new_achievements': [], 'streak_days': 0, 'xp': 0, 'level': 1}
+    try:
+        conn = open_write_db()
+        try:
+            today = datetime.now(timezone(timedelta(hours=7))).strftime('%Y-%m-%d')
+            row = conn.execute('SELECT * FROM user_stats WHERE user_id = ?', (user_id,)).fetchone()
+            if row is None:
+                conn.execute(
+                    'INSERT INTO user_stats (user_id, xp, streak_days, longest_streak, last_active_date) '
+                    'VALUES (?, 0, 0, 0, NULL)', (user_id,)
+                )
+                conn.commit()
+                row = conn.execute('SELECT * FROM user_stats WHERE user_id = ?', (user_id,)).fetchone()
+
+            old_level = row['xp'] // XP_PER_LEVEL + 1
+            new_xp = row['xp'] + XP_PER_TURN
+
+            last_active = row['last_active_date']
+            streak = row['streak_days']
+            if last_active == today:
+                pass  # đã hoạt động hôm nay rồi — không tăng streak thêm lần nữa
+            elif last_active is None:
+                streak = 1
+            else:
+                try:
+                    last_date = datetime.strptime(last_active, '%Y-%m-%d').date()
+                    today_date = datetime.strptime(today, '%Y-%m-%d').date()
+                    gap = (today_date - last_date).days
+                    streak = streak + 1 if gap == 1 else 1
+                except ValueError:
+                    streak = 1
+            longest = max(row['longest_streak'], streak)
+
+            conn.execute(
+                'UPDATE user_stats SET xp = ?, streak_days = ?, longest_streak = ?, last_active_date = ? WHERE user_id = ?',
+                (new_xp, streak, longest, today, user_id)
+            )
+            conn.commit()
+
+            new_level = new_xp // XP_PER_LEVEL + 1
+            result.update({'streak_days': streak, 'xp': new_xp, 'level': new_level, 'leveled_up': new_level > old_level})
+
+            earned_codes = {r['code'] for r in conn.execute(
+                'SELECT code FROM achievements WHERE user_id = ?', (user_id,)).fetchall()}
+            total_turns = conn.execute(
+                "SELECT COUNT(*) c FROM usage_logs WHERE user_id = ? AND status = 'ok'", (user_id,)
+            ).fetchone()['c']
+
+            to_check = []
+            if 'first_lesson' not in earned_codes and total_turns >= 1:
+                to_check.append('first_lesson')
+            if 'streak_7' not in earned_codes and streak >= 7:
+                to_check.append('streak_7')
+            if 'streak_30' not in earned_codes and streak >= 30:
+                to_check.append('streak_30')
+            if 'questions_100' not in earned_codes and total_turns >= 100:
+                to_check.append('questions_100')
+
+            for code in to_check:
+                try:
+                    conn.execute('INSERT INTO achievements (user_id, code, earned_at) VALUES (?, ?, ?)',
+                                 (user_id, code, now_iso()))
+                    conn.commit()
+                    result['new_achievements'].append(code)
+                except sqlite3.IntegrityError:
+                    pass  # trùng UNIQUE(user_id, code) — hiếm gặp, bỏ qua an toàn
+        finally:
+            conn.close()
+    except Exception:
+        pass
+    return result
+
+
+def get_user_stats(user_id):
+    conn = open_write_db()
+    try:
+        row = conn.execute('SELECT * FROM user_stats WHERE user_id = ?', (user_id,)).fetchone()
+        achievements_rows = conn.execute(
+            'SELECT code, earned_at FROM achievements WHERE user_id = ? ORDER BY earned_at ASC', (user_id,)
+        ).fetchall()
+        xp = row['xp'] if row else 0
+        level = xp // XP_PER_LEVEL + 1
+        return {
+            'xp': xp,
+            'level': level,
+            'xp_into_level': xp % XP_PER_LEVEL,
+            'xp_per_level': XP_PER_LEVEL,
+            'streak_days': row['streak_days'] if row else 0,
+            'longest_streak': row['longest_streak'] if row else 0,
+            'achievements': [
+                {'code': a['code'], **ACHIEVEMENTS_META.get(a['code'], {'icon': '🏅', 'label': a['code'], 'desc': ''}),
+                 'earned_at': a['earned_at']}
+                for a in achievements_rows
+            ],
+        }
+    finally:
+        conn.close()
+
 
 def plan_rank(plan):
     try:
@@ -564,7 +1082,11 @@ def plan_limits(plan):
 
 def effective_plan(user):
     """Gói THỰC TẾ đang áp dụng cho tài khoản. Developer trở lên luôn là 'max' bất kể cột
-    `plan` lưu gì trong DB; tài khoản user thường dùng đúng giá trị đã được Admin gán."""
+    `plan` lưu gì trong DB. Với tài khoản user thường: Premium/Max chỉ có hiệu lực nếu
+    `plan_expires_at` còn hạn (gói tính THEO THÁNG — xem grant_plan_upgrade()); hết hạn thì
+    tự động coi như 'free' ngay khi đọc (tính "lazy", không cần job nền dọn dẹp DB — cột
+    `plan` trong DB có thể tạm thời vẫn còn ghi 'premium'/'max' cũ, nhưng hàm này luôn trả về
+    giá trị ĐÚNG THỜI ĐIỂM HIỆN TẠI)."""
     if not user:
         return 'free'
     try:
@@ -574,9 +1096,22 @@ def effective_plan(user):
         pass
     try:
         plan = user['plan']
+        expires_at = user['plan_expires_at']
     except Exception:
-        plan = None
-    return plan if plan in PLAN_ORDER else 'free'
+        plan, expires_at = None, None
+    if plan not in PLAN_ORDER or plan == 'free':
+        return 'free'
+    if not expires_at:
+        return 'free'  # gói trả phí PHẢI có hạn sử dụng — không có hạn coi như đã hết hạn
+    try:
+        exp_dt = datetime.fromisoformat(expires_at)
+        if exp_dt.tzinfo is None:
+            exp_dt = exp_dt.replace(tzinfo=timezone.utc)
+        if exp_dt > datetime.now(timezone.utc):
+            return plan
+    except ValueError:
+        pass
+    return 'free'
 
 
 def current_effective_plan():
@@ -765,6 +1300,50 @@ def save_user_preferences(user_id, updates):
 # ==========================================
 # 1. GIAO DIỆN ĐĂNG NHẬP / ĐĂNG KÝ
 # ==========================================
+# ==========================================
+# 1.5 KẾT QUẢ THANH TOÁN VNPAY (trang trung gian sau khi quay lại từ VNPAY)
+# ==========================================
+VNPAY_RETURN_HTML = r'''
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Kết quả thanh toán — StudyMate AI</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>tailwind.config = { darkMode: 'class' };</script>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.6.0/css/all.min.css">
+</head>
+<body class="min-h-screen flex items-center justify-center bg-gray-50 dark:bg-[#131313] p-4">
+  <div class="max-w-md w-full bg-white dark:bg-[#1c1c1c] rounded-2xl shadow-lg border border-gray-100 dark:border-gray-800 p-8 text-center">
+    {% if success %}
+      <div class="w-16 h-16 rounded-full bg-emerald-100 dark:bg-emerald-900 text-emerald-500 flex items-center justify-center text-3xl mx-auto mb-4">
+        <i class="fas fa-check"></i>
+      </div>
+      <h1 class="text-xl font-bold mb-2">Thanh toán thành công!</h1>
+      <p class="text-sm text-gray-500 dark:text-gray-400">
+        Đơn <strong>{{ order_code }}</strong> đã được ghi nhận.
+        {% if status == 'paid' %}Gói <strong>{{ plan_label }}</strong> của em đã được kích hoạt — quay lại trang chat và tải lại trang để thấy thay đổi nhé! 🎉
+        {% else %}Hệ thống đang xử lý, thường chỉ mất vài giây. Em quay lại trang chat và tải lại trang sau ít phút nhé.{% endif %}
+      </p>
+    {% else %}
+      <div class="w-16 h-16 rounded-full bg-red-100 dark:bg-red-900 text-red-500 flex items-center justify-center text-3xl mx-auto mb-4">
+        <i class="fas fa-xmark"></i>
+      </div>
+      <h1 class="text-xl font-bold mb-2">Thanh toán không thành công</h1>
+      <p class="text-sm text-gray-500 dark:text-gray-400">
+        {% if not valid %}Không xác thực được dữ liệu trả về từ VNPAY.{% else %}Giao dịch <strong>{{ order_code }}</strong> chưa hoàn tất hoặc đã bị huỷ.{% endif %}
+        Em có thể thử lại ở hộp thoại "Nâng cấp gói".
+      </p>
+    {% endif %}
+    <a href="{{ url_for('home') }}" class="inline-block mt-6 px-5 py-2.5 rounded-xl bg-blue-600 hover:bg-blue-700 text-white text-sm font-semibold">
+      <i class="fas fa-arrow-left mr-1"></i> Về trang chat
+    </a>
+  </div>
+</body>
+</html>
+'''
+
 AUTH_HTML = r'''
 <!DOCTYPE html>
 <html lang="vi">
@@ -773,6 +1352,7 @@ AUTH_HTML = r'''
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>{{ 'Đăng nhập' if mode == 'login' else 'Đăng ký' }} — StudyMate AI</title>
   <script src="https://cdn.tailwindcss.com"></script>
+  <script>tailwind.config = { darkMode: 'class' };</script>
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.6.0/css/all.min.css">
   <style>
     body { font-family: 'Segoe UI', system-ui, sans-serif; }
@@ -904,6 +1484,7 @@ HTML = r'''
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>{{ app_name }}</title>
   <script src="https://cdn.tailwindcss.com"></script>
+  <script>tailwind.config = { darkMode: 'class' };</script>
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.6.0/css/all.min.css">
   <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css">
@@ -959,6 +1540,60 @@ HTML = r'''
 
     .attachment-chip img { border: 1px solid rgba(0,0,0,0.08); }
 
+    .msg-actions { opacity: 0; transition: opacity 0.15s; }
+    /* addMessageActions() inserts the actions bar as a SIBLING right after the
+       .ai-msg-group wrapper (wrapper.after(bar)), not as a child of it — so a
+       descendant selector like ".ai-msg-group:hover .msg-actions" never matches
+       and the "Báo lỗi" button stayed invisible (opacity: 0) forever, even though
+       it was in the DOM and technically clickable. Use the general sibling
+       combinator (~) instead, and also show it on its own hover/focus so touch
+       devices (which have no :hover on the message) and keyboard users can reach it. */
+    .msg-actions.force-visible,
+    .ai-msg-group:hover ~ .msg-actions,
+    .msg-actions:hover,
+    .msg-actions:focus-within { opacity: 1; }
+
+    /* ---------- Avatar "suy nghĩ" (shimmer chạy từ dưới lên trên) ----------
+       Dải sáng quét dọc từ DƯỚI lên TRÊN, lặp lại, trên avatar robot — dùng làm
+       avatar chung của cả website (sidebar, khung chat, chỉ báo đang gõ). Khi AI
+       đang trả lời (.thinking) chạy nhanh & rõ hơn; ở logo sidebar (.brand-avatar)
+       chạy chậm, mờ hơn như một nhịp "thở". */
+    .ai-avatar { position: relative; overflow: hidden; isolation: isolate; }
+    .ai-avatar::after {
+      content: '';
+      position: absolute; inset: -60% -20%;
+      background: linear-gradient(0deg,
+        transparent 0%, rgba(255,255,255,0) 38%, rgba(255,255,255,0.95) 50%,
+        rgba(255,255,255,0) 62%, transparent 100%);
+      background-size: 100% 260%;
+      background-position: 0% 160%;
+      mix-blend-mode: overlay;
+      opacity: 0;
+      pointer-events: none;
+      will-change: background-position, opacity;
+    }
+    .ai-avatar.thinking::after { opacity: 1; animation: avatarShimmerUp 1.3s ease-in-out infinite; }
+    .ai-avatar.brand-avatar::after { opacity: 0.55; animation: avatarShimmerUp 3.4s ease-in-out infinite; }
+    @keyframes avatarShimmerUp {
+      0%   { background-position: 0% 160%; }
+      100% { background-position: 0% -160%; }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      .ai-avatar.thinking::after, .ai-avatar.brand-avatar::after { animation: none; opacity: 0.35; }
+    }
+
+    @keyframes memoryToastFade {
+      0% { opacity: 0; transform: translate(-50%, 6px); }
+      10%, 85% { opacity: 1; transform: translate(-50%, 0); }
+      100% { opacity: 0; transform: translate(-50%, 6px); }
+    }
+    .memory-toast { left: 50%; animation: memoryToastFade 3.6s ease forwards; }
+
+    #gamifyWidget { }
+    .gamify-xp-track { background: #e5e7eb; border-radius: 999px; height: 6px; overflow: hidden; }
+    .dark .gamify-xp-track { background: #374151; }
+    .gamify-xp-fill { background: linear-gradient(90deg, #f59e0b, #f97316); height: 100%; border-radius: 999px; transition: width 0.4s; }
+
     #sidebar { transition: transform 0.2s ease; }
     @media (max-width: 1023px) { #sidebar { transform: translateX(-100%); } #sidebar.open { transform: translateX(0); } }
 
@@ -985,7 +1620,7 @@ HTML = r'''
   <aside id="sidebar" class="fixed lg:static inset-y-0 left-0 z-50 w-72 flex-shrink-0 bg-gray-50 dark:bg-[#171717] border-r border-gray-200 dark:border-gray-800 flex flex-col">
     <div class="p-3 flex items-center justify-between">
       <div class="flex items-center gap-2 px-1">
-        <div class="w-8 h-8 rounded-lg bg-gradient-to-br from-blue-600 to-indigo-600 flex items-center justify-center text-white font-bold text-sm">S</div>
+        <div class="ai-avatar brand-avatar w-8 h-8 rounded-lg bg-gradient-to-br from-blue-600 to-indigo-600 flex items-center justify-center text-white text-sm"><i class="fas fa-robot"></i></div>
         <span class="font-bold text-base truncate">{{ app_name }}</span>
       </div>
       <button id="closeSidebarBtn" class="lg:hidden w-8 h-8 flex items-center justify-center rounded-lg hover:bg-gray-200 dark:hover:bg-gray-800 text-gray-500">
@@ -1026,6 +1661,17 @@ HTML = r'''
       <div>
         <div class="text-xs font-semibold text-gray-400 uppercase tracking-wide mb-1 px-1" data-i18n="recents">Gần đây</div>
         <div id="convList" class="space-y-1"></div>
+      </div>
+    </div>
+
+    <div id="gamifyWidget" class="hidden px-3 pb-2">
+      <div class="rounded-xl bg-gray-50 dark:bg-gray-900 border border-gray-100 dark:border-gray-800 px-3 py-2.5">
+        <div class="flex items-center justify-between text-xs mb-1.5">
+          <span class="flex items-center gap-1 font-semibold text-orange-500"><i class="fas fa-fire"></i> <span id="gamifyStreak">0</span> ngày</span>
+          <span class="text-gray-400">Cấp <span id="gamifyLevel" class="font-semibold text-gray-600 dark:text-gray-300">1</span></span>
+        </div>
+        <div class="gamify-xp-track"><div id="gamifyXpBar" class="gamify-xp-fill" style="width: 0%;"></div></div>
+        <p id="gamifyXpText" class="text-[10px] text-gray-400 mt-1 text-right">0/100 XP</p>
       </div>
     </div>
 
@@ -1237,10 +1883,13 @@ HTML = r'''
       <div id="settingsSavedMsg" class="hidden text-sm text-emerald-600 dark:text-emerald-400 flex items-center gap-1"><i class="fas fa-check"></i> Đã lưu</div>
       <button onclick="savePreferences()" class="w-full bg-blue-600 hover:bg-blue-700 text-white font-semibold py-2.5 rounded-xl transition-colors">Lưu thay đổi</button>
 
-      <div class="border-t border-gray-100 dark:border-gray-700 pt-4">
+      <div class="border-t border-gray-100 dark:border-gray-700 pt-4 space-y-2">
         <p class="text-xs font-semibold text-red-500 uppercase mb-2">Khu vực nguy hiểm</p>
         <button onclick="clearAllHistory()" class="w-full bg-red-50 dark:bg-red-900/20 hover:bg-red-100 dark:hover:bg-red-900/40 text-red-600 dark:text-red-400 font-medium py-2.5 rounded-xl text-sm transition-colors">
           <i class="fas fa-trash mr-1"></i> Xoá toàn bộ lịch sử trò chuyện
+        </button>
+        <button onclick="clearMyMemories()" class="w-full bg-purple-50 dark:bg-purple-900/20 hover:bg-purple-100 dark:hover:bg-purple-900/40 text-purple-600 dark:text-purple-400 font-medium py-2.5 rounded-xl text-sm transition-colors">
+          <i class="fas fa-brain mr-1"></i> Xoá bộ nhớ AI của tôi
         </button>
       </div>
     </div>
@@ -1279,8 +1928,12 @@ HTML = r'''
       <h3 class="font-bold text-lg flex items-center gap-2"><i class="fas fa-bolt text-amber-500"></i> Nâng cấp gói</h3>
       <button onclick="closeAllModals()" class="w-8 h-8 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 flex items-center justify-center"><i class="fas fa-xmark"></i></button>
     </div>
-    <div class="p-5">
-      <p class="text-xs text-center text-gray-400 mb-4">🚧 Đây là bản xem trước — chưa có thanh toán thật, chỉ để minh hoạ hướng phát triển.</p>
+
+    <!-- Bước 1: chọn gói -->
+    <div id="upgradePlansView" class="p-5">
+      {% if not payment_methods_enabled %}
+      <p class="text-xs text-center text-gray-400 mb-4">🚧 Chưa cấu hình phương thức thanh toán nào — xem README để bật.</p>
+      {% endif %}
       <div class="grid sm:grid-cols-3 gap-4">
         {% for p in plan_order %}
         {% set meta = plan_meta[p] %}
@@ -1291,7 +1944,23 @@ HTML = r'''
           <span class="absolute -top-2.5 left-4 bg-blue-500 text-white text-[10px] font-bold px-2 py-0.5 rounded-full">GÓI HIỆN TẠI</span>
           {% endif %}
           <p class="font-bold flex items-center gap-1.5">{{ meta.icon }} {{ meta.label }}</p>
-          <ul class="text-sm text-gray-500 dark:text-gray-400 space-y-1.5 my-3 flex-1">
+          {% if p in plan_pricing %}
+            {% if is_discount_eligible %}
+            <span class="inline-flex self-start items-center gap-1 text-[10px] font-bold px-2 py-0.5 rounded-full bg-rose-100 text-rose-600 dark:bg-rose-900/40 dark:text-rose-300 mt-1">
+              <i class="fas fa-gift"></i> Giảm {{ discount_pct }}% — còn {{ discount_months_left }} tháng ưu đãi
+            </span>
+            <p class="mt-1 mb-2">
+              <span class="text-xl font-extrabold">{{ discount_amounts[p]|vnd }}₫</span>
+              <span class="text-sm font-medium text-gray-400 line-through ml-1">{{ plan_pricing[p]|vnd }}₫</span>
+              <span class="text-xs font-normal text-gray-400">/ tháng</span>
+            </p>
+            {% else %}
+            <p class="text-xl font-extrabold mt-1 mb-2">{{ plan_pricing[p]|vnd }}₫ <span class="text-xs font-normal text-gray-400">/ tháng</span></p>
+            {% endif %}
+          {% else %}
+          <p class="text-xl font-extrabold mt-1 mb-2 text-gray-400">Miễn phí</p>
+          {% endif %}
+          <ul class="text-sm text-gray-500 dark:text-gray-400 space-y-1.5 my-1 flex-1">
             <li><i class="fas fa-check text-emerald-500 mr-1.5"></i>
               {% if limits.daily_uploads is none %}Đọc file &amp; ảnh không giới hạn{% else %}{{ limits.daily_uploads }} lượt đọc file/ảnh mỗi 24h{% endif %}
             </li>
@@ -1303,9 +1972,15 @@ HTML = r'''
             {% endfor %}
           </ul>
           {% if is_current %}
-          <button disabled class="w-full py-2 rounded-xl bg-gray-100 dark:bg-gray-700 text-gray-400 text-sm font-semibold">Gói hiện tại</button>
+          <button disabled class="w-full mt-3 py-2 rounded-xl bg-gray-100 dark:bg-gray-700 text-gray-400 text-sm font-semibold">Gói hiện tại</button>
+          {% elif p not in plan_pricing %}
+          <button disabled class="w-full mt-3 py-2 rounded-xl bg-gray-100 dark:bg-gray-700 text-gray-400 text-sm font-semibold">—</button>
+          {% elif not payment_methods_enabled %}
+          <button disabled class="w-full mt-3 py-2 rounded-xl bg-blue-200 dark:bg-blue-900 text-blue-500 dark:text-blue-300 text-sm font-semibold cursor-not-allowed">Chưa khả dụng</button>
           {% else %}
-          <button disabled class="w-full py-2 rounded-xl bg-blue-200 dark:bg-blue-900 text-blue-500 dark:text-blue-300 text-sm font-semibold cursor-not-allowed">Chưa khả dụng</button>
+          <button type="button" onclick="openCheckout('{{ p }}')" class="upgrade-buy-btn w-full mt-3 py-2 rounded-xl bg-blue-600 hover:bg-blue-700 text-white text-sm font-semibold">
+            Nâng cấp — {{ (discount_amounts[p] if is_discount_eligible else plan_pricing[p])|vnd }}₫/tháng
+          </button>
           {% endif %}
         </div>
         {% endfor %}
@@ -1314,12 +1989,88 @@ HTML = r'''
       <p class="text-xs text-center text-gray-400 mt-4"><i class="fas fa-circle-info mr-1"></i> Tài khoản {{ role_label }} được cấp gói Max vô điều kiện theo vai trò, không cần nâng cấp.</p>
       {% endif %}
     </div>
+
+    <!-- Bước 2: chọn phương thức + thanh toán -->
+    <div id="upgradeCheckoutView" class="hidden p-5">
+      <button type="button" onclick="backToPlans()" class="text-sm text-gray-400 hover:text-gray-600 dark:hover:text-gray-200 mb-4 flex items-center gap-1.5">
+        <i class="fas fa-arrow-left"></i> Chọn gói khác
+      </button>
+
+      <div id="checkoutMethodPicker" class="space-y-3">
+        <p class="text-sm font-semibold">Chọn phương thức thanh toán cho gói <span id="checkoutPlanLabel" class="text-blue-600 dark:text-blue-400"></span> — <span id="checkoutPlanAmount" class="font-bold"></span></p>
+        {% if bank_transfer_enabled %}
+        <button type="button" onclick="startCheckout('bank_transfer')" class="w-full flex items-center gap-3 border border-gray-200 dark:border-gray-700 hover:border-blue-500 rounded-xl px-4 py-3 text-left transition-colors">
+          <i class="fas fa-qrcode text-xl text-emerald-500 w-6"></i>
+          <span class="flex-1">
+            <span class="block font-medium text-sm">Chuyển khoản ngân hàng (quét mã QR)</span>
+            <span class="block text-xs text-gray-400">Ngân hàng bất kỳ, hoặc quét từ app MoMo / ZaloPay</span>
+          </span>
+          <i class="fas fa-chevron-right text-gray-300"></i>
+        </button>
+        {% endif %}
+        {% if vnpay_enabled %}
+        <button type="button" onclick="startCheckout('vnpay')" class="w-full flex items-center gap-3 border border-gray-200 dark:border-gray-700 hover:border-blue-500 rounded-xl px-4 py-3 text-left transition-colors">
+          <i class="fas fa-credit-card text-xl text-indigo-500 w-6"></i>
+          <span class="flex-1">
+            <span class="block font-medium text-sm">Thẻ ATM nội địa / Visa / Mastercard / JCB</span>
+            <span class="block text-xs text-gray-400">Thanh toán qua cổng VNPAY, bảo mật chuẩn ngân hàng</span>
+          </span>
+          <i class="fas fa-chevron-right text-gray-300"></i>
+        </button>
+        {% endif %}
+      </div>
+
+      <!-- Kết quả: mã QR chuyển khoản -->
+      <div id="checkoutBankView" class="hidden text-center">
+        <p class="text-sm text-gray-500 dark:text-gray-400 mb-3">Quét mã bằng app ngân hàng bất kỳ, MoMo hoặc ZaloPay:</p>
+        <img id="checkoutQrImage" src="" alt="Mã QR chuyển khoản" class="mx-auto w-56 h-56 rounded-xl border border-gray-200 dark:border-gray-700 object-contain bg-white">
+        <div class="mt-4 text-sm text-left max-w-xs mx-auto space-y-1.5 bg-gray-50 dark:bg-gray-900 rounded-xl p-4">
+          <p class="flex justify-between"><span class="text-gray-400">Ngân hàng thụ hưởng</span><span class="font-medium" id="checkoutBankName"></span></p>
+          <p class="flex justify-between"><span class="text-gray-400">Số tài khoản</span><span class="font-mono font-medium" id="checkoutBankAccNo"></span></p>
+          <p class="flex justify-between"><span class="text-gray-400">Chủ tài khoản</span><span class="font-medium" id="checkoutBankAccName"></span></p>
+          <p class="flex justify-between"><span class="text-gray-400">Số tiền</span><span class="font-bold" id="checkoutBankAmount"></span></p>
+          <p class="flex justify-between items-center"><span class="text-gray-400">Nội dung CK (bắt buộc)</span>
+            <span class="flex items-center gap-1.5"><span class="font-mono font-bold" id="checkoutBankContent"></span>
+            <button type="button" onclick="copyCheckoutContent()" class="text-gray-400 hover:text-blue-500"><i class="fas fa-copy"></i></button></span>
+          </p>
+        </div>
+        <p class="text-xs text-amber-600 dark:text-amber-400 mt-3"><i class="fas fa-triangle-exclamation mr-1"></i>Ghi ĐÚNG nội dung chuyển khoản ở trên để hệ thống đối chiếu đúng đơn của em.</p>
+        <div id="checkoutWaitingStatus" class="mt-4 text-sm text-gray-500 dark:text-gray-400 flex items-center justify-center gap-2">
+          <i class="fas fa-spinner fa-spin"></i> Đang chờ Admin xác nhận đã nhận được tiền...
+        </div>
+      </div>
+
+      <!-- Kết quả: VNPAY -->
+      <div id="checkoutVnpayView" class="hidden text-center py-6">
+        <i class="fas fa-circle-notch fa-spin text-3xl text-blue-500 mb-3"></i>
+        <p class="text-sm text-gray-500 dark:text-gray-400">Đang chuyển sang cổng thanh toán VNPAY...</p>
+      </div>
+    </div>
+  </div>
+
+  <div id="reportIssueModal" class="hidden modal-panel bg-white dark:bg-gray-800 rounded-2xl shadow-2xl w-full max-w-md max-h-[85vh] overflow-y-auto">
+    <div class="flex items-center justify-between px-5 py-4 border-b border-gray-100 dark:border-gray-700">
+      <h3 class="font-bold text-lg flex items-center gap-2"><i class="fas fa-flag text-red-500"></i> Báo lỗi câu trả lời</h3>
+      <button onclick="closeAllModals()" class="w-8 h-8 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 flex items-center justify-center"><i class="fas fa-xmark"></i></button>
+    </div>
+    <div class="p-5 space-y-3 text-sm">
+      <p class="text-xs text-gray-400">Cho Thầy/Cô biết câu trả lời này có vấn đề gì (sai kiến thức, khó hiểu, lạc đề...) để đội ngũ StudyMate cải thiện AI nhé.</p>
+      <textarea id="reportIssueText" rows="4" maxlength="1000" placeholder="Mô tả vấn đề em gặp phải..."
+        class="w-full px-3 py-2.5 rounded-xl bg-gray-100 dark:bg-gray-800 border-0 focus:outline-none focus:ring-2 focus:ring-red-500 dark:text-white resize-none"></textarea>
+      <button id="reportIssueSubmitBtn" onclick="submitReportIssue()" class="w-full px-4 py-2.5 rounded-xl bg-red-600 hover:bg-red-700 disabled:opacity-50 text-white text-sm font-semibold">Gửi báo cáo</button>
+      <p id="reportIssueStatus" class="hidden text-xs text-emerald-600 dark:text-emerald-400 flex items-center gap-1"><i class="fas fa-check"></i> Đã gửi báo cáo, cảm ơn em! ✓</p>
+    </div>
   </div>
 </div>
 
 <script>
 const CURRENT_USERNAME = {{ username|tojson }};
 const APP_NAME = {{ app_name|tojson }};
+const PLAN_PRICING_JS = {{ plan_pricing|tojson }};
+const PLAN_META_JS = {{ plan_meta|tojson }};
+const DISCOUNT_AMOUNTS_JS = {{ discount_amounts|tojson }};
+const IS_DISCOUNT_ELIGIBLE_JS = {{ is_discount_eligible|tojson }};
+const ACHIEVEMENTS_META_JS = {{ achievements_meta|tojson }};
 let uploadedFileContext = "";
 let uploadedFileName = "";
 let uploadedImageDataUrl = "";
@@ -1385,11 +2136,17 @@ function openModal(id) {
   document.getElementById(id).classList.remove('hidden');
   modalBackdrop.classList.remove('hidden');
   modalBackdrop.classList.add('flex');
+  if (id === 'upgradeModal') {
+    stopCheckoutPolling();
+    document.getElementById('upgradeCheckoutView').classList.add('hidden');
+    document.getElementById('upgradePlansView').classList.remove('hidden');
+  }
 }
 function closeAllModals() {
   modalBackdrop.classList.add('hidden');
   modalBackdrop.classList.remove('flex');
   document.querySelectorAll('.modal-panel').forEach(m => m.classList.add('hidden'));
+  stopCheckoutPolling();
 }
 
 // ---------- Chế độ suy nghĩ (Trợ Lý / Học Giả / Giáo Sư / Thiên Tài) ----------
@@ -1441,6 +2198,98 @@ async function loadPlanInfo() {
       if (bar) bar.style.width = pct + '%';
     }
   } catch (e) { /* im lặng bỏ qua lỗi mạng */ }
+}
+
+// ---------- Nâng cấp gói (thanh toán: VNPAY / Chuyển khoản VietQR) ----------
+function formatVnd(n) { return Number(n).toLocaleString('vi-VN') + '₫'; }
+
+let checkoutPlan = null;
+let checkoutPollTimer = null;
+
+function openCheckout(plan) {
+  checkoutPlan = plan;
+  document.getElementById('upgradePlansView').classList.add('hidden');
+  document.getElementById('upgradeCheckoutView').classList.remove('hidden');
+  document.getElementById('checkoutMethodPicker').classList.remove('hidden');
+  document.getElementById('checkoutBankView').classList.add('hidden');
+  document.getElementById('checkoutVnpayView').classList.add('hidden');
+  const meta = PLAN_META_JS[plan];
+  document.getElementById('checkoutPlanLabel').textContent = `${meta.icon} ${meta.label}`;
+  const amount = IS_DISCOUNT_ELIGIBLE_JS ? DISCOUNT_AMOUNTS_JS[plan] : PLAN_PRICING_JS[plan];
+  document.getElementById('checkoutPlanAmount').innerHTML = IS_DISCOUNT_ELIGIBLE_JS
+    ? `${formatVnd(amount)}/tháng <span class="text-gray-400 font-normal line-through">${formatVnd(PLAN_PRICING_JS[plan])}</span>`
+    : `${formatVnd(amount)}/tháng`;
+}
+
+function backToPlans() {
+  stopCheckoutPolling();
+  document.getElementById('upgradeCheckoutView').classList.add('hidden');
+  document.getElementById('upgradePlansView').classList.remove('hidden');
+}
+
+function stopCheckoutPolling() {
+  if (checkoutPollTimer) { clearInterval(checkoutPollTimer); checkoutPollTimer = null; }
+}
+
+async function startCheckout(method) {
+  document.getElementById('checkoutMethodPicker').classList.add('hidden');
+  try {
+    const res = await fetch('/api/checkout', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ plan: checkoutPlan, method })
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      alert(data.error || 'Không tạo được đơn hàng.');
+      document.getElementById('checkoutMethodPicker').classList.remove('hidden');
+      return;
+    }
+
+    if (method === 'vnpay') {
+      document.getElementById('checkoutVnpayView').classList.remove('hidden');
+      window.location.href = data.redirectUrl;  // chuyển hẳn trang sang cổng VNPAY
+      return;
+    }
+
+    // bank_transfer
+    document.getElementById('checkoutBankView').classList.remove('hidden');
+    document.getElementById('checkoutQrImage').src = data.qrImageUrl;
+    document.getElementById('checkoutBankName').textContent = data.bankId;
+    document.getElementById('checkoutBankAccNo').textContent = data.bankAccountNo;
+    document.getElementById('checkoutBankAccName').textContent = data.bankAccountName;
+    document.getElementById('checkoutBankAmount').textContent = formatVnd(data.amount);
+    document.getElementById('checkoutBankContent').textContent = data.transferContent;
+
+    stopCheckoutPolling();
+    checkoutPollTimer = setInterval(() => pollCheckoutStatus(data.orderCode), 4000);
+  } catch (e) {
+    alert('Lỗi mạng khi tạo đơn hàng.');
+    document.getElementById('checkoutMethodPicker').classList.remove('hidden');
+  }
+}
+
+async function pollCheckoutStatus(orderCode) {
+  try {
+    const res = await fetch(`/api/checkout/${orderCode}/status`);
+    if (!res.ok) return;
+    const data = await res.json();
+    if (data.status === 'paid') {
+      stopCheckoutPolling();
+      document.getElementById('checkoutWaitingStatus').innerHTML =
+        '<i class="fas fa-circle-check text-emerald-500"></i> Đã xác nhận! Gói của em đã được nâng cấp 🎉';
+      loadPlanInfo();
+      setTimeout(() => { closeAllModals(); window.location.reload(); }, 1800);
+    } else if (data.status === 'cancelled' || data.status === 'failed') {
+      stopCheckoutPolling();
+      document.getElementById('checkoutWaitingStatus').innerHTML =
+        '<i class="fas fa-circle-xmark text-red-500"></i> Đơn hàng đã bị huỷ/thất bại. Em thử tạo đơn mới nhé.';
+    }
+  } catch (e) { /* im lặng bỏ qua lỗi mạng, thử lại ở lượt poll kế tiếp */ }
+}
+
+function copyCheckoutContent() {
+  const text = document.getElementById('checkoutBankContent').textContent;
+  navigator.clipboard.writeText(text).catch(() => {});
 }
 
 // ---------- Ngôn ngữ (i18n nhẹ cho các nhãn chính trong giao diện) ----------
@@ -1536,6 +2385,14 @@ async function clearAllHistory() {
   } catch (e) { alert('Không xoá được lịch sử, em thử lại nhé.'); }
 }
 
+async function clearMyMemories() {
+  if (!confirm('Xoá toàn bộ bộ nhớ AI về em? Hành động này không thể hoàn tác.')) return;
+  try {
+    await fetch('/api/memories', { method: 'DELETE' });
+    alert('Đã xoá xong.');
+  } catch (e) { alert('Không xoá được, em thử lại nhé.'); }
+}
+
 // ---------- Thông báo hệ thống (banner do developer đặt) ----------
 let bannerDismissed = false;
 async function loadBanner() {
@@ -1587,7 +2444,7 @@ function showTypingIndicator() {
   const wrapper = document.createElement('div');
   wrapper.id = 'typingIndicator';
   wrapper.className = 'flex gap-3 items-start';
-  wrapper.innerHTML = `<div class="w-8 h-8 rounded-full bg-gradient-to-br from-blue-600 to-indigo-600 flex items-center justify-center text-white text-sm flex-shrink-0 mt-0.5"><i class="fas fa-robot"></i></div>
+  wrapper.innerHTML = `<div class="ai-avatar thinking w-8 h-8 rounded-full bg-gradient-to-br from-blue-600 to-indigo-600 flex items-center justify-center text-white text-sm flex-shrink-0 mt-0.5"><i class="fas fa-robot"></i></div>
     <div class="ai-content flex-1 min-w-0 leading-relaxed pt-1.5"><span class="typing-indicator inline-flex items-center gap-1 text-gray-400"><span></span><span></span><span></span></span></div>`;
   chat.appendChild(wrapper);
   scrollChatToBottom();
@@ -1597,7 +2454,7 @@ function removeTypingIndicator() {
   if (el) el.remove();
 }
 
-function addMessage(sender, content, isMarkdown = false) {
+function addMessage(sender, content, isMarkdown = false, actionsCtx = null) {
   const chat = document.getElementById('chat');
   if (sender === 'user') {
     const div = document.createElement('div');
@@ -1608,9 +2465,9 @@ function addMessage(sender, content, isMarkdown = false) {
     return div;
   }
   const wrapper = document.createElement('div');
-  wrapper.className = 'flex gap-3 items-start';
+  wrapper.className = 'ai-msg-group flex gap-3 items-start';
   const avatar = document.createElement('div');
-  avatar.className = 'w-8 h-8 rounded-full bg-gradient-to-br from-blue-600 to-indigo-600 flex items-center justify-center text-white text-sm flex-shrink-0 mt-0.5';
+  avatar.className = 'ai-avatar w-8 h-8 rounded-full bg-gradient-to-br from-blue-600 to-indigo-600 flex items-center justify-center text-white text-sm flex-shrink-0 mt-0.5';
   avatar.innerHTML = '<i class="fas fa-robot"></i>';
   const bubble = document.createElement('div');
   bubble.className = 'ai-content flex-1 min-w-0 leading-relaxed pt-1.5';
@@ -1619,6 +2476,7 @@ function addMessage(sender, content, isMarkdown = false) {
   wrapper.appendChild(avatar);
   wrapper.appendChild(bubble);
   chat.appendChild(wrapper);
+  if (actionsCtx) addMessageActions(wrapper, actionsCtx.conversationId, () => content);
   scrollChatToBottom();
   return bubble;
 }
@@ -1626,8 +2484,8 @@ function addMessage(sender, content, isMarkdown = false) {
 function createAiStreamBubble() {
   const chat = document.getElementById('chat');
   const wrapper = document.createElement('div');
-  wrapper.className = 'flex gap-3 items-start';
-  wrapper.innerHTML = `<div class="w-8 h-8 rounded-full bg-gradient-to-br from-blue-600 to-indigo-600 flex items-center justify-center text-white text-sm flex-shrink-0 mt-0.5"><i class="fas fa-robot"></i></div>
+  wrapper.className = 'ai-msg-group flex gap-3 items-start';
+  wrapper.innerHTML = `<div class="ai-avatar thinking w-8 h-8 rounded-full bg-gradient-to-br from-blue-600 to-indigo-600 flex items-center justify-center text-white text-sm flex-shrink-0 mt-0.5"><i class="fas fa-robot"></i></div>
     <div class="ai-content flex-1 min-w-0 leading-relaxed pt-1.5"><span class="typing-indicator inline-flex items-center gap-1 text-gray-400"><span></span><span></span><span></span></span></div>`;
   chat.appendChild(wrapper);
   scrollChatToBottom();
@@ -1637,6 +2495,113 @@ function updateAiStreamBubble(bubble, text, showCursor) {
   bubble.innerHTML = marked.parse(text) + (showCursor ? '<span class="stream-cursor"></span>' : '');
   renderMathIn(bubble);
   scrollChatToBottom();
+}
+
+// ---------- Báo lỗi câu trả lời ----------
+function addMessageActions(wrapper, conversationId, getText) {
+  const bar = document.createElement('div');
+  bar.className = 'msg-actions flex items-center gap-1 mt-1 ml-11';
+  const btn = document.createElement('button');
+  btn.type = 'button';
+  btn.className = 'text-xs text-gray-400 hover:text-red-500 px-2 py-1 -ml-2 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-800 flex items-center gap-1.5';
+  btn.title = 'Báo lỗi câu trả lời này';
+  btn.innerHTML = '<i class="fas fa-flag"></i> <span>Báo lỗi</span>';
+  btn.addEventListener('click', () => openReportModal(conversationId, getText()));
+  bar.appendChild(btn);
+  wrapper.after(bar);
+  return bar;
+}
+
+let reportContext = { conversationId: null, messageExcerpt: '' };
+function openReportModal(conversationId, messageExcerpt) {
+  reportContext = { conversationId: conversationId || null, messageExcerpt: (messageExcerpt || '').slice(0, 2000) };
+  const textEl = document.getElementById('reportIssueText');
+  const statusEl = document.getElementById('reportIssueStatus');
+  if (textEl) textEl.value = '';
+  if (statusEl) statusEl.classList.add('hidden');
+  openModal('reportIssueModal');
+  setTimeout(() => textEl && textEl.focus(), 50);
+}
+
+async function submitReportIssue() {
+  const textEl = document.getElementById('reportIssueText');
+  const statusEl = document.getElementById('reportIssueStatus');
+  const btn = document.getElementById('reportIssueSubmitBtn');
+  const description = textEl.value.trim();
+  if (!description) { textEl.focus(); return; }
+  btn.disabled = true;
+  try {
+    const res = await fetch('/api/report-issue', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        conversationId: reportContext.conversationId,
+        messageExcerpt: reportContext.messageExcerpt,
+        description
+      })
+    });
+    if (res.ok) {
+      statusEl.classList.remove('hidden');
+      setTimeout(closeAllModals, 1200);
+    } else {
+      const data = await res.json().catch(() => ({}));
+      alert(data.error || 'Không gửi được báo cáo.');
+    }
+  } catch (err) {
+    alert('Lỗi mạng khi gửi báo cáo.');
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+// ---------- "Bộ nhớ" AI: toast khi ghi nhớ điều gì mới ----------
+function showMemoryToast(text) {
+  const toast = document.createElement('div');
+  toast.className = 'memory-toast fixed bottom-24 left-1/2 z-50 bg-gray-900 dark:bg-gray-100 text-white dark:text-gray-900 text-xs px-4 py-2 rounded-full shadow-lg flex items-center gap-2 max-w-[90vw]';
+  toast.innerHTML = `<i class="fas fa-brain text-purple-400"></i> <span class="truncate">Đã ghi nhớ: ${escapeHtml(text.slice(0, 80))}</span>`;
+  document.body.appendChild(toast);
+  setTimeout(() => toast.remove(), 3600);
+}
+
+// ---------- Gamification: XP / streak / thành tựu ----------
+async function loadGamification() {
+  try {
+    const res = await fetch('/api/gamification');
+    if (!res.ok) return;
+    renderGamification(await res.json());
+  } catch (e) { /* im lặng bỏ qua lỗi mạng */ }
+}
+
+function renderGamification(data) {
+  const widget = document.getElementById('gamifyWidget');
+  if (!widget) return;
+  widget.classList.remove('hidden');
+  document.getElementById('gamifyStreak').textContent = data.streak_days;
+  document.getElementById('gamifyLevel').textContent = data.level;
+  const pct = Math.round((data.xp_into_level / data.xp_per_level) * 100);
+  document.getElementById('gamifyXpBar').style.width = pct + '%';
+  document.getElementById('gamifyXpText').textContent = `${data.xp_into_level}/${data.xp_per_level} XP`;
+}
+
+function showGamifyToast(html) {
+  const toast = document.createElement('div');
+  toast.className = 'memory-toast fixed bottom-24 left-1/2 z-50 bg-amber-500 text-white text-xs px-4 py-2.5 rounded-full shadow-lg flex items-center gap-2 max-w-[90vw] font-semibold';
+  toast.innerHTML = html;
+  document.body.appendChild(toast);
+  setTimeout(() => toast.remove(), 4200);
+}
+
+function handleGamifyEvent(g) {
+  renderGamification({
+    streak_days: g.streak_days, level: g.level,
+    xp_into_level: g.xp % 100, xp_per_level: 100,
+  });
+  if (g.leveled_up) {
+    showGamifyToast(`<i class="fas fa-arrow-up"></i> Lên cấp ${g.level}! 🎉`);
+  }
+  (g.new_achievements || []).forEach((code, i) => {
+    const meta = ACHIEVEMENTS_META_JS[code];
+    if (meta) setTimeout(() => showGamifyToast(`${meta.icon} Mở khoá thành tựu: ${meta.label}!`), 600 + i * 1500);
+  });
 }
 
 function showWelcome() {
@@ -1837,7 +2802,12 @@ async function openConversation(id) {
     const messages = await res.json();
     currentConversationId = id;
     document.getElementById('chat').innerHTML = '';
-    messages.forEach(m => addMessage(m.role === 'user' ? 'user' : 'ai', m.content, m.role !== 'user'));
+    messages.forEach(m => addMessage(
+      m.role === 'user' ? 'user' : 'ai',
+      m.content,
+      m.role !== 'user',
+      m.role !== 'user' ? { conversationId: id } : null
+    ));
     clearAttachments();
     closeSidebar();
     loadConversations();
@@ -1934,6 +2904,10 @@ async function sendMessage() {
 
           if (payload.conversationId) {
             currentConversationId = payload.conversationId;
+          } else if (payload.memory) {
+            showMemoryToast(payload.memory);
+          } else if (payload.gamify) {
+            handleGamifyEvent(payload.gamify);
           } else if (payload.error) {
             updateAiStreamBubble(aiBubble, (fullText ? fullText + '\n\n' : '') + '⚠️ **Lỗi:** ' + payload.error, false);
             handledError = true;
@@ -1950,10 +2924,17 @@ async function sendMessage() {
       if (!gotFirstToken && !handledError) {
         updateAiStreamBubble(aiBubble, '⚠️ Thầy/Cô chưa nhận được phản hồi. Em thử lại nhé!', false);
       }
+
+      if (gotFirstToken && !handledError) {
+        addMessageActions(aiBubble.parentElement, currentConversationId, () => fullText);
+      }
     }
   } catch (error) {
     updateAiStreamBubble(aiBubble, fullText || '🔌 Đã mất kết nối. Em kiểm tra lại mạng nhé!', false);
   } finally {
+    // Tắt hiệu ứng "đang suy nghĩ" trên avatar khi đã có kết quả (xong hoặc lỗi).
+    const avatarEl = aiBubble.parentElement && aiBubble.parentElement.querySelector('.ai-avatar');
+    if (avatarEl) avatarEl.classList.remove('thinking');
     input.disabled = false;
     sendBtn.disabled = false;
     sendBtn.innerHTML = '<i class="fas fa-arrow-up"></i>';
@@ -2117,6 +3098,7 @@ window.onload = () => {
   loadConversations();
   loadBanner();
   loadPlanInfo();
+  loadGamification();
 };
 </script>
 </body>
@@ -2134,6 +3116,7 @@ SECURITY_HTML = r'''
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Bảo mật ứng dụng StudyMate AI với HTTPS</title>
     <script src="https://cdn.tailwindcss.com"></script>
+    <script>tailwind.config = { darkMode: 'class' };</script>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>
         @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;700&display=swap');
@@ -2437,6 +3420,7 @@ DEV_STATS_HTML = r'''
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Thống kê sử dụng — StudyMate AI Max</title>
   <script src="https://cdn.tailwindcss.com"></script>
+  <script>tailwind.config = { darkMode: 'class' };</script>
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.6.0/css/all.min.css">
   <style>
     body { font-family: 'Segoe UI', system-ui, sans-serif; }
@@ -2485,7 +3469,7 @@ DEV_STATS_HTML = r'''
     {% endwith %}
 
     <!-- Thẻ tổng quan -->
-    <div class="grid grid-cols-2 lg:grid-cols-4 gap-4">
+    <div class="grid grid-cols-2 lg:grid-cols-3 xl:grid-cols-5 gap-4">
       <div class="bg-white dark:bg-[#1c1c1c] rounded-2xl border border-gray-100 dark:border-gray-800 p-5 shadow-sm">
         <div class="flex items-center justify-between">
           <span class="text-xs font-semibold text-gray-400 uppercase">Tổng tài khoản</span>
@@ -2518,6 +3502,14 @@ DEV_STATS_HTML = r'''
         <p class="text-3xl font-extrabold mt-2">{{ error_rate }}%</p>
         <p class="text-xs text-gray-400 mt-1">{{ error_count }} lượt gặp lỗi / {{ total_usage }} lượt</p>
       </div>
+      <a href="#issue-reports" class="bg-white dark:bg-[#1c1c1c] rounded-2xl border border-gray-100 dark:border-gray-800 p-5 shadow-sm hover:border-red-300 dark:hover:border-red-800 transition-colors">
+        <div class="flex items-center justify-between">
+          <span class="text-xs font-semibold text-gray-400 uppercase">Báo lỗi đang mở</span>
+          <i class="fas fa-flag text-red-500"></i>
+        </div>
+        <p class="text-3xl font-extrabold mt-2">{{ open_issues_count }}</p>
+        <p class="text-xs text-gray-400 mt-1">Bấm để xem chi tiết ↓</p>
+      </a>
     </div>
 
     <!-- Biểu đồ 14 ngày gần nhất -->
@@ -2629,6 +3621,136 @@ DEV_STATS_HTML = r'''
           <button name="value" value="on" type="submit" {{ 'disabled' if not google_configured else '' }} class="px-3 py-2 rounded-xl text-sm font-semibold disabled:opacity-40 {{ 'bg-emerald-600 text-white' if google_override == 'on' else 'bg-gray-100 dark:bg-gray-800 text-gray-500' }}">Bật</button>
           <button name="value" value="off" type="submit" class="px-3 py-2 rounded-xl text-sm font-semibold {{ 'bg-red-600 text-white' if google_override == 'off' else 'bg-gray-100 dark:bg-gray-800 text-gray-500' }}">Tắt</button>
         </form>
+      </div>
+    </div>
+
+    <!-- Đơn nâng cấp gói (thanh toán) -->
+    <div class="bg-white dark:bg-[#1c1c1c] rounded-2xl border border-gray-100 dark:border-gray-800 p-5 shadow-sm">
+      <div class="flex flex-wrap items-center justify-between gap-3 mb-1">
+        <h2 class="font-bold flex items-center gap-2"><i class="fas fa-credit-card text-indigo-500"></i> Thanh toán nâng cấp gói</h2>
+        <div class="flex items-center gap-2 text-xs">
+          <span class="px-2 py-1 rounded-full {{ 'bg-emerald-100 text-emerald-600 dark:bg-emerald-900 dark:text-emerald-300' if vnpay_enabled else 'bg-gray-100 text-gray-400 dark:bg-gray-800' }}">
+            <i class="fas fa-circle text-[6px] mr-1"></i>VNPAY {{ 'BẬT' if vnpay_enabled else 'TẮT' }}
+          </span>
+          <span class="px-2 py-1 rounded-full {{ 'bg-emerald-100 text-emerald-600 dark:bg-emerald-900 dark:text-emerald-300' if bank_transfer_enabled else 'bg-gray-100 text-gray-400 dark:bg-gray-800' }}">
+            <i class="fas fa-circle text-[6px] mr-1"></i>VietQR {{ 'BẬT' if bank_transfer_enabled else 'TẮT' }}
+          </span>
+        </div>
+      </div>
+      <p class="text-xs text-gray-400 mb-4">
+        Giá gói: Premium {{ plan_pricing.premium|vnd }}₫ · Max {{ plan_pricing.max|vnd }}₫ · Đã thu (đã xác nhận): <strong>{{ total_revenue|vnd }}₫</strong>.
+        Đơn qua VNPAY tự động kích hoạt gói (không cần bấm gì); đơn Chuyển khoản VietQR cần Admin bấm xác nhận thủ công sau khi kiểm tra đã nhận được tiền.
+      </p>
+
+      {% if pending_orders %}
+      <div class="mb-4">
+        <div class="text-xs font-semibold text-amber-600 dark:text-amber-400 uppercase mb-2">
+          <i class="fas fa-clock mr-1"></i> Đang chờ xác nhận ({{ pending_orders|length }})
+        </div>
+        <div class="space-y-2">
+          {% for o in pending_orders %}
+          <div class="flex flex-wrap items-center justify-between gap-2 border border-amber-200 dark:border-amber-900/50 bg-amber-50 dark:bg-amber-900/10 rounded-xl px-4 py-2.5 text-sm">
+            <div>
+              <span class="font-mono font-semibold">{{ o.order_code }}</span>
+              — {{ o.username or '—' }} · {{ plan_meta[o.plan].icon }} {{ plan_meta[o.plan].label }} ·
+              {{ o.amount|vnd }}₫ ·
+              <span class="text-gray-400">{{ 'VietQR' if o.method == 'bank_transfer' else 'VNPAY' }}</span>
+              <span class="text-gray-400">· {{ o.created_at[:16].replace('T', ' ') }}</span>
+            </div>
+            {% if o.method == 'bank_transfer' %}
+            <div class="flex items-center gap-1.5">
+              <form method="POST" action="{{ url_for('developer_confirm_payment', order_code=o.order_code) }}">
+                <button type="submit" class="px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-semibold">
+                  <i class="fas fa-check mr-1"></i>Xác nhận đã nhận tiền
+                </button>
+              </form>
+              <form method="POST" action="{{ url_for('developer_cancel_payment', order_code=o.order_code) }}">
+                <button type="submit" class="px-3 py-1.5 rounded-lg bg-gray-200 dark:bg-gray-700 hover:bg-gray-300 dark:hover:bg-gray-600 text-xs font-semibold">Huỷ</button>
+              </form>
+            </div>
+            {% else %}
+            <span class="text-xs text-gray-400 italic">Chờ VNPAY xác nhận tự động...</span>
+            {% endif %}
+          </div>
+          {% endfor %}
+        </div>
+      </div>
+      {% endif %}
+
+      <div class="text-xs font-semibold text-gray-400 uppercase mb-2">20 đơn gần nhất</div>
+      <div class="overflow-x-auto">
+        <table class="w-full text-sm min-w-[560px]">
+          <thead>
+            <tr class="text-left text-gray-400 text-xs uppercase border-b border-gray-100 dark:border-gray-800">
+              <th class="py-2 pr-3">Mã đơn</th>
+              <th class="py-2 pr-3">Người dùng</th>
+              <th class="py-2 pr-3">Gói</th>
+              <th class="py-2 pr-3">Số tiền</th>
+              <th class="py-2 pr-3">Phương thức</th>
+              <th class="py-2 pr-3">Trạng thái</th>
+              <th class="py-2">Thời gian</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for o in recent_orders %}
+            <tr class="border-b border-gray-50 dark:border-gray-900">
+              <td class="py-2 pr-3 font-mono text-xs">{{ o.order_code }}</td>
+              <td class="py-2 pr-3">{{ o.username or '—' }}</td>
+              <td class="py-2 pr-3">{{ plan_meta[o.plan].icon }} {{ plan_meta[o.plan].label }}</td>
+              <td class="py-2 pr-3">{{ o.amount|vnd }}₫</td>
+              <td class="py-2 pr-3 text-gray-400">{{ 'VietQR' if o.method == 'bank_transfer' else 'VNPAY' }}</td>
+              <td class="py-2 pr-3">
+                {% if o.status == 'paid' %}<span class="text-emerald-600 dark:text-emerald-400 font-semibold">Đã thanh toán</span>
+                {% elif o.status == 'pending' %}<span class="text-amber-600 dark:text-amber-400 font-semibold">Đang chờ</span>
+                {% elif o.status == 'cancelled' %}<span class="text-gray-400">Đã huỷ</span>
+                {% else %}<span class="text-red-500">Thất bại</span>{% endif %}
+              </td>
+              <td class="py-2 text-gray-400">{{ o.created_at[:16].replace('T', ' ') }}</td>
+            </tr>
+            {% else %}
+            <tr><td colspan="7" class="py-4 text-center text-gray-400">Chưa có đơn nào.</td></tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- Báo cáo lỗi từ học sinh -->
+    <div id="issue-reports" class="bg-white dark:bg-[#1c1c1c] rounded-2xl border border-gray-100 dark:border-gray-800 p-5 shadow-sm scroll-mt-20">
+      <div class="flex items-center justify-between mb-1 flex-wrap gap-2">
+        <h2 class="font-bold flex items-center gap-2"><i class="fas fa-flag text-red-500"></i> Báo cáo lỗi từ học sinh</h2>
+        <span class="text-xs text-gray-400">{{ open_issues_count }} đang mở / {{ issue_reports|length }} hiển thị</span>
+      </div>
+      <p class="text-xs text-gray-400 mb-4">Học sinh bấm "Báo lỗi" dưới 1 câu trả lời trong khung chat để gửi báo cáo về đây.</p>
+      <div class="space-y-3">
+        {% for r in issue_reports %}
+        <div class="border border-gray-100 dark:border-gray-800 rounded-xl p-4 {{ 'opacity-50' if r.status == 'resolved' else '' }}" data-issue-id="{{ r.id }}">
+          <div class="flex items-start justify-between gap-3 flex-wrap">
+            <div class="min-w-0">
+              <div class="flex items-center gap-2 text-xs text-gray-400 mb-1 flex-wrap">
+                <span class="font-semibold text-gray-600 dark:text-gray-300">{{ r.username or '—' }}</span>
+                <span>•</span><span>{{ r.created_at[:16].replace('T', ' ') }}</span>
+                {% if r.status == 'resolved' %}
+                <span class="px-1.5 py-0.5 rounded-full bg-emerald-100 dark:bg-emerald-900 text-emerald-600 dark:text-emerald-300 text-[10px] font-semibold uppercase">Đã xử lý</span>
+                {% else %}
+                <span class="px-1.5 py-0.5 rounded-full bg-red-100 dark:bg-red-900 text-red-600 dark:text-red-300 text-[10px] font-semibold uppercase">Đang mở</span>
+                {% endif %}
+              </div>
+              <p class="text-sm font-medium">{{ r.description }}</p>
+              {% if r.message_excerpt %}
+              <p class="text-xs text-gray-400 mt-1.5 italic">Liên quan tới câu trả lời: "{{ r.message_excerpt[:160] }}{{ '…' if r.message_excerpt|length > 160 else '' }}"</p>
+              {% endif %}
+            </div>
+            <form method="POST" action="{{ url_for('developer_resolve_issue', issue_id=r.id) }}">
+              <button type="submit" class="flex-shrink-0 text-xs font-medium px-3 py-1.5 rounded-lg bg-gray-100 dark:bg-gray-800 hover:bg-gray-200 dark:hover:bg-gray-700 whitespace-nowrap">
+                {{ 'Mở lại' if r.status == 'resolved' else 'Đánh dấu đã xử lý' }}
+              </button>
+            </form>
+          </div>
+        </div>
+        {% else %}
+        <p class="text-sm text-gray-400">Chưa có báo cáo lỗi nào. 🎉</p>
+        {% endfor %}
       </div>
     </div>
 
@@ -2950,6 +4072,16 @@ def home():
     unlocked_by_plan = {
         p: [k for k in THINKING_MODE_ORDER if thinking_mode_unlocked(k, p)] for p in PLAN_ORDER
     }
+    # Ưu đãi lần đầu chỉ phụ thuộc số đơn ĐÃ TRẢ TIỀN của tài khoản (không phụ thuộc đang xem
+    # gói nào), nên chỉ cần gọi 1 lần với 1 gói bất kỳ trong PLAN_PRICING để lấy is_discounted.
+    discount_amounts = {}
+    is_discount_eligible, discount_months_left = False, 0
+    if user:
+        for p, base in PLAN_PRICING.items():
+            amount, base_amount, is_discounted, paid_count = compute_checkout_price(user['id'], p)
+            discount_amounts[p] = amount
+            is_discount_eligible = is_discounted
+            discount_months_left = max(0, FIRST_TIME_DISCOUNT_MONTHS - paid_count)
     return render_template_string(
         HTML,
         username=session.get('username', ''),
@@ -2968,6 +4100,15 @@ def home():
         thinking_mode_order=THINKING_MODE_ORDER,
         unlocked_thinking_modes=unlocked_by_plan[plan],
         unlocked_by_plan=unlocked_by_plan,
+        plan_pricing=PLAN_PRICING,
+        discount_amounts=discount_amounts,
+        is_discount_eligible=is_discount_eligible,
+        discount_pct=FIRST_TIME_DISCOUNT_PCT,
+        discount_months_left=discount_months_left,
+        vnpay_enabled=VNPAY_ENABLED,
+        bank_transfer_enabled=BANK_TRANSFER_ENABLED,
+        payment_methods_enabled=PAYMENT_METHODS_ENABLED,
+        achievements_meta=ACHIEVEMENTS_META,
     )
 
 
@@ -3074,6 +4215,29 @@ def developer_stats():
     ).fetchone()
     estimated_tokens = round((token_row['mc'] + token_row['rc']) / 4)
 
+    # ---- Đơn nâng cấp gói (thanh toán) ----
+    pending_orders_rows = db.execute('''
+        SELECT o.*, u.username AS username FROM payment_orders o
+        LEFT JOIN users u ON u.id = o.user_id
+        WHERE o.status = 'pending' ORDER BY o.created_at ASC
+    ''').fetchall()
+    recent_orders_rows = db.execute('''
+        SELECT o.*, u.username AS username FROM payment_orders o
+        LEFT JOIN users u ON u.id = o.user_id
+        ORDER BY o.created_at DESC LIMIT 20
+    ''').fetchall()
+    total_revenue = db.execute(
+        "SELECT COALESCE(SUM(amount), 0) r FROM payment_orders WHERE status = 'paid'"
+    ).fetchone()['r']
+
+    # ---- Báo lỗi từ học sinh ----
+    open_issues_count = db.execute("SELECT COUNT(*) c FROM issue_reports WHERE status = 'open'").fetchone()['c']
+    issue_rows = db.execute('''
+        SELECT r.*, u.username AS username FROM issue_reports r
+        LEFT JOIN users u ON u.id = r.user_id
+        ORDER BY (r.status = 'open') DESC, r.created_at DESC LIMIT 30
+    ''').fetchall()
+
     role = current_user_role()
 
     return render_template_string(
@@ -3096,6 +4260,7 @@ def developer_stats():
         role_rank_map={r: role_rank(r) for r in ROLE_ORDER},
         plan_meta=PLAN_META,
         plan_order=PLAN_ORDER,
+        plan_pricing=PLAN_PRICING,
         current_role=role,
         is_admin=(role_rank(role) >= role_rank('admin')),
         is_super_admin=(role_rank(role) >= role_rank('super_admin')),
@@ -3108,6 +4273,13 @@ def developer_stats():
         ai_temperature_override=get_setting('ai_temperature_override', '') or '',
         global_system_addendum=get_setting('global_system_addendum', '') or '',
         default_model=CONSOLEX_MODEL,
+        pending_orders=[dict(o) for o in pending_orders_rows],
+        recent_orders=[dict(o) for o in recent_orders_rows],
+        total_revenue=total_revenue,
+        vnpay_enabled=VNPAY_ENABLED,
+        bank_transfer_enabled=BANK_TRANSFER_ENABLED,
+        issue_reports=[dict(r) for r in issue_rows],
+        open_issues_count=open_issues_count,
     )
 
 
@@ -3165,10 +4337,77 @@ def developer_change_plan(user_id):
         flash('Gói không hợp lệ.')
         return redirect(url_for('developer_stats'))
 
-    db.execute('UPDATE users SET plan = ? WHERE id = ?', (new_plan, user_id))
+    if new_plan == 'free':
+        # Hạ về Free thì xoá luôn hạn dùng — không cần grant_plan_upgrade() (hàm đó chỉ dùng để
+        # CẤP gói có phí theo tháng, hạ về Free không có khái niệm "hạn dùng").
+        db.execute('UPDATE users SET plan = ?, plan_expires_at = NULL WHERE id = ?', (new_plan, user_id))
+        db.commit()
+        write_audit('change_plan', target['username'], f"{target['plan']} → {new_plan}")
+    else:
+        # Admin "tặng" gói: CHỈ 1 THÁNG miễn phí (không phải vĩnh viễn) — dùng chung
+        # grant_plan_upgrade() với cổng thanh toán thật để hạn dùng được tính nhất quán và tự
+        # rơi về Free khi hết hạn (xem effective_plan()).
+        grant_plan_upgrade(user_id, new_plan, order_code=f"gift_by_{session.get('username','admin')}",
+                            actor=session.get('username', 'admin'), months=1)
+    flash(f"Đã đổi gói của '{target['username']}' thành {plan_meta(new_plan)['label']}"
+          + ('' if new_plan == 'free' else ' (tặng miễn phí 1 tháng).'))
+    return redirect(url_for('developer_stats'))
+
+
+@app.route('/developer/payments/<order_code>/confirm', methods=['POST'])
+@admin_required
+def developer_confirm_payment(order_code):
+    """Admin bấm xác nhận ĐÃ NHẬN ĐƯỢC TIỀN cho 1 đơn chuyển khoản VietQR (thủ công, vì app
+    không có quyền đọc sao kê ngân hàng tự động). Đơn qua VNPAY thì KHÔNG cần bấm tay — đã tự
+    chốt qua IPN (xem vnpay_ipn())."""
+    db = get_db()
+    order = db.execute('SELECT * FROM payment_orders WHERE order_code = ?', (order_code,)).fetchone()
+    if not order:
+        flash('Không tìm thấy đơn hàng.')
+        return redirect(url_for('developer_stats'))
+    if order['status'] == 'paid':
+        flash('Đơn này đã được xác nhận trước đó.')
+        return redirect(url_for('developer_stats'))
+
+    db.execute("UPDATE payment_orders SET status = 'paid', paid_at = ? WHERE order_code = ?",
+               (now_iso(), order_code))
     db.commit()
-    write_audit('change_plan', target['username'], f"{target['plan']} → {new_plan}")
-    flash(f"Đã đổi gói của '{target['username']}' thành {plan_meta(new_plan)['label']}.")
+    grant_plan_upgrade(order['user_id'], order['plan'], order_code, actor=session.get('username', ''))
+    flash(f"Đã xác nhận thanh toán & nâng cấp gói cho đơn {order_code}.")
+    return redirect(url_for('developer_stats'))
+
+
+@app.route('/developer/payments/<order_code>/cancel', methods=['POST'])
+@admin_required
+def developer_cancel_payment(order_code):
+    db = get_db()
+    order = db.execute('SELECT * FROM payment_orders WHERE order_code = ?', (order_code,)).fetchone()
+    if not order:
+        flash('Không tìm thấy đơn hàng.')
+        return redirect(url_for('developer_stats'))
+    db.execute("UPDATE payment_orders SET status = 'cancelled' WHERE order_code = ?", (order_code,))
+    db.commit()
+    write_audit('cancel_payment_order', target=order_code)
+    flash(f"Đã huỷ đơn {order_code}.")
+    return redirect(url_for('developer_stats'))
+
+
+@app.route('/developer/issues/<int:issue_id>/resolve', methods=['POST'])
+@admin_required
+def developer_resolve_issue(issue_id):
+    """Đánh dấu 1 báo cáo lỗi là đã xử lý (hoặc mở lại nếu bấm lần nữa)."""
+    db = get_db()
+    row = db.execute('SELECT id, status FROM issue_reports WHERE id = ?', (issue_id,)).fetchone()
+    if not row:
+        flash('Không tìm thấy báo cáo này.')
+        return redirect(url_for('developer_stats'))
+    new_status = 'open' if row['status'] == 'resolved' else 'resolved'
+    resolved_at = now_iso() if new_status == 'resolved' else None
+    db.execute('UPDATE issue_reports SET status = ?, resolved_at = ?, resolved_by = ? WHERE id = ?',
+               (new_status, resolved_at, session.get('username', '') if new_status == 'resolved' else None, issue_id))
+    db.commit()
+    if new_status == 'resolved':
+        write_audit('resolve_issue_report', target=str(issue_id))
     return redirect(url_for('developer_stats'))
 
 
@@ -3350,6 +4589,7 @@ AUDIT_LOG_HTML = r'''
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Nhật ký hệ thống - StudyMate AI Max</title>
   <script src="https://cdn.tailwindcss.com"></script>
+  <script>tailwind.config = { darkMode: 'class' };</script>
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.6.0/css/all.min.css">
 </head>
 <body class="bg-[#0f0f0f] text-gray-200 min-h-screen">
@@ -3654,18 +4894,258 @@ def api_plan():
     plan = effective_plan(user)
     limits = plan_limits(plan)
     used = _uploads_used_last_24h(user['id']) if limits['daily_uploads'] is not None else 0
+    is_role_based = role_rank(user['role']) >= role_rank('developer')
+
+    days_remaining = None
+    expires_at_iso = None
+    if plan != 'free' and not is_role_based:
+        try:
+            raw = user['plan_expires_at']
+            if raw:
+                exp_dt = datetime.fromisoformat(raw)
+                if exp_dt.tzinfo is None:
+                    exp_dt = exp_dt.replace(tzinfo=timezone.utc)
+                days_remaining = max(0, (exp_dt - datetime.now(timezone.utc)).days)
+                expires_at_iso = exp_dt.isoformat()
+        except Exception:
+            pass
+
+    _, _, is_discount_eligible, paid_months = compute_checkout_price(user['id'], 'premium')
+
     return jsonify({
         'plan': plan,
         'label': plan_meta(plan)['label'],
         'icon': plan_meta(plan)['icon'],
-        'is_role_based': role_rank(user['role']) >= role_rank('developer'),
+        'is_role_based': is_role_based,
         'daily_upload_limit': limits['daily_uploads'],
         'daily_uploads_used': used,
         'max_file_mb': limits['max_file_mb'],
         'unlocked_thinking_modes': [
             k for k in THINKING_MODE_ORDER if thinking_mode_unlocked(k, plan)
         ],
+        'plan_expires_at': expires_at_iso,
+        'days_remaining': days_remaining,
+        'is_discount_eligible': is_discount_eligible,
+        'discount_pct': FIRST_TIME_DISCOUNT_PCT,
+        'discount_months_used': paid_months,
+        'discount_months_total': FIRST_TIME_DISCOUNT_MONTHS,
     })
+
+
+@app.route('/api/gamification', methods=['GET'])
+@login_required
+def api_gamification():
+    """XP / streak / thành tựu của tài khoản đang đăng nhập — hiển thị ở sidebar + Cài đặt."""
+    return jsonify(get_user_stats(current_user_id()))
+
+
+@app.route('/api/memories', methods=['GET'])
+@login_required
+def api_list_memories():
+    conn = open_write_db()
+    try:
+        rows = conn.execute(
+            'SELECT id, content, category, source, created_at FROM memories WHERE user_id = ? ORDER BY created_at DESC',
+            (current_user_id(),)
+        ).fetchall()
+    finally:
+        conn.close()
+    return jsonify([dict(r) for r in rows])
+
+
+@app.route('/api/memories', methods=['DELETE'])
+@login_required
+def api_clear_memories():
+    """Xoá toàn bộ 'bộ nhớ' AI của chính học sinh này (quyền riêng tư — mỗi người chỉ xoá
+    được bộ nhớ của mình)."""
+    conn = open_write_db()
+    try:
+        conn.execute('DELETE FROM memories WHERE user_id = ?', (current_user_id(),))
+        conn.commit()
+    finally:
+        conn.close()
+    return jsonify({"success": True})
+
+
+@app.route('/api/report-issue', methods=['POST'])
+@login_required
+def api_report_issue():
+    """Học sinh báo lỗi 1 câu trả lời cụ thể (hoặc báo lỗi chung). Lưu lại để Admin xem và
+    xử lý ở trang /developer."""
+    data = request.get_json(silent=True) or {}
+    description = (data.get('description') or '').strip()
+    message_excerpt = (data.get('messageExcerpt') or '').strip()[:2000]
+    raw_conv_id = data.get('conversationId')
+
+    if not description:
+        return jsonify({"error": "Em mô tả lỗi cụ thể giúp Thầy/Cô nhé."}), 400
+    if len(description) > 1000:
+        return jsonify({"error": "Mô tả hơi dài, em rút gọn lại giúp Thầy/Cô nhé!"}), 400
+
+    conv_id = None
+    if raw_conv_id is not None:
+        try:
+            conv_id = int(raw_conv_id)
+        except (TypeError, ValueError):
+            conv_id = None
+
+    db = get_db()
+    db.execute(
+        '''INSERT INTO issue_reports
+           (user_id, conversation_id, message_excerpt, description, status, created_at)
+           VALUES (?, ?, ?, ?, 'open', ?)''',
+        (current_user_id(), conv_id, message_excerpt, description, now_iso())
+    )
+    db.commit()
+    return jsonify({"success": True})
+
+
+# ==========================================
+# 8.5 THANH TOÁN NÂNG CẤP GÓI (VNPAY + Chuyển khoản VietQR)
+# ==========================================
+@app.route('/api/checkout', methods=['POST'])
+@login_required
+def api_checkout():
+    """Tạo 1 đơn nâng cấp gói THEO THÁNG. method = 'vnpay' (thẻ ATM/Visa/Mastercard/JCB,
+    redirect sang VNPAY) hoặc 'bank_transfer' (quét mã VietQR, Admin xác nhận thủ công sau
+    khi nhận tiền). Tự áp dụng ưu đãi lần đầu (xem compute_checkout_price())."""
+    user = current_user()
+    role = current_user_role()
+    if role_rank(role) >= role_rank('developer'):
+        return jsonify({"error": "Tài khoản của em đã có gói Max theo vai trò, không cần nâng cấp."}), 400
+
+    data = request.get_json(silent=True) or {}
+    plan = (data.get('plan') or '').strip()
+    method = (data.get('method') or '').strip()
+
+    if plan not in PLAN_PRICING:
+        return jsonify({"error": "Gói không hợp lệ."}), 400
+    if plan_rank(plan) < plan_rank(effective_plan(user)):
+        return jsonify({"error": "Không thể hạ xuống gói thấp hơn gói đang dùng qua đây."}), 400
+    if method not in ('vnpay', 'bank_transfer'):
+        return jsonify({"error": "Phương thức thanh toán không hợp lệ."}), 400
+    if method == 'vnpay' and not VNPAY_ENABLED:
+        return jsonify({"error": "Thanh toán qua thẻ (VNPAY) hiện chưa khả dụng."}), 400
+    if method == 'bank_transfer' and not BANK_TRANSFER_ENABLED:
+        return jsonify({"error": "Thanh toán chuyển khoản hiện chưa khả dụng."}), 400
+
+    amount, base_amount, is_discounted, paid_so_far = compute_checkout_price(user['id'], plan)
+    order_code = generate_order_code()
+    db = get_db()
+    db.execute(
+        '''INSERT INTO payment_orders
+           (order_code, user_id, plan, amount, base_amount, is_discounted, method, status, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?)''',
+        (order_code, user['id'], plan, amount, base_amount, int(is_discounted), method, now_iso())
+    )
+    db.commit()
+
+    if method == 'bank_transfer':
+        return jsonify({
+            'orderCode': order_code,
+            'amount': amount,
+            'baseAmount': base_amount,
+            'isDiscounted': is_discounted,
+            'method': 'bank_transfer',
+            'qrImageUrl': vietqr_image_url(amount, order_code),
+            'bankAccountName': VIETQR_ACCOUNT_NAME,
+            'bankAccountNo': VIETQR_ACCOUNT_NO,
+            'bankId': VIETQR_BANK_ID,
+            'transferContent': order_code,
+        })
+
+    # method == 'vnpay'
+    ip_addr = (request.headers.get('X-Forwarded-For', '') or request.remote_addr or '127.0.0.1').split(',')[0].strip()
+    return_url = url_for('vnpay_return', _external=True)
+    order_info = f"Nang cap {plan_meta(plan)['label']} 1 thang StudyMate AI - {order_code}"
+    payment_url = vnpay_build_payment_url(order_code, amount, order_info, ip_addr, return_url)
+    return jsonify({
+        'orderCode': order_code, 'amount': amount, 'baseAmount': base_amount,
+        'isDiscounted': is_discounted, 'method': 'vnpay', 'redirectUrl': payment_url,
+    })
+
+
+@app.route('/api/checkout/<order_code>/status', methods=['GET'])
+@login_required
+def api_checkout_status(order_code):
+    """Client gọi định kỳ (polling) trong lúc chờ xác nhận chuyển khoản — hoặc để kiểm tra
+    kết quả sau khi quay lại từ VNPAY. Chỉ trả về đơn của CHÍNH tài khoản đang đăng nhập."""
+    db = get_db()
+    order = db.execute(
+        'SELECT * FROM payment_orders WHERE order_code = ? AND user_id = ?',
+        (order_code, current_user_id())
+    ).fetchone()
+    if not order:
+        return jsonify({"error": "Không tìm thấy đơn hàng."}), 404
+    return jsonify({
+        'orderCode': order['order_code'], 'plan': order['plan'], 'amount': order['amount'],
+        'method': order['method'], 'status': order['status'],
+    })
+
+
+@app.route('/vnpay/return')
+def vnpay_return():
+    """VNPAY chuyển hướng trình duyệt của học sinh về đây sau khi thanh toán xong. Đây CHỈ
+    là màn hình hiển thị kết quả cho người dùng xem — việc CHỐT đơn hàng (cộng gói) luôn dựa
+    vào IPN (vnpay_ipn, server-to-server) bên dưới, vì Return URL có thể bị người dùng đóng
+    trình duyệt giữa chừng hoặc giả mạo query string."""
+    args = request.args.to_dict()
+    valid = VNPAY_ENABLED and vnpay_verify_return(args)
+    success = valid and args.get('vnp_ResponseCode') == '00'
+    order_code = args.get('vnp_TxnRef', '')
+
+    db = get_db()
+    order = db.execute('SELECT * FROM payment_orders WHERE order_code = ?', (order_code,)).fetchone()
+    status = order['status'] if order else None
+
+    return render_template_string(
+        VNPAY_RETURN_HTML,
+        success=success, valid=valid, order_code=order_code, status=status,
+        plan_label=plan_meta(order['plan'])['label'] if order else '',
+    )
+
+
+@app.route('/vnpay/ipn')
+def vnpay_ipn():
+    """IPN (Instant Payment Notification) — VNPAY tự gọi endpoint này từ SERVER của họ (không
+    qua trình duyệt người dùng) để báo kết quả thanh toán CHÍNH THỨC. Đây là nơi DUY NHẤT được
+    phép cộng gói cho tài khoản. Phải trả lời đúng định dạng JSON RspCode/Message VNPAY yêu cầu,
+    nếu không VNPAY sẽ coi là thất bại và gọi lại nhiều lần."""
+    args = request.args.to_dict()
+
+    if not VNPAY_ENABLED or not vnpay_verify_return(args):
+        return jsonify({"RspCode": "97", "Message": "Invalid signature"})
+
+    order_code = args.get('vnp_TxnRef', '')
+    db = get_db()
+    order = db.execute('SELECT * FROM payment_orders WHERE order_code = ?', (order_code,)).fetchone()
+    if not order:
+        return jsonify({"RspCode": "01", "Message": "Order not found"})
+
+    # Số tiền VNPAY gửi về đã nhân 100 — đối chiếu lại đúng số tiền đơn hàng gốc để tránh
+    # trường hợp bị sửa amount trên đường truyền.
+    try:
+        vnp_amount = int(args.get('vnp_Amount', '0')) // 100
+    except ValueError:
+        vnp_amount = -1
+    if vnp_amount != order['amount']:
+        return jsonify({"RspCode": "04", "Message": "Invalid amount"})
+
+    if order['status'] == 'paid':
+        return jsonify({"RspCode": "02", "Message": "Order already confirmed"})
+
+    if args.get('vnp_ResponseCode') == '00':
+        db.execute(
+            "UPDATE payment_orders SET status = 'paid', provider_txn_id = ?, paid_at = ? WHERE order_code = ?",
+            (args.get('vnp_TransactionNo', ''), now_iso(), order_code)
+        )
+        db.commit()
+        grant_plan_upgrade(order['user_id'], order['plan'], order_code, actor='vnpay_ipn')
+        return jsonify({"RspCode": "00", "Message": "Confirm Success"})
+    else:
+        db.execute("UPDATE payment_orders SET status = 'failed' WHERE order_code = ?", (order_code,))
+        db.commit()
+        return jsonify({"RspCode": "00", "Message": "Confirm Success"})
 
 
 # ==========================================
@@ -4080,6 +5560,11 @@ def chat():
     )
     db.commit()
 
+    # "Bộ nhớ" AI: phát hiện + lưu 1 mục mới từ tin nhắn này (nếu có), rồi lấy những gì đã
+    # ghi nhớ trước đó để cá nhân hoá câu trả lời (xem mục 0.27).
+    new_memory = extract_and_save_memory(user_id, user_message)
+    recent_memories = get_recent_memories(user_id)
+
     if custom_tutor:
         system_prompt = f"""
     Bạn là "{custom_tutor['name']}", một AI Tutor tuỳ chỉnh do chính người dùng tạo ra trên {app_name}.
@@ -4128,6 +5613,17 @@ def chat():
     ---
     """
 
+    if recent_memories:
+        mem_lines = "\n".join(f"    - {m}" for m in recent_memories)
+        system_prompt += f"""
+
+    Những điều Thầy/Cô đã ghi nhớ về học sinh này từ các lần trò chuyện trước:
+{mem_lines}
+    Hãy tận dụng thông tin này để cá nhân hoá câu trả lời khi phù hợp (vd: nếu biết học sinh
+    hay nhầm 1 lỗi cụ thể, hãy giải thích kỹ hơn ở phần đó), nhưng đừng nhắc lại y nguyên nếu
+    không cần thiết.
+    """
+
     if file_context:
         system_prompt += f"""
 
@@ -4155,6 +5651,8 @@ def chat():
 
     def generate():
         yield f"data: {json.dumps({'conversationId': conv_id, 'thinkingMode': thinking_mode})}\n\n"
+        if new_memory:
+            yield f"data: {json.dumps({'memory': new_memory})}\n\n"
         collected = []
         try:
             for token in stream_consolex_ai(system_prompt, user_content, max_tokens=tm_conf['max_tokens']):
@@ -4179,6 +5677,12 @@ def chat():
 
             log_usage(user_id, subject, mode, len(user_message), len(assistant_text),
                       bool(file_context), bool(image_data), 'ok' if assistant_text else 'empty')
+
+            if assistant_text:
+                track_topic_practice(user_id, subject, mode)
+                gamify = award_xp_and_streak(user_id)
+                yield f"data: {json.dumps({'gamify': gamify})}\n\n"
+
             yield f"data: {json.dumps({'done': True})}\n\n"
         except RuntimeError as e:
             log_usage(user_id, subject, mode, len(user_message), 0, bool(file_context), bool(image_data), 'error')
@@ -4220,4 +5724,12 @@ if __name__ == '__main__':
     print("🛡️ Để xem bảng báo cáo bảo mật... Truy cập: http://localhost:5000/security")
     # debug=True chỉ dùng khi phát triển trên máy cá nhân — KHÔNG bật khi deploy thật
     # (xem README phần "Deploy lên production" để chạy bằng gunicorn thay vì app.run).
-    app.run(host='0.0.0.0', port=5000, debug=True, threaded=True)
+    # use_reloader=False: khi debug=True, Werkzeug mặc định tự khởi động lại
+    # (restart) tiến trình mỗi khi phát hiện một file trong thư mục dự án thay
+    # đổi. studymate.db (SQLite) bị ghi liên tục mỗi khi có tin nhắn mới, nên
+    # nó cũng bị coi là "file thay đổi" và làm server tự restart ngay giữa lúc
+    # đang stream câu trả lời — kết nối SQLite của request đó bị đóng đột ngột,
+    # gây lỗi "Cannot operate on a closed database.". Tắt use_reloader để tránh
+    # restart ngoài ý muốn này (vẫn giữ debug=True để còn thấy traceback lỗi khi
+    # phát triển). Khi sửa code .py, chỉ cần dừng (Ctrl+C) và chạy lại thủ công.
+    app.run(host='0.0.0.0', port=5000, debug=True, threaded=True, use_reloader=False)
