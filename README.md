@@ -175,35 +175,59 @@ Trang `/developer` có thêm mục **"Quản lý hệ thống"**:
 
 ⚠️ Không cần cài thêm thư viện nào cho các tính năng ở mục 8–9 — toàn bộ dùng lại `flask`, `sqlite3`, `csv` (thư viện chuẩn của Python), không cập nhật `requirements.txt`.
 
-## 10. Báo lỗi câu trả lời (mới)
+## 10. Gói sử dụng: Free / Premium / Max (mới)
 
-Học sinh giờ có thể báo lỗi trực tiếp ngay dưới bất kỳ câu trả lời nào của AI:
+> ⚠️ Lưu ý: bản `app.py` bạn gửi lần này là một nhánh phát triển khác với các bản trước (đã có sẵn hệ thống vai trò `user → developer → admin → super_admin`, AI Tutor tuỳ chỉnh, nhật ký audit, v.v. — xem mục 12). Mục 10–11 dưới đây là phần mình vừa hoàn thiện theo đúng yêu cầu mới nhất của bạn. Hai mục "Báo lỗi câu trả lời" / "Bộ nhớ AI" ở bản README cũ **không có trong nhánh `app.py` này** nên đã được gỡ khỏi tài liệu để tránh nhầm lẫn — nếu bạn vẫn muốn 2 tính năng đó trong nhánh này, cứ nhắn mình làm tiếp.
 
-- Dưới mỗi câu trả lời (hiện khi rê chuột / chạm vào), có nút **"🚩 Báo lỗi"**. Bấm vào sẽ mở hộp thoại cho học sinh mô tả vấn đề (sai kiến thức, khó hiểu, lạc đề, v.v.).
-- Báo cáo được gửi kèm: tên tài khoản, đoạn chat liên quan (`conversation_id`), một đoạn trích câu trả lời bị báo lỗi (tối đa 2000 ký tự), và mô tả của học sinh — lưu vào bảng mới `issue_reports`.
-- Trang `/developer` có thêm:
-  - Thẻ tổng quan thứ 5: **"Báo lỗi đang mở"** (số lượng đang chờ xử lý / tổng số báo cáo).
-  - Banner nhỏ màu đỏ ở đầu trang khi có báo cáo đang mở, bấm vào để nhảy thẳng xuống panel báo cáo.
-  - Panel **"Báo cáo lỗi từ học sinh"**: liệt kê từng báo cáo (người gửi, thời gian, mô tả, đoạn trích liên quan), có nút **"Đánh dấu đã xử lý"** / **"Mở lại"** để developer cập nhật trạng thái ngay tại chỗ (không cần reload thủ công — trang tự tải lại sau khi bấm).
-- API liên quan: `POST /api/report-issue` (học sinh gửi báo cáo), `POST /developer/issues/<id>/resolve` (developer đổi trạng thái, chỉ tài khoản `role = developer` mới gọi được).
+Đã bỏ hẳn chữ **"Pro"** khỏi mọi nơi hiển thị cho tài khoản thường — tên app giờ đổi động theo gói:
 
-## 11. "Bộ nhớ" AI — cá nhân hoá câu trả lời (mới)
+| Gói | Ai có | Giới hạn đọc file/ảnh mỗi 24h | Dung lượng tối đa/file | Tên app hiển thị |
+|---|---|---|---|---|
+| 🆓 **Free** | Mặc định mọi tài khoản mới | 20 lượt | 20MB | `StudyMate AI` |
+| 💎 **Premium** | Admin gán tay từ `/developer` | 50 lượt | 500MB | `StudyMate AI Premium` |
+| 🚀 **Max** | Admin gán tay, **hoặc tự động nếu vai trò ≥ Developer** | Không giới hạn | 1GB | `StudyMate AI Max` |
 
-Lấy cảm hứng từ tính năng Memory của các AI phổ biến, nhưng làm gọn nhẹ, **không tốn thêm lượt gọi API AI nào**:
+- Cột `plan` mới trong bảng `users` (mặc định `'free'`) lưu gói do Admin gán thủ công — **nhưng** tài khoản có vai trò `developer`/`admin`/`super_admin` luôn được tính là **Max vô điều kiện** ngay cả khi cột `plan` vẫn ghi `'free'` (hàm `effective_plan()` ưu tiên vai trò trước, không cần Admin phải gán tay cho từng dev). Vì vậy trang `/developer` **không cho đổi gói** với các tài khoản từ Developer trở lên (nút bị ẩn, kèm chú thích lý do).
+- Giới hạn *số lượt* đọc file/ảnh tính theo **cửa sổ trượt 24 giờ** (không phải theo lịch nửa đêm reset) — bảng mới `file_uploads` ghi lại mỗi lượt tải lên, cứ quá 24h thì lượt đó "hết hạn" và tự nhường chỗ cho lượt mới. Giới hạn dung lượng còn siết luôn cả bước trích chữ từ PDF/Word: Free cắt ở ~12.000 ký tự, Premium ~48.000 ký tự, Max không cắt.
+- **Đổi gói (Admin trở lên)**: bảng "Toàn bộ tài khoản" ở `/developer` có thêm cột **Gói** + dropdown đổi gói tại chỗ (`POST /developer/users/<id>/plan`), có ghi audit log.
+- **Xem gói + hạn mức của chính mình**: `GET /api/plan` trả về gói hiện tại, đã dùng bao nhiêu/bao nhiêu lượt hôm nay, có phải "miễn phí theo vai trò" không. Hiển thị ngay trong **Cài đặt** (thanh tiến trình nhỏ, tự làm mới sau mỗi lần tải file).
+- **Hộp thoại "Nâng cấp gói"** làm lại hoàn toàn: hiện đúng 3 cột Free/Premium/Max với số liệu thật (không còn số liệu giả), tự khoanh viền cột gói hiện tại của người xem, và liệt kê luôn các Chế độ suy nghĩ mở khoá ở từng gói (xem mục 11). Chưa có cổng thanh toán thật — bấm nút ở 2 cột còn lại chỉ hiện "Chưa khả dụng", đúng như bản trước.
 
-- **Ghi nhớ theo yêu cầu**: học sinh gõ những câu như *"ghi nhớ giúp em là em học lớp 8 và yếu phần hình học"*, *"hãy nhớ mình sắp thi học kỳ môn Hóa"* — hệ thống nhận diện bằng regex (các cụm kích hoạt: "ghi nhớ", "hãy nhớ", "nhớ giúp", "note giúp", "lưu ý giúp"), lưu nội dung vào bảng mới `memories`, và hiện một toast nhỏ **"🧠 Đã ghi nhớ: ..."** ở góc dưới màn hình để xác nhận ngay lập tức.
-- **Tự nhận diện lớp học**: nếu học sinh nhắc "lớp 6/7/8/9" ở bất kỳ tin nhắn nào, hệ thống tự ghi nhớ 1 lần duy nhất (không lặp lại mỗi lần nhắc).
-- **Dùng lại để cá nhân hoá**: ở mỗi lượt chat tiếp theo, tối đa 5 mục ghi nhớ gần nhất của học sinh đó được đưa vào system prompt, giúp AI trả lời đúng trình độ / bối cảnh hơn mà không cần học sinh lặp lại thông tin.
-- **Quyền riêng tư**: học sinh có thể tự xoá toàn bộ bộ nhớ của mình bất cứ lúc nào qua **Cài đặt → "Xoá bộ nhớ AI của tôi"** (`DELETE /api/memories`) — chỉ xoá được bộ nhớ của chính tài khoản đang đăng nhập.
-- **Xem tổng hợp (developer)**: trang `/developer` có panel **"Bộ nhớ AI gần đây"** hiển thị 10 mục mới nhất trên toàn hệ thống (tài khoản, nội dung, thời gian, nguồn gốc "tự động"/"học sinh yêu cầu") kèm tổng số mục — giúp hiểu học sinh đang cần hỗ trợ gì mà không cần đọc toàn bộ lịch sử chat.
+## 11. Chế độ suy nghĩ của AI: Trợ Lý / Học Giả / Giáo Sư / Thiên Tài (mới)
 
-⚠️ Lưu ý: đây là cơ chế "bộ nhớ" dựa trên quy tắc (regex) đơn giản, không phải AI tự suy luận/tổng hợp — độ chính xác phụ thuộc vào cách học sinh diễn đạt câu yêu cầu ghi nhớ. Không cập nhật `requirements.txt` cho mục 10–11 (chỉ dùng `flask`, `sqlite3`, `re` có sẵn).
+Một dropdown mới ngay cạnh 2 ô "Môn học" / "Chế độ" ở thanh trên cùng, cho học sinh chọn AI nên "đầu tư" bao nhiêu công sức suy luận cho câu trả lời:
+
+| Chế độ | Icon | Gói tối thiểu | Ngân sách token | Ý tưởng |
+|---|---|---|---|---|
+| Trợ Lý | 💬 | Free | 800 | Mặc định, nhanh, cân bằng |
+| Học Giả | 📖 | Premium | 1.400 | Suy luận từng bước kỹ hơn trước khi chốt đáp án |
+| Giáo Sư | 🎓 | Premium | 1.600 | Giải thích mở rộng — nhiều ví dụ, liên hệ thực tế |
+| Thiên Tài | 🌟 | **Max** (độc quyền) | 2.200 | Kết hợp cả suy luận sâu lẫn giải thích mở rộng — mạnh nhất |
+
+- Học Giả + Giáo Sư tương ứng đúng 2 chế độ "deepthinking"/"extra" bạn yêu cầu (mở khoá từ Premium); Thiên Tài là chế độ **độc quyền Max** duy nhất, kết hợp cả hai — bạn có thể đổi tên hiển thị bất cứ lúc nào ở dict `THINKING_MODES` trong `app.py`, không cần sửa logic.
+- Trong dropdown, chế độ chưa mở khoá vẫn hiện đầy đủ (kèm mô tả) nhưng có khoá 🔒 + nhãn gói cần có — bấm vào sẽ mở thẳng hộp thoại "Nâng cấp gói" thay vì chọn được.
+- **Chặn ở cả server, không chỉ ẩn ở giao diện**: kể cả khi ai đó tự gọi thẳng `POST /api/chat` với `thinkingMode: "genius"` mà tài khoản đang là Free, server vẫn tự động hạ về `"standard"` (hàm `resolve_thinking_mode()`) — không tin tưởng dữ liệu phía client gửi lên.
+- Chế độ đang chọn được gắn thêm 1 đoạn hướng dẫn (`prompt_hint`) vào system prompt và đổi luôn `max_tokens` gửi cho model — không tốn thêm lượt gọi API nào ngoài 1 lượt chat bình thường.
+
+⚠️ Chưa lưu chế độ suy nghĩ đang chọn vào tuỳ chọn cá nhân (`preferences`) — mỗi lần tải lại trang sẽ về lại "Trợ Lý" mặc định. Muốn nhớ lựa chọn qua các lần đăng nhập thì cần thêm 1 field vào `DEFAULT_PREFERENCES`/`get_preferences()`/`set_preferences()` — có thể làm tiếp nếu bạn cần.
+
+## 12. Sửa 1 lỗi ẩn khi kết hợp streaming + SQLite (mới, quan trọng)
+
+Trong lúc kiểm thử tính năng ở mục 10–11, phát hiện một lỗi có sẵn từ trước (không liên quan tới gói/chế độ suy nghĩ, nhưng ảnh hưởng tới **mọi** câu trả lời AI): các lượt chat thật ra bị lỗi ngầm **"Cannot operate on a closed database"** ngay khi AI bắt đầu trả lời.
+
+**Nguyên nhân:** `/api/chat` dùng `stream_with_context()` để giữ `request`/`session`/`g` sống trong lúc trả lời dạng streaming (SSE) — nhưng cơ chế này **không** ngăn được `teardown_appcontext` (hàm đóng kết nối SQLite `g._database`) chạy sớm hơn generator thật sự bắt đầu. Kết quả: bất kỳ chỗ nào trong generator (hoặc trong các hàm nó gọi tới, kể cả gián tiếp — ví dụ `stream_consolex_ai()` đọc cấu hình model/temperature qua `get_setting()`) mà dùng lại `get_db()`/`g` đều đụng phải kết nối SQLite **đã bị đóng từ trước**.
+
+**Đã sửa:** thêm hàm `open_write_db()` — mở 1 kết nối SQLite **độc lập, không qua `g`**, tự đóng ngay sau khi dùng xong. Áp dụng cho mọi thao tác ghi DB xảy ra **bên trong** generator streaming: lưu câu trả lời của AI vào lịch sử chat, ghi `usage_logs` (`log_usage()`), và đọc cấu hình runtime (`get_setting()`/`set_setting()`, vì `stream_consolex_ai()` gọi tới 2 hàm này để lấy model/temperature ghi đè). Đã kiểm thử lại toàn bộ luồng chat (thành công lẫn báo lỗi) — không còn gặp lỗi này nữa.
+
+## 13. Vai trò & công cụ quản trị đã có sẵn trong nhánh này (ghi chú lại, không phải mình làm)
+
+Để tránh trùng lặp tài liệu, đây là danh sách nhanh những gì `app.py` bạn gửi **đã có sẵn** trước khi mình động vào (mình chỉ dùng/nối thêm vào, không viết lại): hệ thống vai trò 4 cấp `user → developer → admin → super_admin` (`ROLE_ORDER`/`role_rank()`), khoá/mở khoá tài khoản, reset session, xoá tài khoản, AI Tutor tuỳ chỉnh (`/api/tutors`), API key cá nhân (`/api/keys`, `/api/v1/ping`), Playground thử prompt cho Developer trở lên, ghi đè model/temperature/system-prompt chung không cần restart, chế độ bảo trì, và nhật ký audit (`/developer/audit`, chỉ Super Admin xem được). Nếu cần tài liệu chi tiết cho từng phần này, cho mình biết để viết bổ sung.
 
 ## Chưa làm (nằm ngoài phạm vi yêu cầu lần này)
 Phần đầu prompt gốc của bạn từng có yêu cầu dựng lại toàn bộ thành một sản phẩm Next.js/TypeScript quy mô lớn (nhiều trang, Dashboard, Blog, Pricing...). Bản cập nhật này vẫn giữ nguyên nền tảng Flask hiện có của bạn. Nếu bạn vẫn muốn bản Next.js quy mô lớn, đó sẽ là một dự án tách riêng — cho mình biết nếu bạn muốn triển khai.
 
 Vài ý tưởng hợp lý để làm tiếp sau này (chưa làm, vì nằm ngoài yêu cầu lần này):
 - Trang đổi mật khẩu cho tài khoản đăng nhập bằng mật khẩu (hiện chỉ có thể đổi qua thao tác thủ công trong DB).
-- Rate limiting cho `/login`, `/register`, `/api/report-issue` để chống spam/brute-force khi deploy công khai (gợi ý: `flask-limiter`).
-- Cho học sinh tự xem "bộ nhớ" của mình (hiện chỉ có nút xoá, chưa có màn hình xem danh sách) — có thể thêm 1 modal nhỏ dùng `GET /api/memories` đã có sẵn.
-- Gửi email/webhook thông báo cho developer khi có báo cáo lỗi mới, thay vì phải tự vào `/developer` kiểm tra.
+- Rate limiting cho `/login`, `/register` để chống spam/brute-force khi deploy công khai (gợi ý: `flask-limiter`).
+- Lưu "Chế độ suy nghĩ" đang chọn vào tuỳ chọn cá nhân để nhớ qua các lần đăng nhập (xem ghi chú cuối mục 11).
+- Cổng thanh toán thật cho Premium/Max (hiện Admin chỉ gán gói thủ công, chưa có Stripe/VNPay/Momo...).
