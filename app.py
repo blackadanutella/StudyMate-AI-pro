@@ -15,7 +15,7 @@ from urllib.parse import urlencode, quote_plus
 from dotenv import load_dotenv
 from flask import (
     Flask, render_template_string, request, jsonify, Response,
-    stream_with_context, session, redirect, url_for, flash, g
+    stream_with_context, session, redirect, url_for, flash, g, send_from_directory
 )
 from werkzeug.security import generate_password_hash, check_password_hash
 from pypdf import PdfReader
@@ -393,6 +393,35 @@ def init_db():
             earned_at TEXT NOT NULL,
             UNIQUE(user_id, code),
             FOREIGN KEY (user_id) REFERENCES users (id)
+        )
+    ''')
+    # "Thẻ ghi nhớ" (flashcards) — bộ thẻ do học sinh tự tạo hoặc AI tạo giúp từ 1 chủ đề /
+    # đoạn chat. box_level dùng kiểu Leitner đơn giản (1-5, đúng thì tăng, sai thì về 1) để
+    # ưu tiên cho học sinh ôn lại thẻ còn yếu trước.
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS flashcard_decks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            title TEXT NOT NULL,
+            subject TEXT DEFAULT '',
+            source TEXT NOT NULL DEFAULT 'manual',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY (user_id) REFERENCES users (id)
+        )
+    ''')
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS flashcards (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            deck_id INTEGER NOT NULL,
+            front TEXT NOT NULL,
+            back TEXT NOT NULL,
+            box_level INTEGER NOT NULL DEFAULT 1,
+            times_reviewed INTEGER NOT NULL DEFAULT 0,
+            times_correct INTEGER NOT NULL DEFAULT 0,
+            last_reviewed_at TEXT,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (deck_id) REFERENCES flashcard_decks (id)
         )
     ''')
     conn.commit()
@@ -959,13 +988,18 @@ ACHIEVEMENTS_META = {
     'streak_7':      {'icon': '🔥', 'label': 'Chuỗi 7 ngày', 'desc': 'Học liên tục 7 ngày không nghỉ.'},
     'streak_30':     {'icon': '🏆', 'label': 'Chuỗi 30 ngày', 'desc': 'Học liên tục 30 ngày không nghỉ.'},
     'questions_100': {'icon': '📚', 'label': '100 câu hỏi', 'desc': 'Đã hỏi AI 100 lượt.'},
+    'first_deck':    {'icon': '🗂️', 'label': 'Bộ thẻ đầu tiên', 'desc': 'Tạo bộ thẻ ghi nhớ đầu tiên.'},
+    'game_player':   {'icon': '🎮', 'label': 'Người chơi mới', 'desc': 'Hoàn thành 1 trò chơi luyện tập.'},
 }
 
 
-def award_xp_and_streak(user_id):
-    """Cộng XP + cập nhật streak sau 1 lượt chat THÀNH CÔNG. Gọi từ bên trong generator
-    streaming của /api/chat nên dùng open_write_db() (xem docstring open_write_db()). Trả về
-    dict mô tả những gì vừa xảy ra (lên cấp? thành tựu mới?) để báo ngay trên giao diện."""
+def award_xp_and_streak(user_id, xp_amount=XP_PER_TURN, extra_achievement_checks=None):
+    """Cộng XP + cập nhật streak sau 1 hoạt động học tập THÀNH CÔNG (trả lời chat, hoặc chơi
+    xong 1 game luyện tập — xem api_game_complete()). Gọi từ bên trong generator streaming
+    của /api/chat nên dùng open_write_db() (xem docstring open_write_db()). Trả về dict mô tả
+    những gì vừa xảy ra (lên cấp? thành tựu mới?) để báo ngay trên giao diện.
+    `extra_achievement_checks`: dict {code: điều_kiện_bool} để kiểm tra thêm thành tựu đặc thù
+    theo ngữ cảnh gọi (vd: 'first_deck' khi vừa tạo xong bộ thẻ đầu tiên)."""
     result = {'leveled_up': False, 'new_achievements': [], 'streak_days': 0, 'xp': 0, 'level': 1}
     try:
         conn = open_write_db()
@@ -981,7 +1015,7 @@ def award_xp_and_streak(user_id):
                 row = conn.execute('SELECT * FROM user_stats WHERE user_id = ?', (user_id,)).fetchone()
 
             old_level = row['xp'] // XP_PER_LEVEL + 1
-            new_xp = row['xp'] + XP_PER_TURN
+            new_xp = row['xp'] + xp_amount
 
             last_active = row['last_active_date']
             streak = row['streak_days']
@@ -1023,6 +1057,9 @@ def award_xp_and_streak(user_id):
                 to_check.append('streak_30')
             if 'questions_100' not in earned_codes and total_turns >= 100:
                 to_check.append('questions_100')
+            for code, condition in (extra_achievement_checks or {}).items():
+                if code not in earned_codes and condition:
+                    to_check.append(code)
 
             for code in to_check:
                 try:
@@ -1483,6 +1520,13 @@ HTML = r'''
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>{{ app_name }}</title>
+  <link rel="manifest" href="/manifest.json">
+  <link rel="icon" type="image/png" sizes="192x192" href="/static/icons/icon-192.png">
+  <link rel="apple-touch-icon" href="/static/icons/icon-192.png">
+  <meta name="theme-color" content="#4f46e5">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-title" content="{{ app_name }}">
   <script src="https://cdn.tailwindcss.com"></script>
   <script>tailwind.config = { darkMode: 'class' };</script>
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.6.0/css/all.min.css">
@@ -1631,6 +1675,9 @@ HTML = r'''
     <div class="px-3 mt-1 space-y-2">
       <button id="newChatBtn" class="w-full flex items-center gap-2 px-3 py-2.5 rounded-xl border border-gray-300 dark:border-gray-700 hover:bg-gray-100 dark:hover:bg-gray-800 font-medium text-sm transition-colors">
         <i class="fas fa-plus"></i> <span data-i18n="new_chat">Đoạn chat mới</span>
+      </button>
+      <button id="openFlashcardsBtn" class="w-full flex items-center gap-2 px-3 py-2.5 rounded-xl border border-gray-300 dark:border-gray-700 hover:bg-gray-100 dark:hover:bg-gray-800 font-medium text-sm transition-colors">
+        <i class="fas fa-layer-group text-purple-500"></i> <span>Thẻ ghi nhớ &amp; Trò chơi</span>
       </button>
       <div class="relative">
         <i class="fas fa-magnifying-glass absolute left-3 top-1/2 -translate-y-1/2 text-gray-400 text-xs"></i>
@@ -1815,6 +1862,116 @@ HTML = r'''
 </div>
 
 <!-- ===================== MODALS ===================== -->
+<div id="flashcardsOverlay" class="hidden fixed inset-0 bg-white dark:bg-[#131313] z-[70] flex flex-col">
+  <div class="flex items-center justify-between px-4 lg:px-6 py-3.5 border-b border-gray-200 dark:border-gray-800 flex-shrink-0">
+    <div class="flex items-center gap-2 min-w-0">
+      <button id="fcBackBtn" class="hidden w-9 h-9 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-800 flex items-center justify-center flex-shrink-0"><i class="fas fa-arrow-left"></i></button>
+      <i class="fas fa-layer-group text-purple-500"></i>
+      <h2 id="fcHeaderTitle" class="font-bold truncate">Thẻ ghi nhớ &amp; Trò chơi</h2>
+    </div>
+    <button onclick="closeFlashcards()" class="w-9 h-9 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-800 flex items-center justify-center flex-shrink-0"><i class="fas fa-xmark"></i></button>
+  </div>
+
+  <div class="flex-1 overflow-y-auto">
+    <!-- ============ Danh sách bộ thẻ ============ -->
+    <div id="fcDeckListView" class="max-w-4xl mx-auto p-4 lg:p-6">
+      <div class="flex flex-wrap gap-2 mb-5">
+        <button onclick="openCreateDeckPrompt()" class="px-4 py-2.5 rounded-xl border border-gray-300 dark:border-gray-700 hover:bg-gray-100 dark:hover:bg-gray-800 text-sm font-medium flex items-center gap-2">
+          <i class="fas fa-plus"></i> Tạo bộ thẻ trống
+        </button>
+        <button onclick="openAiDeckForm()" class="px-4 py-2.5 rounded-xl bg-gradient-to-r from-purple-600 to-indigo-600 hover:opacity-90 text-white text-sm font-semibold flex items-center gap-2">
+          <i class="fas fa-wand-magic-sparkles"></i> Tạo bằng AI ✨
+        </button>
+      </div>
+
+      <div id="aiDeckForm" class="hidden mb-5 p-4 rounded-2xl border border-purple-200 dark:border-purple-900 bg-purple-50 dark:bg-purple-900/10 space-y-2.5">
+        <p class="text-sm font-semibold flex items-center gap-1.5"><i class="fas fa-wand-magic-sparkles text-purple-500"></i> AI tạo bộ thẻ giúp em</p>
+        <input id="aiDeckTopic" type="text" maxlength="200" placeholder="Chủ đề, vd: Từ vựng tiếng Anh unit 5, Hằng đẳng thức đáng nhớ..."
+          class="w-full px-3 py-2.5 rounded-xl bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 text-sm focus:outline-none focus:ring-2 focus:ring-purple-500 dark:text-white">
+        <div class="flex flex-wrap gap-2">
+          <input id="aiDeckSubject" type="text" maxlength="60" placeholder="Môn học (tuỳ chọn)"
+            class="flex-1 min-w-[140px] px-3 py-2 rounded-xl bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 text-sm focus:outline-none focus:ring-2 focus:ring-purple-500 dark:text-white">
+          <select id="aiDeckCount" class="px-3 py-2 rounded-xl bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 text-sm focus:outline-none focus:ring-2 focus:ring-purple-500 dark:text-white">
+            <option value="4">4 thẻ</option>
+            <option value="8" selected>8 thẻ</option>
+            <option value="12">12 thẻ</option>
+          </select>
+        </div>
+        <div class="flex gap-2">
+          <button id="aiDeckSubmitBtn" onclick="submitAiDeck()" class="px-4 py-2 rounded-xl bg-purple-600 hover:bg-purple-700 disabled:opacity-50 text-white text-sm font-semibold flex items-center gap-2">
+            <span id="aiDeckSubmitLabel">Tạo bộ thẻ</span>
+          </button>
+          <button onclick="document.getElementById('aiDeckForm').classList.add('hidden')" class="px-4 py-2 rounded-xl bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 text-sm">Huỷ</button>
+        </div>
+        <p id="aiDeckError" class="hidden text-xs text-red-500"></p>
+      </div>
+
+      <div id="deckGrid" class="grid sm:grid-cols-2 lg:grid-cols-3 gap-3"></div>
+      <p id="deckEmptyState" class="hidden text-center text-sm text-gray-400 py-16">Chưa có bộ thẻ nào — tạo bộ đầu tiên ở trên nhé! 🗂️</p>
+    </div>
+
+    <!-- ============ Chi tiết 1 bộ thẻ ============ -->
+    <div id="fcDeckDetailView" class="hidden max-w-3xl mx-auto p-4 lg:p-6">
+      <div class="flex flex-wrap items-center justify-between gap-2 mb-4">
+        <div>
+          <h3 id="fcDeckTitle" class="font-bold text-lg"></h3>
+          <p id="fcDeckMeta" class="text-xs text-gray-400"></p>
+        </div>
+        <div class="flex flex-wrap gap-2">
+          <button onclick="startStudyMode()" class="px-3.5 py-2 rounded-xl bg-blue-600 hover:bg-blue-700 text-white text-sm font-semibold flex items-center gap-1.5"><i class="fas fa-graduation-cap"></i> Học</button>
+          <button onclick="startMemoryGame()" class="px-3.5 py-2 rounded-xl bg-amber-500 hover:bg-amber-600 text-white text-sm font-semibold flex items-center gap-1.5"><i class="fas fa-gamepad"></i> Lật thẻ</button>
+          <button onclick="deleteCurrentDeck()" class="px-3 py-2 rounded-xl bg-red-50 dark:bg-red-900/20 text-red-600 dark:text-red-400 text-sm hover:bg-red-100 dark:hover:bg-red-900/40"><i class="fas fa-trash-can"></i></button>
+        </div>
+      </div>
+
+      <div class="mb-4 p-3 rounded-xl bg-gray-50 dark:bg-gray-900 border border-gray-100 dark:border-gray-800 flex flex-wrap gap-2 items-end">
+        <input id="newCardFront" type="text" maxlength="200" placeholder="Mặt trước..." class="flex-1 min-w-[120px] px-3 py-2 rounded-lg bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 dark:text-white">
+        <input id="newCardBack" type="text" maxlength="500" placeholder="Mặt sau..." class="flex-1 min-w-[120px] px-3 py-2 rounded-lg bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 dark:text-white">
+        <button onclick="addCardToCurrentDeck()" class="px-3.5 py-2 rounded-lg bg-gray-800 dark:bg-gray-700 hover:bg-gray-900 text-white text-sm font-medium">Thêm thẻ</button>
+      </div>
+
+      <div id="cardList" class="space-y-2"></div>
+    </div>
+
+    <!-- ============ Chế độ Học (lật thẻ ôn tập) ============ -->
+    <div id="fcStudyView" class="hidden max-w-lg mx-auto p-4 lg:p-6 flex flex-col items-center">
+      <p id="studyProgress" class="text-xs text-gray-400 mb-3">Thẻ 1/1</p>
+      <div id="studyCard" onclick="flipStudyCard()" class="w-full aspect-[4/3] rounded-2xl bg-gradient-to-br from-blue-50 to-indigo-100 dark:from-gray-800 dark:to-gray-900 border border-gray-200 dark:border-gray-700 flex items-center justify-center p-6 text-center cursor-pointer select-none shadow-sm">
+        <p id="studyCardText" class="text-lg font-semibold"></p>
+      </div>
+      <p class="text-xs text-gray-400 mt-2">Bấm vào thẻ để lật</p>
+      <div id="studyAnswerBtns" class="hidden mt-5 flex gap-3 w-full">
+        <button onclick="answerStudyCard(false)" class="flex-1 py-3 rounded-xl bg-red-50 dark:bg-red-900/20 text-red-600 dark:text-red-400 font-semibold hover:bg-red-100 dark:hover:bg-red-900/40"><i class="fas fa-xmark mr-1"></i> Chưa nhớ</button>
+        <button onclick="answerStudyCard(true)" class="flex-1 py-3 rounded-xl bg-emerald-50 dark:bg-emerald-900/20 text-emerald-600 dark:text-emerald-400 font-semibold hover:bg-emerald-100 dark:hover:bg-emerald-900/40"><i class="fas fa-check mr-1"></i> Đã nhớ</button>
+      </div>
+      <div id="studySummary" class="hidden text-center mt-4">
+        <p class="text-2xl mb-1">🎉</p>
+        <p class="font-bold text-lg" id="studySummaryText"></p>
+        <button onclick="showDeckDetail(currentDeckId)" class="mt-4 px-4 py-2 rounded-xl bg-blue-600 hover:bg-blue-700 text-white text-sm font-semibold">Xong</button>
+      </div>
+    </div>
+
+    <!-- ============ Game: Lật thẻ ghi nhớ (Memory Match) ============ -->
+    <div id="fcGameView" class="hidden max-w-2xl mx-auto p-4 lg:p-6">
+      <div class="flex items-center justify-between mb-4 text-sm">
+        <span>⏱️ <span id="gameTimer">0</span>s</span>
+        <span>🔄 <span id="gameMoves">0</span> lượt lật</span>
+        <span>✅ <span id="gameMatched">0</span>/<span id="gameTotalPairs">0</span> cặp</span>
+      </div>
+      <div id="gameGrid" class="grid grid-cols-4 gap-2 sm:gap-3"></div>
+      <div id="gameWinPanel" class="hidden text-center mt-6">
+        <p class="text-2xl mb-1">🏆</p>
+        <p class="font-bold text-lg">Hoàn thành! <span id="gameWinTime"></span>s, <span id="gameWinMoves"></span> lượt lật</p>
+        <p class="text-sm text-gray-400 mt-1" id="gameXpText"></p>
+        <div class="flex gap-2 justify-center mt-4">
+          <button onclick="startMemoryGame()" class="px-4 py-2 rounded-xl bg-amber-500 hover:bg-amber-600 text-white text-sm font-semibold">Chơi lại</button>
+          <button onclick="showDeckDetail(currentDeckId)" class="px-4 py-2 rounded-xl bg-gray-100 dark:bg-gray-800 text-sm font-semibold">Về bộ thẻ</button>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
 <div id="modalBackdrop" class="hidden fixed inset-0 bg-black/50 z-[60] flex items-center justify-center p-4" onclick="if(event.target===this) closeAllModals()">
 
   <!-- Cài đặt -->
@@ -2834,6 +2991,383 @@ function newChat() {
   loadConversations();
 }
 document.getElementById('newChatBtn').addEventListener('click', newChat);
+
+// ==================================================================
+// THẺ GHI NHỚ (FLASHCARDS) + TRÒ CHƠI LUYỆN TẬP
+// ==================================================================
+let currentDeckId = null;
+let currentDeckCards = [];
+let studyQueue = [];
+let studyIndex = 0;
+let studyCorrectCount = 0;
+let studyFlipped = false;
+let gameTimerHandle = null;
+let gameState = null;
+
+function openFlashcards() {
+  document.getElementById('flashcardsOverlay').classList.remove('hidden');
+  showFcView('list');
+  loadDecks();
+}
+function closeFlashcards() {
+  document.getElementById('flashcardsOverlay').classList.add('hidden');
+  stopGameTimer();
+}
+document.getElementById('openFlashcardsBtn').addEventListener('click', openFlashcards);
+
+function showFcView(view) {
+  const views = { list: 'fcDeckListView', detail: 'fcDeckDetailView', study: 'fcStudyView', game: 'fcGameView' };
+  Object.values(views).forEach(id => document.getElementById(id).classList.add('hidden'));
+  document.getElementById(views[view]).classList.remove('hidden');
+  const backBtn = document.getElementById('fcBackBtn');
+  const title = document.getElementById('fcHeaderTitle');
+  if (view === 'list') {
+    backBtn.classList.add('hidden');
+    title.textContent = 'Thẻ ghi nhớ & Trò chơi';
+    backBtn.onclick = null;
+  } else if (view === 'detail') {
+    backBtn.classList.remove('hidden');
+    title.textContent = 'Chi tiết bộ thẻ';
+    backBtn.onclick = () => { loadDecks(); showFcView('list'); };
+  } else {
+    backBtn.classList.remove('hidden');
+    title.textContent = view === 'study' ? 'Chế độ Học' : 'Lật thẻ ghi nhớ';
+    backBtn.onclick = () => { stopGameTimer(); showDeckDetail(currentDeckId); };
+  }
+}
+
+async function loadDecks() {
+  try {
+    const res = await fetch('/api/decks');
+    if (!res.ok) return;
+    renderDeckGrid(await res.json());
+  } catch (e) { /* im lặng bỏ qua lỗi mạng */ }
+}
+
+function renderDeckGrid(decks) {
+  const grid = document.getElementById('deckGrid');
+  const empty = document.getElementById('deckEmptyState');
+  grid.innerHTML = '';
+  empty.classList.toggle('hidden', decks.length > 0);
+  decks.forEach(d => {
+    const card = document.createElement('div');
+    card.className = 'rounded-2xl border border-gray-200 dark:border-gray-800 p-4 hover:border-blue-400 dark:hover:border-blue-600 cursor-pointer transition-colors';
+    card.innerHTML = `
+      <div class="flex items-start justify-between gap-2">
+        <p class="font-semibold truncate flex-1">${escapeHtml(d.title)}</p>
+        ${d.source === 'ai' ? '<i class="fas fa-wand-magic-sparkles text-purple-400 text-xs" title="Tạo bằng AI"></i>' : ''}
+      </div>
+      ${d.subject ? `<p class="text-xs text-gray-400 mt-0.5">${escapeHtml(d.subject)}</p>` : ''}
+      <div class="flex items-center gap-3 mt-3 text-xs text-gray-400">
+        <span><i class="fas fa-layer-group mr-1"></i>${d.card_count} thẻ</span>
+        <span><i class="fas fa-star mr-1 text-amber-400"></i>${d.mastered_count} thuộc</span>
+      </div>`;
+    card.addEventListener('click', () => showDeckDetail(d.id));
+    grid.appendChild(card);
+  });
+}
+
+function openCreateDeckPrompt() {
+  const title = prompt('Tên bộ thẻ mới:');
+  if (!title || !title.trim()) return;
+  fetch('/api/decks', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ title: title.trim() })
+  }).then(res => res.json()).then(data => {
+    if (data.id) showDeckDetail(data.id); else alert(data.error || 'Không tạo được bộ thẻ.');
+  }).catch(() => alert('Lỗi mạng.'));
+}
+
+function openAiDeckForm() {
+  const form = document.getElementById('aiDeckForm');
+  form.classList.toggle('hidden');
+  if (!form.classList.contains('hidden')) document.getElementById('aiDeckTopic').focus();
+}
+
+async function submitAiDeck() {
+  const topic = document.getElementById('aiDeckTopic').value.trim();
+  const subject = document.getElementById('aiDeckSubject').value.trim();
+  const count = document.getElementById('aiDeckCount').value;
+  const errEl = document.getElementById('aiDeckError');
+  const btn = document.getElementById('aiDeckSubmitBtn');
+  const label = document.getElementById('aiDeckSubmitLabel');
+  errEl.classList.add('hidden');
+  if (!topic) { document.getElementById('aiDeckTopic').focus(); return; }
+
+  btn.disabled = true;
+  label.innerHTML = '<i class="fas fa-spinner fa-spin"></i> AI đang tạo thẻ...';
+  try {
+    const res = await fetch('/api/decks/generate', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ topic, subject, count: parseInt(count, 10) })
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      errEl.textContent = data.error || 'AI tạo thẻ chưa được, em thử lại nhé.';
+      errEl.classList.remove('hidden');
+    } else {
+      document.getElementById('aiDeckForm').classList.add('hidden');
+      document.getElementById('aiDeckTopic').value = '';
+      if (data.gamify) handleGamifyEvent(data.gamify);
+      showDeckDetail(data.deckId);
+    }
+  } catch (e) {
+    errEl.textContent = 'Lỗi mạng, em thử lại nhé.';
+    errEl.classList.remove('hidden');
+  } finally {
+    btn.disabled = false;
+    label.textContent = 'Tạo bộ thẻ';
+  }
+}
+
+async function showDeckDetail(deckId) {
+  try {
+    const res = await fetch(`/api/decks/${deckId}`);
+    if (!res.ok) { showFcView('list'); loadDecks(); return; }
+    const data = await res.json();
+    currentDeckId = deckId;
+    currentDeckCards = data.cards;
+    document.getElementById('fcDeckTitle').textContent = data.deck.title;
+    document.getElementById('fcDeckMeta').textContent =
+      (data.deck.subject ? data.deck.subject + ' · ' : '') + `${data.cards.length} thẻ`;
+    renderCardList(data.cards);
+    showFcView('detail');
+  } catch (e) {
+    alert('Không tải được bộ thẻ này.');
+  }
+}
+
+function renderCardList(cards) {
+  const list = document.getElementById('cardList');
+  list.innerHTML = '';
+  if (!cards.length) {
+    list.innerHTML = '<p class="text-sm text-gray-400 text-center py-8">Chưa có thẻ nào — thêm thẻ ở trên nhé!</p>';
+    return;
+  }
+  cards.forEach(c => {
+    const row = document.createElement('div');
+    row.className = 'flex items-center gap-3 border border-gray-100 dark:border-gray-800 rounded-xl px-3.5 py-2.5 text-sm';
+    row.innerHTML = `
+      <div class="flex-1 min-w-0 grid grid-cols-2 gap-3">
+        <p class="truncate"><span class="text-gray-400 mr-1">Trước:</span>${escapeHtml(c.front)}</p>
+        <p class="truncate"><span class="text-gray-400 mr-1">Sau:</span>${escapeHtml(c.back)}</p>
+      </div>
+      <span class="text-[10px] text-gray-400 flex-shrink-0" title="Mức độ nhớ">Lv${c.box_level}</span>
+      <button class="edit-card-btn text-gray-400 hover:text-blue-500 w-7 h-7 flex items-center justify-center flex-shrink-0"><i class="fas fa-pen text-xs"></i></button>
+      <button class="del-card-btn text-gray-400 hover:text-red-500 w-7 h-7 flex items-center justify-center flex-shrink-0"><i class="fas fa-trash-can text-xs"></i></button>`;
+    row.querySelector('.edit-card-btn').addEventListener('click', () => editCard(c));
+    row.querySelector('.del-card-btn').addEventListener('click', () => deleteCard(c.id));
+    list.appendChild(row);
+  });
+}
+
+async function addCardToCurrentDeck() {
+  const frontEl = document.getElementById('newCardFront');
+  const backEl = document.getElementById('newCardBack');
+  const front = frontEl.value.trim(), back = backEl.value.trim();
+  if (!front || !back) return;
+  try {
+    const res = await fetch(`/api/decks/${currentDeckId}/cards`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ front, back })
+    });
+    if (res.ok) {
+      frontEl.value = ''; backEl.value = '';
+      showDeckDetail(currentDeckId);
+    }
+  } catch (e) { alert('Lỗi mạng.'); }
+}
+
+async function editCard(card) {
+  const front = prompt('Mặt trước:', card.front);
+  if (front === null) return;
+  const back = prompt('Mặt sau:', card.back);
+  if (back === null) return;
+  try {
+    await fetch(`/api/cards/${card.id}`, {
+      method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ front: front.trim(), back: back.trim() })
+    });
+    showDeckDetail(currentDeckId);
+  } catch (e) { alert('Lỗi mạng.'); }
+}
+
+async function deleteCard(cardId) {
+  if (!confirm('Xoá thẻ này?')) return;
+  try {
+    await fetch(`/api/cards/${cardId}`, { method: 'DELETE' });
+    showDeckDetail(currentDeckId);
+  } catch (e) { alert('Lỗi mạng.'); }
+}
+
+async function deleteCurrentDeck() {
+  if (!confirm('Xoá toàn bộ bộ thẻ này? Hành động này không thể hoàn tác.')) return;
+  try {
+    await fetch(`/api/decks/${currentDeckId}`, { method: 'DELETE' });
+    showFcView('list');
+    loadDecks();
+  } catch (e) { alert('Lỗi mạng.'); }
+}
+
+// ---------- Chế độ Học (lật thẻ ôn tập, kiểu Leitner đơn giản) ----------
+function startStudyMode() {
+  if (!currentDeckCards.length) { alert('Bộ thẻ này chưa có thẻ nào.'); return; }
+  // Ưu tiên ôn thẻ có box_level thấp (chưa thuộc) trước — xáo trộn nhẹ trong cùng mức.
+  studyQueue = [...currentDeckCards].sort((a, b) => a.box_level - b.box_level || Math.random() - 0.5);
+  studyIndex = 0;
+  studyCorrectCount = 0;
+  showFcView('study');
+  showStudyCard();
+}
+
+function showStudyCard() {
+  document.getElementById('studySummary').classList.add('hidden');
+  if (studyIndex >= studyQueue.length) {
+    document.getElementById('studyCard').classList.add('hidden');
+    document.getElementById('studyAnswerBtns').classList.add('hidden');
+    document.getElementById('studyProgress').classList.add('hidden');
+    document.getElementById('studySummary').classList.remove('hidden');
+    document.getElementById('studySummaryText').textContent =
+      `Đúng ${studyCorrectCount}/${studyQueue.length} thẻ!`;
+    return;
+  }
+  document.getElementById('studyCard').classList.remove('hidden');
+  document.getElementById('studyProgress').classList.remove('hidden');
+  studyFlipped = false;
+  document.getElementById('studyAnswerBtns').classList.add('hidden');
+  document.getElementById('studyProgress').textContent = `Thẻ ${studyIndex + 1}/${studyQueue.length}`;
+  document.getElementById('studyCardText').textContent = studyQueue[studyIndex].front;
+}
+
+function flipStudyCard() {
+  if (studyIndex >= studyQueue.length) return;
+  studyFlipped = !studyFlipped;
+  const card = studyQueue[studyIndex];
+  document.getElementById('studyCardText').textContent = studyFlipped ? card.back : card.front;
+  document.getElementById('studyAnswerBtns').classList.toggle('hidden', !studyFlipped);
+}
+
+async function answerStudyCard(correct) {
+  const card = studyQueue[studyIndex];
+  if (correct) studyCorrectCount++;
+  try { await fetch(`/api/cards/${card.id}`, {
+    method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ correct })
+  }); } catch (e) { /* im lặng bỏ qua lỗi mạng, vẫn cho học tiếp */ }
+  studyIndex++;
+  showStudyCard();
+}
+
+// ---------- Game: Lật thẻ ghi nhớ (Memory Match) ----------
+function stopGameTimer() {
+  if (gameTimerHandle) { clearInterval(gameTimerHandle); gameTimerHandle = null; }
+}
+
+function startMemoryGame() {
+  const usable = currentDeckCards.slice(0, 8);  // tối đa 8 cặp (16 ô) cho vừa màn hình
+  if (usable.length < 3) { alert('Bộ thẻ cần ít nhất 3 thẻ để chơi Lật thẻ.'); return; }
+
+  const tiles = [];
+  usable.forEach(c => {
+    tiles.push({ cardId: c.id, text: c.front, matched: false });
+    tiles.push({ cardId: c.id, text: c.back, matched: false });
+  });
+  for (let i = tiles.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [tiles[i], tiles[j]] = [tiles[j], tiles[i]];
+  }
+
+  gameState = { tiles, firstPick: null, busy: false, matchedPairs: 0, totalPairs: usable.length, moves: 0, seconds: 0 };
+  document.getElementById('gameTotalPairs').textContent = usable.length;
+  document.getElementById('gameMatched').textContent = '0';
+  document.getElementById('gameMoves').textContent = '0';
+  document.getElementById('gameTimer').textContent = '0';
+  document.getElementById('gameWinPanel').classList.add('hidden');
+  document.getElementById('gameGrid').classList.remove('hidden');
+
+  renderGameGrid();
+  showFcView('game');
+  stopGameTimer();
+  gameTimerHandle = setInterval(() => {
+    gameState.seconds++;
+    document.getElementById('gameTimer').textContent = gameState.seconds;
+  }, 1000);
+}
+
+function renderGameGrid() {
+  const grid = document.getElementById('gameGrid');
+  grid.innerHTML = '';
+  gameState.tiles.forEach((tile, idx) => {
+    const btn = document.createElement('button');
+    btn.className = 'game-tile aspect-square rounded-xl bg-gray-100 dark:bg-gray-800 hover:bg-gray-200 dark:hover:bg-gray-700 flex items-center justify-center text-center p-1.5 text-[11px] sm:text-xs font-medium leading-tight transition-colors';
+    btn.textContent = '❓';
+    btn.dataset.idx = idx;
+    btn.addEventListener('click', () => flipGameTile(idx));
+    grid.appendChild(btn);
+  });
+}
+
+function flipGameTile(idx) {
+  const state = gameState;
+  const tile = state.tiles[idx];
+  if (state.busy || tile.matched) return;
+  const btn = document.querySelector(`.game-tile[data-idx="${idx}"]`);
+  if (btn.classList.contains('revealed')) return;
+
+  btn.textContent = tile.text;
+  btn.classList.add('revealed', 'bg-blue-100', 'dark:bg-blue-900/40');
+
+  if (state.firstPick === null) {
+    state.firstPick = idx;
+    return;
+  }
+
+  state.moves++;
+  document.getElementById('gameMoves').textContent = state.moves;
+  const firstIdx = state.firstPick;
+  const firstTile = state.tiles[firstIdx];
+  state.busy = true;
+
+  if (firstTile.cardId === tile.cardId && firstIdx !== idx) {
+    tile.matched = true; firstTile.matched = true;
+    state.matchedPairs++;
+    document.getElementById('gameMatched').textContent = state.matchedPairs;
+    state.firstPick = null;
+    state.busy = false;
+    btn.classList.add('opacity-40');
+    document.querySelector(`.game-tile[data-idx="${firstIdx}"]`).classList.add('opacity-40');
+    if (state.matchedPairs === state.totalPairs) finishMemoryGame();
+  } else {
+    setTimeout(() => {
+      btn.textContent = '❓';
+      btn.classList.remove('revealed', 'bg-blue-100', 'dark:bg-blue-900/40');
+      const firstBtn = document.querySelector(`.game-tile[data-idx="${firstIdx}"]`);
+      firstBtn.textContent = '❓';
+      firstBtn.classList.remove('revealed', 'bg-blue-100', 'dark:bg-blue-900/40');
+      state.firstPick = null;
+      state.busy = false;
+    }, 700);
+  }
+}
+
+async function finishMemoryGame() {
+  stopGameTimer();
+  document.getElementById('gameGrid').classList.add('hidden');
+  document.getElementById('gameWinPanel').classList.remove('hidden');
+  document.getElementById('gameWinTime').textContent = gameState.seconds;
+  document.getElementById('gameWinMoves').textContent = gameState.moves;
+
+  // Điểm càng cao khi ít lượt lật + nhanh — server sẽ tự giới hạn XP thưởng trong khoảng hợp lý.
+  const score = Math.max(10, Math.round(50 - gameState.moves - gameState.seconds / 5));
+  try {
+    const res = await fetch('/api/games/complete', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ game: 'memory_match', score })
+    });
+    const data = await res.json();
+    document.getElementById('gameXpText').textContent = data.xpAwarded ? `+${data.xpAwarded} XP 🎉` : '';
+    if (data.gamify) handleGamifyEvent(data.gamify);
+  } catch (e) { /* im lặng bỏ qua lỗi mạng */ }
+}
 
 // ---------- Gửi tin nhắn (streaming) ----------
 async function sendMessage() {
@@ -4063,6 +4597,16 @@ def logout():
 # ==========================================
 # 5. ĐỊNH TUYẾN CHÍNH (Trang chủ gia sư AI)
 # ==========================================
+@app.route('/manifest.json')
+def pwa_manifest():
+    """PWA manifest — cho phép 'Cài đặt' StudyMate AI như 1 app (Add to Home Screen) trên
+    điện thoại/máy tính. Icon lấy từ static/icons/ (xem README nếu cần đổi icon)."""
+    return send_from_directory(
+        os.path.dirname(os.path.abspath(__file__)), 'manifest.json',
+        mimetype='application/manifest+json'
+    )
+
+
 @app.route('/')
 @login_required
 def home():
@@ -4706,6 +5250,49 @@ def stream_consolex_ai(system_prompt: str, user_content, max_tokens: int = 800):
 
 
 # ==========================================
+# 8.6 "THẺ GHI NHỚ" (FLASHCARDS) — TẠO BẰNG AI
+# ==========================================
+FLASHCARD_MAX_COUNT = 12
+FLASHCARD_MIN_COUNT = 4
+
+
+def generate_flashcards_via_ai(topic, subject, count=8):
+    """Gọi AI 1 LẦN (không streaming) để tạo bộ thẻ ghi nhớ front/back cho 1 chủ đề. Trả về
+    list[(front, back)]. Ném lỗi (ValueError/json.JSONDecodeError/RuntimeError/...) nếu AI trả
+    về không đúng định dạng — bên gọi (api_generate_deck) chịu trách nhiệm bắt và báo lỗi
+    thân thiện cho học sinh."""
+    count = max(FLASHCARD_MIN_COUNT, min(int(count or 8), FLASHCARD_MAX_COUNT))
+    subject_line = f" (môn {subject})" if subject else ""
+    system_prompt = f"""
+    Bạn là công cụ tạo thẻ ghi nhớ (flashcard) học tập cho học sinh THCS{subject_line}.
+    Hãy tạo đúng {count} thẻ ghi nhớ cho chủ đề học sinh đưa ra. Mỗi thẻ gồm:
+    - "front": câu hỏi hoặc thuật ngữ NGẮN GỌN (dưới 15 từ).
+    - "back": câu trả lời/định nghĩa ngắn gọn, dễ hiểu, đúng trọng tâm (dưới 40 từ).
+    CHỈ trả lời bằng JSON hợp lệ đúng định dạng mảng dưới đây — KHÔNG thêm ```markdown```,
+    KHÔNG thêm lời giải thích nào khác ngoài JSON:
+    [{{"front": "...", "back": "..."}}, ...]
+    """
+    raw = ''.join(stream_consolex_ai(system_prompt, f"Chủ đề: {topic}", max_tokens=1600))
+    text = raw.strip()
+    if text.startswith('```'):
+        text = re.sub(r'^```[a-zA-Z]*\n?', '', text)
+        text = re.sub(r'```\s*$', '', text).strip()
+
+    data = json.loads(text)  # có thể ném json.JSONDecodeError — caller xử lý
+    if not isinstance(data, list):
+        raise ValueError("AI không trả về danh sách thẻ hợp lệ.")
+
+    cards = []
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        front = str(item.get('front', '')).strip()[:200]
+        back = str(item.get('back', '')).strip()[:500]
+        if front and back:
+            cards.append((front, back))
+    return cards[:count]
+
+
 # 8. UPLOAD FILE / ẢNH
 # ==========================================
 def _truncate_text(full_text: str, text_limit=None) -> str:
@@ -4937,6 +5524,228 @@ def api_plan():
 def api_gamification():
     """XP / streak / thành tựu của tài khoản đang đăng nhập — hiển thị ở sidebar + Cài đặt."""
     return jsonify(get_user_stats(current_user_id()))
+
+
+# ==========================================
+# 8.7 API "THẺ GHI NHỚ" (FLASHCARDS) + GAME LUYỆN TẬP
+# ==========================================
+def _get_owned_deck(deck_id, user_id):
+    db = get_db()
+    return db.execute(
+        'SELECT * FROM flashcard_decks WHERE id = ? AND user_id = ?', (deck_id, user_id)
+    ).fetchone()
+
+
+def _get_owned_card(card_id, user_id):
+    db = get_db()
+    return db.execute('''
+        SELECT c.* FROM flashcards c
+        JOIN flashcard_decks d ON d.id = c.deck_id
+        WHERE c.id = ? AND d.user_id = ?
+    ''', (card_id, user_id)).fetchone()
+
+
+@app.route('/api/decks', methods=['GET'])
+@login_required
+def api_list_decks():
+    db = get_db()
+    rows = db.execute('''
+        SELECT d.id, d.title, d.subject, d.source, d.created_at, d.updated_at,
+               COUNT(c.id) AS card_count,
+               COALESCE(SUM(CASE WHEN c.box_level >= 5 THEN 1 ELSE 0 END), 0) AS mastered_count
+        FROM flashcard_decks d
+        LEFT JOIN flashcards c ON c.deck_id = d.id
+        WHERE d.user_id = ?
+        GROUP BY d.id
+        ORDER BY d.updated_at DESC
+    ''', (current_user_id(),)).fetchall()
+    return jsonify([dict(r) for r in rows])
+
+
+@app.route('/api/decks', methods=['POST'])
+@login_required
+def api_create_deck():
+    data = request.get_json(silent=True) or {}
+    title = (data.get('title') or '').strip()[:120]
+    subject = (data.get('subject') or '').strip()[:60]
+    if not title:
+        return jsonify({"error": "Em đặt tên cho bộ thẻ nhé."}), 400
+    db = get_db()
+    cur = db.execute(
+        'INSERT INTO flashcard_decks (user_id, title, subject, source, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)',
+        (current_user_id(), title, subject, 'manual', now_iso(), now_iso())
+    )
+    db.commit()
+    return jsonify({"id": cur.lastrowid, "title": title, "subject": subject})
+
+
+@app.route('/api/decks/generate', methods=['POST'])
+@login_required
+def api_generate_deck():
+    """Nhờ AI tạo giúp cả bộ thẻ ghi nhớ chỉ từ 1 chủ đề — gọi AI đúng 1 lần (không streaming),
+    parse JSON kết quả, rồi lưu thành 1 bộ thẻ mới."""
+    data = request.get_json(silent=True) or {}
+    topic = (data.get('topic') or '').strip()
+    subject = (data.get('subject') or '').strip()[:60]
+    count = data.get('count', 8)
+
+    if not topic:
+        return jsonify({"error": "Em nhập chủ đề muốn tạo thẻ ghi nhớ nhé."}), 400
+    if len(topic) > 200:
+        return jsonify({"error": "Chủ đề hơi dài, em rút gọn lại nhé."}), 400
+
+    try:
+        cards = generate_flashcards_via_ai(topic, subject, count)
+    except RuntimeError as e:
+        return jsonify({"error": str(e)}), 502
+    except Exception:
+        return jsonify({"error": "AI tạo thẻ chưa đúng định dạng, em thử lại nhé!"}), 502
+
+    if not cards:
+        return jsonify({"error": "AI chưa tạo được thẻ nào, em thử đổi chủ đề hoặc thử lại nhé."}), 502
+
+    user_id = current_user_id()
+    db = get_db()
+    cur = db.execute(
+        'INSERT INTO flashcard_decks (user_id, title, subject, source, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)',
+        (user_id, topic[:120], subject, 'ai', now_iso(), now_iso())
+    )
+    deck_id = cur.lastrowid
+    for front, back in cards:
+        db.execute('INSERT INTO flashcards (deck_id, front, back, created_at) VALUES (?, ?, ?, ?)',
+                   (deck_id, front, back, now_iso()))
+    db.commit()
+
+    deck_count = db.execute('SELECT COUNT(*) c FROM flashcard_decks WHERE user_id = ?', (user_id,)).fetchone()['c']
+    gamify = award_xp_and_streak(user_id, xp_amount=15, extra_achievement_checks={'first_deck': deck_count >= 1})
+
+    return jsonify({"deckId": deck_id, "cardCount": len(cards), "gamify": gamify})
+
+
+@app.route('/api/decks/<int:deck_id>', methods=['GET'])
+@login_required
+def api_get_deck(deck_id):
+    deck = _get_owned_deck(deck_id, current_user_id())
+    if not deck:
+        return jsonify({"error": "Không tìm thấy bộ thẻ này."}), 404
+    db = get_db()
+    cards = db.execute('SELECT * FROM flashcards WHERE deck_id = ? ORDER BY id ASC', (deck_id,)).fetchall()
+    return jsonify({"deck": dict(deck), "cards": [dict(c) for c in cards]})
+
+
+@app.route('/api/decks/<int:deck_id>', methods=['PATCH'])
+@login_required
+def api_update_deck(deck_id):
+    deck = _get_owned_deck(deck_id, current_user_id())
+    if not deck:
+        return jsonify({"error": "Không tìm thấy bộ thẻ này."}), 404
+    data = request.get_json(silent=True) or {}
+    title = (data.get('title') or '').strip()[:120]
+    if not title:
+        return jsonify({"error": "Tên bộ thẻ không được để trống."}), 400
+    db = get_db()
+    db.execute('UPDATE flashcard_decks SET title = ?, updated_at = ? WHERE id = ?', (title, now_iso(), deck_id))
+    db.commit()
+    return jsonify({"success": True})
+
+
+@app.route('/api/decks/<int:deck_id>', methods=['DELETE'])
+@login_required
+def api_delete_deck(deck_id):
+    deck = _get_owned_deck(deck_id, current_user_id())
+    if not deck:
+        return jsonify({"error": "Không tìm thấy bộ thẻ này."}), 404
+    db = get_db()
+    db.execute('DELETE FROM flashcards WHERE deck_id = ?', (deck_id,))
+    db.execute('DELETE FROM flashcard_decks WHERE id = ?', (deck_id,))
+    db.commit()
+    return jsonify({"success": True})
+
+
+@app.route('/api/decks/<int:deck_id>/cards', methods=['POST'])
+@login_required
+def api_add_card(deck_id):
+    deck = _get_owned_deck(deck_id, current_user_id())
+    if not deck:
+        return jsonify({"error": "Không tìm thấy bộ thẻ này."}), 404
+    data = request.get_json(silent=True) or {}
+    front = (data.get('front') or '').strip()[:200]
+    back = (data.get('back') or '').strip()[:500]
+    if not front or not back:
+        return jsonify({"error": "Em nhập đủ mặt trước và mặt sau nhé."}), 400
+    db = get_db()
+    cur = db.execute('INSERT INTO flashcards (deck_id, front, back, created_at) VALUES (?, ?, ?, ?)',
+                      (deck_id, front, back, now_iso()))
+    db.execute('UPDATE flashcard_decks SET updated_at = ? WHERE id = ?', (now_iso(), deck_id))
+    db.commit()
+    return jsonify({"id": cur.lastrowid, "front": front, "back": back})
+
+
+@app.route('/api/cards/<int:card_id>', methods=['PATCH'])
+@login_required
+def api_update_card(card_id):
+    """Sửa nội dung thẻ, HOẶC (nếu body có "correct") ghi nhận 1 lượt ôn tập ở Chế độ Học —
+    dùng Leitner đơn giản: đúng thì tăng box (tối đa 5), sai thì về box 1 để ôn lại sớm hơn."""
+    card = _get_owned_card(card_id, current_user_id())
+    if not card:
+        return jsonify({"error": "Không tìm thấy thẻ này."}), 404
+    data = request.get_json(silent=True) or {}
+    db = get_db()
+
+    if 'correct' in data:
+        correct = bool(data.get('correct'))
+        new_box = min(5, card['box_level'] + 1) if correct else 1
+        db.execute(
+            'UPDATE flashcards SET box_level = ?, times_reviewed = times_reviewed + 1, '
+            'times_correct = times_correct + ?, last_reviewed_at = ? WHERE id = ?',
+            (new_box, 1 if correct else 0, now_iso(), card_id)
+        )
+        db.commit()
+        return jsonify({"success": True, "box_level": new_box})
+
+    set_clauses, values = [], []
+    if 'front' in data:
+        set_clauses.append('front = ?'); values.append(str(data.get('front') or '').strip()[:200])
+    if 'back' in data:
+        set_clauses.append('back = ?'); values.append(str(data.get('back') or '').strip()[:500])
+    if not set_clauses:
+        return jsonify({"error": "Không có nội dung nào để cập nhật."}), 400
+    values.append(card_id)
+    db.execute(f'UPDATE flashcards SET {", ".join(set_clauses)} WHERE id = ?', values)
+    db.commit()
+    return jsonify({"success": True})
+
+
+@app.route('/api/cards/<int:card_id>', methods=['DELETE'])
+@login_required
+def api_delete_card(card_id):
+    card = _get_owned_card(card_id, current_user_id())
+    if not card:
+        return jsonify({"error": "Không tìm thấy thẻ này."}), 404
+    db = get_db()
+    db.execute('DELETE FROM flashcards WHERE id = ?', (card_id,))
+    db.commit()
+    return jsonify({"success": True})
+
+
+@app.route('/api/games/complete', methods=['POST'])
+@login_required
+def api_game_complete():
+    """Học sinh hoàn thành 1 ván game luyện tập (vd: Lật thẻ ghi nhớ) — cộng XP thưởng (tách
+    riêng khỏi XP mỗi lượt chat) + mở thành tựu 'Người chơi mới' nếu đây là lần đầu."""
+    data = request.get_json(silent=True) or {}
+    game = (data.get('game') or '').strip()
+    try:
+        score = int(data.get('score') or 0)
+    except (TypeError, ValueError):
+        score = 0
+    if game not in ('memory_match',):
+        return jsonify({"error": "Trò chơi không hợp lệ."}), 400
+
+    bonus_xp = min(50, max(10, score))
+    gamify = award_xp_and_streak(current_user_id(), xp_amount=bonus_xp,
+                                  extra_achievement_checks={'game_player': True})
+    return jsonify({"success": True, "xpAwarded": bonus_xp, "gamify": gamify})
 
 
 @app.route('/api/memories', methods=['GET'])
