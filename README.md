@@ -146,5 +146,34 @@ Cách B tốn công cấu hình hơn nhưng bạn toàn quyền kiểm soát d�
 - **Chữ tràn ra ngoài khung chat**: đã thêm `overflow-wrap: anywhere` cho phần nội dung AI trả lời để tự xuống dòng với chuỗi dài không có khoảng trắng.
 - **Đã bỏ đăng nhập Facebook** khỏi toàn bộ app (route, nút bấm, biến môi trường) — chỉ còn đăng nhập bằng Google + tên đăng nhập/mật khẩu.
 
+## 8. Dự án, Ghim, Tìm kiếm, Cài đặt cá nhân (mới)
+
+Sidebar được nâng cấp thêm cấu trúc kiểu ChatGPT/Claude:
+
+- **Ô tìm kiếm** phía trên sidebar: lọc đoạn chat theo tiêu đề ngay khi gõ (client-side, không cần reload).
+- **Dự án**: bấm dấu "+" cạnh mục "Dự án" để tạo một dự án mới (vd: "Ôn thi HK1"), sau đó dùng menu "⋯" trên từng đoạn chat để **chuyển đoạn chat vào dự án**. Bấm vào tên dự án trong sidebar để lọc riêng các đoạn chat thuộc dự án đó.
+- **Ghim đoạn chat**: menu "⋯" trên từng đoạn chat có mục Ghim/Bỏ ghim — các đoạn đã ghim nổi lên mục "Đã ghim" riêng, luôn ở trên cùng.
+- **Đổi tên đoạn chat**: cũng nằm trong menu "⋯".
+- **Menu tài khoản** (góc dưới sidebar) có thêm 3 mục mới:
+  - **Cài đặt**: chọn giao diện Sáng/Tối/Theo hệ thống, ngôn ngữ (Tiếng Việt/English — dịch nhẹ phần khung giao diện, không dịch nội dung AI trả lời), môn học & chế độ mặc định khi mở đoạn chat mới, và nút **xoá toàn bộ lịch sử** (có xác nhận trước khi xoá).
+  - **Trợ giúp & phím tắt**: liệt kê các phím tắt — `Ctrl/Cmd+K` đoạn chat mới, `Ctrl/Cmd+/` mở trợ giúp, `Esc` đóng hộp thoại.
+  - **Nâng cấp gói**: chỉ là bản xem trước giao diện, **chưa có chức năng thanh toán thật** — ghi rõ trong hộp thoại để tránh gây hiểu lầm.
+- Tất cả tuỳ chọn ở trên được lưu theo tài khoản (cột `preferences` mới trong bảng `users`, dạng JSON) — đăng nhập ở máy khác vẫn giữ nguyên cài đặt.
+- **Banner thông báo hệ thống**: nếu developer bật banner (xem mục 9), mọi người dùng đã đăng nhập sẽ thấy dòng thông báo trong sidebar, có thể bấm "x" để tạm ẩn (ẩn theo phiên trình duyệt, hiện lại nếu mở tab mới hoặc banner được đổi nội dung).
+
+## 9. Công cụ quản lý mới cho tài khoản Developer
+
+Trang `/developer` có thêm mục **"Quản lý hệ thống"**:
+
+- **Banner thông báo**: ô nhập nội dung (tối đa 300 ký tự) + công tắc bật/tắt, bấm "Lưu banner" để áp dụng ngay cho toàn bộ người dùng.
+- **Công tắc đăng nhập Google (runtime)**: chỉ hiện nếu `GOOGLE_CLIENT_ID`/`GOOGLE_CLIENT_SECRET` đã có trong `.env`. Cho phép Bật/Tắt/Về mặc định nút "Đăng nhập với Google" **ngay lập tức, không cần sửa `.env` hay khởi động lại server** — hữu ích khi cần tạm khoá đăng nhập Google (vd: đang debug OAuth) mà không ảnh hưởng đăng nhập bằng mật khẩu.
+- **Xuất CSV**: tải toàn bộ `usage_logs` (không có nội dung câu hỏi/trả lời, chỉ số liệu) ra file `usage_logs.csv` để phân tích thêm bằng Excel/Google Sheets.
+- **Tìm kiếm tài khoản**: ô tìm theo tên đăng nhập phía trên bảng "Toàn bộ tài khoản".
+- **Thăng/hạ quyền developer trực tiếp từ bảng tài khoản**: nút "Nâng lên developer" / "Hạ xuống user" trên từng dòng. Có 2 lớp bảo vệ:
+  - Không thể tự hạ quyền chính tài khoản đang đăng nhập.
+  - Không thể hạ quyền nếu đó là **developer cuối cùng** của hệ thống — luôn phải còn ít nhất 1 tài khoản developer.
+
+⚠️ Không cần cài thêm thư viện nào cho các tính năng ở mục 8–9 — toàn bộ dùng lại `flask`, `sqlite3`, `csv` (thư viện chuẩn của Python), không cập nhật `requirements.txt`.
+
 ## Chưa làm (nằm ngoài phạm vi yêu cầu lần này)
 Phần đầu prompt gốc của bạn từng có yêu cầu dựng lại toàn bộ thành một sản phẩm Next.js/TypeScript quy mô lớn (nhiều trang, Dashboard, Blog, Pricing...). Bản cập nhật này vẫn giữ nguyên nền tảng Flask hiện có của bạn và chỉ tập trung vào 2 yêu cầu mới nhất: giao diện giống các AI phổ biến + hệ thống tài khoản. Nếu bạn vẫn muốn bản Next.js quy mô lớn, đó sẽ là một dự án tách riêng — cho mình biết nếu bạn muốn triển khai.
