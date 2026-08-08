@@ -41,7 +41,10 @@ except ImportError:
 load_dotenv()  # đọc các biến từ file .env cùng thư mục (nếu có)
 
 app = Flask(__name__)
-app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024  # giới hạn upload cứng ở tầng Flask/Werkzeug (áp dụng cho mọi tài khoản, kể cả Admin — xem ghi chú "không giới hạn" trong README)
+# Trần cứng ở tầng Flask/Werkzeug — áp dụng cho MỌI request trước khi code của ta kịp chạy.
+# Đặt bằng đúng mức trần cao nhất trong số các gói (Max = 1GB/file); giới hạn thấp hơn cho
+# từng gói (Free/Premium) được kiểm tra riêng, chi tiết hơn, ngay trong route /api/upload.
+app.config['MAX_CONTENT_LENGTH'] = 1024 * 1024 * 1024 + 8 * 1024 * 1024  # 1GB + đệm cho overhead multipart
 app.config['SESSION_COOKIE_HTTPONLY'] = True
 app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
 
@@ -61,9 +64,9 @@ else:
     print("⚠️  CẢNH BÁO: Chưa có SECRET_KEY trong .env — phiên đăng nhập sẽ mất khi restart server.")
     print("   Thêm dòng sau vào .env để cố định: SECRET_KEY=" + secrets.token_hex(16))
 
-# Giới hạn số ký tự trích từ file để tránh vượt quá token limit khi gửi cho AI
+# Giới hạn số ký tự trích từ file để tránh vượt quá token limit khi gửi cho AI (mức Free —
+# Premium/Max có mức cao hơn hoặc không giới hạn, xem PLAN_LIMITS bên dưới).
 MAX_FILE_CHARS = 12000
-MAX_IMAGE_BYTES = 6 * 1024 * 1024
 MAX_IMAGE_DIMENSION = 1600  # px, ảnh lớn hơn sẽ được thu nhỏ để gửi AI nhanh hơn
 
 ALLOWED_IMAGE_EXT = {'.png', '.jpg', '.jpeg', '.gif', '.webp'}
@@ -237,6 +240,13 @@ def init_db():
         conn.execute("ALTER TABLE users ADD COLUMN session_version INTEGER NOT NULL DEFAULT 0")
         conn.commit()
 
+    # ---- Di trú: gói sử dụng (Free/Premium/Max) ----
+    # Chỉ áp dụng thật sự cho tài khoản role='user' — Developer trở lên luôn có Max vô điều
+    # kiện, tính động qua effective_plan() ở runtime (xem mục 0.25), không đọc từ cột này.
+    if 'plan' not in existing_cols:
+        conn.execute("ALTER TABLE users ADD COLUMN plan TEXT NOT NULL DEFAULT 'free'")
+        conn.commit()
+
     # "AI Tutor" tuỳ chỉnh do developer trở lên tự tạo (tên + system prompt riêng).
     conn.execute('''
         CREATE TABLE IF NOT EXISTS custom_tutors (
@@ -273,6 +283,19 @@ def init_db():
             target TEXT DEFAULT '',
             detail TEXT DEFAULT '',
             created_at TEXT NOT NULL
+        )
+    ''')
+    # Nhật ký từng lượt tải file/ảnh lên — dùng để tính giới hạn "X file/ảnh mỗi 24h" theo
+    # gói (Free/Premium/Max). Đếm theo cửa sổ trượt 24h kể từ thời điểm hỏi (rolling window),
+    # KHÔNG reset cứng theo nửa đêm — đúng như yêu cầu "thời gian reset 24h".
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS file_uploads (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            kind TEXT NOT NULL,
+            size_bytes INTEGER DEFAULT 0,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (user_id) REFERENCES users (id)
         )
     ''')
     conn.commit()
@@ -498,18 +521,164 @@ def super_admin_required(view):
     return wrapped
 
 
-def log_usage(user_id, subject, mode, message_chars, response_chars, had_file, had_image, status):
-    """Ghi lại 1 lượt sử dụng AI vào bảng usage_logs, phục vụ trang thống kê developer."""
+# ==========================================
+# 0.25. GÓI SỬ DỤNG (Free / Premium / Max) & CHẾ ĐỘ SUY NGHĨ AI
+# ==========================================
+# free < premium < max — mỗi gói cao hơn kế thừa toàn bộ quyền lợi của gói thấp hơn.
+# Developer/Admin/Super Admin luôn được cấp Max VÔ ĐIỀU KIỆN (tính động qua effective_plan(),
+# không cần ghi vào cột `plan` trong DB) — đây là quyền lợi đi kèm vai trò, không phải trả phí.
+PLAN_ORDER = ['free', 'premium', 'max']
+PLAN_META = {
+    'free':    {'label': 'Free',    'icon': '🆓',
+                'badge': 'bg-gray-100 text-gray-500 dark:bg-gray-800 dark:text-gray-400'},
+    'premium': {'label': 'Premium', 'icon': '💎',
+                'badge': 'bg-indigo-100 text-indigo-600 dark:bg-indigo-900 dark:text-indigo-300'},
+    'max':     {'label': 'Max',     'icon': '🚀',
+                'badge': 'bg-amber-100 text-amber-700 dark:bg-amber-900 dark:text-amber-300'},
+}
+# daily_uploads: số file/ảnh tối đa trong 24h gần nhất (rolling window, không phải theo lịch) —
+# None = không giới hạn. max_file_mb: dung lượng tối đa MỖI file/ảnh. text_chars: số ký tự tối
+# đa trích xuất từ file văn bản/PDF/Word trước khi bị cắt bớt — None = không cắt.
+PLAN_LIMITS = {
+    'free':    {'daily_uploads': 20,   'max_file_mb': 20,   'text_chars': MAX_FILE_CHARS},
+    'premium': {'daily_uploads': 50,   'max_file_mb': 500,  'text_chars': MAX_FILE_CHARS * 4},
+    'max':     {'daily_uploads': None, 'max_file_mb': 1024, 'text_chars': None},
+}
+UPLOAD_QUOTA_WINDOW_HOURS = 24
+
+
+def plan_rank(plan):
     try:
-        db = get_db()
-        db.execute(
-            '''INSERT INTO usage_logs
-               (user_id, endpoint, subject, mode, message_chars, response_chars, had_file, had_image, status, created_at)
-               VALUES (?, 'chat', ?, ?, ?, ?, ?, ?, ?, ?)''',
-            (user_id, subject, mode, message_chars, response_chars, int(bool(had_file)), int(bool(had_image)),
-             status, now_iso())
-        )
-        db.commit()
+        return PLAN_ORDER.index(plan)
+    except ValueError:
+        return 0
+
+
+def plan_meta(plan):
+    return PLAN_META.get(plan, PLAN_META['free'])
+
+
+def plan_limits(plan):
+    return PLAN_LIMITS.get(plan, PLAN_LIMITS['free'])
+
+
+def effective_plan(user):
+    """Gói THỰC TẾ đang áp dụng cho tài khoản. Developer trở lên luôn là 'max' bất kể cột
+    `plan` lưu gì trong DB; tài khoản user thường dùng đúng giá trị đã được Admin gán."""
+    if not user:
+        return 'free'
+    try:
+        if role_rank(user['role']) >= role_rank('developer'):
+            return 'max'
+    except Exception:
+        pass
+    try:
+        plan = user['plan']
+    except Exception:
+        plan = None
+    return plan if plan in PLAN_ORDER else 'free'
+
+
+def current_effective_plan():
+    return effective_plan(current_user())
+
+
+def app_display_name(user):
+    """Tên hiển thị của app, gắn theo gói thực tế của tài khoản đang đăng nhập — tài khoản
+    Free thấy tên trơn "StudyMate AI" (không còn chữ "Pro"); Premium/Max thấy tên có gắn gói."""
+    plan = effective_plan(user)
+    if plan == 'max':
+        return 'StudyMate AI Max'
+    if plan == 'premium':
+        return 'StudyMate AI Premium'
+    return 'StudyMate AI'
+
+
+# "Chế độ suy nghĩ" — các mức độ suy luận sâu/rộng khác nhau mà AI sẽ áp dụng khi trả lời.
+# Đặt tên theo hành trình một học sinh "lên trình": Trợ Lý (mặc định, mọi gói) → Học Giả /
+# Giáo Sư (mở khoá từ Premium) → Thiên Tài (độc quyền Max — mạnh nhất, kết hợp cả hai).
+THINKING_MODE_ORDER = ['standard', 'scholar', 'professor', 'genius']
+THINKING_MODES = {
+    'standard': {
+        'key': 'standard', 'label': 'Trợ Lý', 'icon': '💬', 'min_plan': 'free', 'max_tokens': 800,
+        'desc': 'Phản hồi nhanh, cân bằng — phù hợp phần lớn câu hỏi hằng ngày.',
+        'prompt_hint': '',
+    },
+    'scholar': {
+        'key': 'scholar', 'label': 'Học Giả', 'icon': '📖', 'min_plan': 'premium', 'max_tokens': 1400,
+        'desc': 'Suy luận từng bước kỹ càng hơn trước khi trả lời — hợp bài khó, cần độ chính xác cao.',
+        'prompt_hint': ('Hãy suy nghĩ cẩn thận, từng bước một trong đầu, kiểm tra lại logic trước khi '
+                         'đưa ra câu trả lời cuối cùng. Trình bày ngắn gọn các bước suy luận chính, '
+                         'sau đó kết luận thật rõ ràng.'),
+    },
+    'professor': {
+        'key': 'professor', 'label': 'Giáo Sư', 'icon': '🎓', 'min_plan': 'premium', 'max_tokens': 1600,
+        'desc': 'Giải thích mở rộng hơn — nhiều ví dụ, liên hệ thực tế, nhiều góc nhìn.',
+        'prompt_hint': ('Hãy giải thích mở rộng và sâu hơn bình thường: thêm ví dụ minh hoạ, liên hệ '
+                         'thực tế, so sánh nhiều cách tiếp cận nếu phù hợp — giúp học sinh hiểu bản '
+                         'chất chứ không chỉ nhớ đáp số.'),
+    },
+    'genius': {
+        'key': 'genius', 'label': 'Thiên Tài', 'icon': '🌟', 'min_plan': 'max', 'max_tokens': 2200,
+        'desc': 'Kết hợp suy luận sâu nhất + mở rộng kiến thức tối đa — chế độ mạnh nhất, độc quyền Max.',
+        'prompt_hint': ('Hãy kết hợp cả hai: suy luận từng bước thật kỹ để đảm bảo chính xác tuyệt đối, '
+                         'đồng thời giải thích mở rộng với ví dụ, liên hệ thực tế và nhiều góc nhìn. Đây '
+                         'là chế độ mạnh nhất — hãy đầu tư chất lượng tối đa cho câu trả lời.'),
+    },
+}
+
+
+def thinking_mode_unlocked(mode_key, plan):
+    tm = THINKING_MODES.get(mode_key)
+    if not tm:
+        return False
+    return plan_rank(plan) >= plan_rank(tm['min_plan'])
+
+
+def resolve_thinking_mode(requested_key, plan):
+    """Trả về key hợp lệ: nếu chế độ yêu cầu không tồn tại hoặc vượt quá gói hiện tại
+    (kể cả khi client cố tình gửi thẳng key bị khoá qua API) thì rơi về 'standard'."""
+    if requested_key in THINKING_MODES and thinking_mode_unlocked(requested_key, plan):
+        return requested_key
+    return 'standard'
+
+
+def open_write_db():
+    """Kết nối SQLite RIÊNG, không qua `g`/`get_db()`.
+
+    Lý do cần cái này: `stream_with_context` (dùng cho các response dạng SSE streaming,
+    xem `chat()` bên dưới) chỉ "hoãn" được request/session/g ở mức tham chiếu Python —
+    nó KHÔNG ngăn được `teardown_appcontext` (hàm `close_db`) chạy sớm hơn generator.
+    Trong Flask hiện tại, `ctx.pop()` ở cuối `wsgi_app()` (đóng kết nối `g._database`
+    qua `close_db`) xảy ra NGAY khi view function return Response — tức là TRƯỚC khi
+    generator SSE thật sự bắt đầu chạy và stream dữ liệu. Nếu generator dùng lại
+    `get_db()`/`g._database` để ghi DB, nó sẽ gặp lỗi "Cannot operate on a closed
+    database" vì kết nối đó đã bị `close_db` đóng mất rồi.
+    Giải pháp: bất kỳ đoạn code nào ghi DB BÊN TRONG một generator streaming (SSE) đều
+    phải tự mở kết nối riêng bằng hàm này, dùng xong tự đóng — không phụ thuộc vào `g`."""
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def log_usage(user_id, subject, mode, message_chars, response_chars, had_file, had_image, status):
+    """Ghi lại 1 lượt sử dụng AI vào bảng usage_logs, phục vụ trang thống kê developer.
+    Dùng kết nối riêng (open_write_db) vì hàm này thường được gọi từ BÊN TRONG generator
+    streaming của /api/chat, lúc đó `g`/`get_db()` có thể đã bị teardown (xem giải thích
+    ở open_write_db)."""
+    try:
+        conn = open_write_db()
+        try:
+            conn.execute(
+                '''INSERT INTO usage_logs
+                   (user_id, endpoint, subject, mode, message_chars, response_chars, had_file, had_image, status, created_at)
+                   VALUES (?, 'chat', ?, ?, ?, ?, ?, ?, ?, ?)''',
+                (user_id, subject, mode, message_chars, response_chars, int(bool(had_file)), int(bool(had_image)),
+                 status, now_iso())
+            )
+            conn.commit()
+        finally:
+            conn.close()
     except Exception:
         # Không để lỗi ghi log ảnh hưởng tới trải nghiệm chat của học sinh.
         pass
@@ -519,19 +688,29 @@ def log_usage(user_id, subject, mode, message_chars, response_chars, had_file, h
 # 0.3. CẤU HÌNH HỆ THỐNG (settings key-value) — do developer chỉnh qua /developer
 # ==========================================
 def get_setting(key, default=None):
-    db = get_db()
-    row = db.execute('SELECT value FROM settings WHERE key = ?', (key,)).fetchone()
-    return row['value'] if row and row['value'] is not None else default
+    """Đọc 1 giá trị cấu hình từ bảng settings. Cố ý dùng kết nối RIÊNG (open_write_db(),
+    không phải get_db()/g) vì hàm này còn được gọi từ BÊN TRONG generator streaming của
+    /api/chat (qua stream_consolex_ai() -> đọc ai_model_override/ai_temperature_override),
+    lúc đó `g._database` có thể đã bị teardown — xem giải thích chi tiết ở open_write_db()."""
+    conn = open_write_db()
+    try:
+        row = conn.execute('SELECT value FROM settings WHERE key = ?', (key,)).fetchone()
+        return row['value'] if row and row['value'] is not None else default
+    finally:
+        conn.close()
 
 
 def set_setting(key, value):
-    db = get_db()
-    db.execute(
-        'INSERT INTO settings (key, value) VALUES (?, ?) '
-        'ON CONFLICT(key) DO UPDATE SET value = excluded.value',
-        (key, value)
-    )
-    db.commit()
+    conn = open_write_db()
+    try:
+        conn.execute(
+            'INSERT INTO settings (key, value) VALUES (?, ?) '
+            'ON CONFLICT(key) DO UPDATE SET value = excluded.value',
+            (key, value)
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def google_login_effective_enabled():
@@ -553,6 +732,7 @@ PREFERENCE_DEFAULTS = {
     'language': 'vi',             # 'vi' | 'en'
     'default_subject': 'Toán',
     'default_mode': 'Giải thích',
+    'default_thinking_mode': 'standard',  # 'standard' | 'scholar' | 'professor' | 'genius'
 }
 ALLOWED_PREFERENCE_KEYS = set(PREFERENCE_DEFAULTS.keys())
 
@@ -591,7 +771,7 @@ AUTH_HTML = r'''
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>{{ 'Đăng nhập' if mode == 'login' else 'Đăng ký' }} — StudyMate AI Pro</title>
+  <title>{{ 'Đăng nhập' if mode == 'login' else 'Đăng ký' }} — StudyMate AI</title>
   <script src="https://cdn.tailwindcss.com"></script>
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.6.0/css/all.min.css">
   <style>
@@ -623,7 +803,7 @@ AUTH_HTML = r'''
   <div class="w-full max-w-md relative z-10">
     <div class="text-center mb-7">
       <div class="inline-flex w-16 h-16 rounded-2xl bg-gradient-to-br from-indigo-500 to-cyan-400 items-center justify-center text-white text-3xl font-bold shadow-lg shadow-indigo-500/40">S</div>
-      <h1 class="text-2xl font-extrabold mt-4 text-white tracking-tight">StudyMate AI Pro</h1>
+      <h1 class="text-2xl font-extrabold mt-4 text-white tracking-tight">StudyMate AI</h1>
       <p class="text-indigo-200/80 text-sm mt-1">Gia sư AI thông minh cho học sinh THCS 🎓</p>
     </div>
 
@@ -707,7 +887,7 @@ AUTH_HTML = r'''
       </p>
     </div>
 
-    <p class="text-center text-xs text-indigo-200/60 mt-6">© {{ 2026 }} StudyMate AI Pro — Dữ liệu đăng nhập được mã hoá, không chia sẻ cho bên thứ ba.</p>
+    <p class="text-center text-xs text-indigo-200/60 mt-6">© {{ 2026 }} StudyMate AI — Dữ liệu đăng nhập được mã hoá, không chia sẻ cho bên thứ ba.</p>
   </div>
 </body>
 </html>
@@ -722,7 +902,7 @@ HTML = r'''
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>StudyMate AI Pro - Gia sư THCS</title>
+  <title>{{ app_name }}</title>
   <script src="https://cdn.tailwindcss.com"></script>
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.6.0/css/all.min.css">
   <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
@@ -806,7 +986,7 @@ HTML = r'''
     <div class="p-3 flex items-center justify-between">
       <div class="flex items-center gap-2 px-1">
         <div class="w-8 h-8 rounded-lg bg-gradient-to-br from-blue-600 to-indigo-600 flex items-center justify-center text-white font-bold text-sm">S</div>
-        <span class="font-bold text-base">StudyMate AI</span>
+        <span class="font-bold text-base truncate">{{ app_name }}</span>
       </div>
       <button id="closeSidebarBtn" class="lg:hidden w-8 h-8 flex items-center justify-center rounded-lg hover:bg-gray-200 dark:hover:bg-gray-800 text-gray-500">
         <i class="fas fa-xmark"></i>
@@ -856,6 +1036,14 @@ HTML = r'''
         <i class="fas fa-chevron-up text-xs text-gray-400"></i>
       </button>
       <div id="userMenu" class="hidden absolute bottom-[64px] left-3 right-3 bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-xl shadow-lg overflow-hidden z-10">
+        <div class="px-4 py-2.5 border-b border-gray-100 dark:border-gray-700 flex items-center gap-1.5">
+          <span class="text-[11px] font-semibold px-2 py-0.5 rounded-full {{ plan_meta[current_plan].badge }}">
+            {{ plan_meta[current_plan].icon }} {{ plan_meta[current_plan].label }}
+          </span>
+          {% if is_plan_role_based %}
+          <span class="text-[10px] text-gray-400">(theo vai trò {{ role_label }})</span>
+          {% endif %}
+        </div>
         {% if is_developer %}
         <a href="/developer" class="flex items-center gap-2 px-4 py-3 text-sm hover:bg-gray-100 dark:hover:bg-gray-700 text-indigo-600 dark:text-indigo-400 border-b border-gray-100 dark:border-gray-700">
           <i class="fas fa-chart-line"></i> Thống kê (Developer)
@@ -904,6 +1092,36 @@ HTML = r'''
         <option value="Luyện tập">📝 Ra Bài Luyện Tập</option>
         <option value="Ôn tập">🔄 Tổng Hợp Ôn Tập</option>
       </select>
+
+      <div class="relative">
+        <button id="thinkingModeBtn" type="button" title="Chế độ suy nghĩ của AI"
+          class="text-sm font-medium bg-gray-100 dark:bg-gray-800 border-0 rounded-full pl-3.5 pr-2.5 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500 cursor-pointer dark:text-white flex items-center gap-1.5">
+          <span id="thinkingModeIcon">💬</span>
+          <span id="thinkingModeLabel">Trợ Lý</span>
+          <i class="fas fa-chevron-down text-[10px] text-gray-400"></i>
+        </button>
+        <div id="thinkingModeMenu" class="hidden absolute left-0 top-full mt-1.5 z-30 w-72 bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-xl shadow-lg overflow-hidden">
+          {% for key in thinking_mode_order %}
+          {% set tm = thinking_modes[key] %}
+          {% set unlocked = key in unlocked_thinking_modes %}
+          <button type="button" class="thinking-mode-item w-full text-left px-3.5 py-2.5 hover:bg-gray-50 dark:hover:bg-gray-700 flex items-start gap-2.5 text-sm border-b border-gray-50 dark:border-gray-700/50 last:border-b-0 {{ '' if unlocked else 'opacity-70' }}"
+            data-mode="{{ key }}" data-unlocked="{{ '1' if unlocked else '0' }}">
+            <span class="text-base leading-5">{{ tm.icon }}</span>
+            <span class="flex-1 min-w-0">
+              <span class="font-medium flex items-center gap-1.5 flex-wrap">
+                {{ tm.label }}
+                {% if not unlocked %}
+                <span class="text-[10px] font-semibold px-1.5 py-0.5 rounded-full {{ plan_meta[tm.min_plan].badge }}">
+                  <i class="fas fa-lock text-[9px] mr-0.5"></i>{{ plan_meta[tm.min_plan].label }}
+                </span>
+                {% endif %}
+              </span>
+              <span class="block text-xs text-gray-400 mt-0.5 leading-snug">{{ tm.desc }}</span>
+            </span>
+          </button>
+          {% endfor %}
+        </div>
+      </div>
 
       <div class="flex-1"></div>
 
@@ -960,6 +1178,22 @@ HTML = r'''
       <button onclick="closeAllModals()" class="w-8 h-8 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 flex items-center justify-center"><i class="fas fa-xmark"></i></button>
     </div>
     <div class="p-5 space-y-5">
+      <div class="rounded-xl border border-gray-200 dark:border-gray-700 p-3.5 flex items-center gap-3">
+        <div class="flex-1 min-w-0">
+          <div class="flex items-center gap-1.5">
+            <span id="planBadge" class="text-[11px] font-semibold px-2 py-0.5 rounded-full {{ plan_meta[current_plan].badge }}">{{ plan_meta[current_plan].icon }} {{ plan_meta[current_plan].label }}</span>
+          </div>
+          <p id="planQuotaText" class="text-xs text-gray-400 mt-1.5">Đang tải thông tin gói...</p>
+          <div class="w-full h-1.5 bg-gray-100 dark:bg-gray-700 rounded-full mt-1.5 overflow-hidden">
+            <div id="planQuotaBar" class="h-full bg-indigo-500 rounded-full" style="width: 0%;"></div>
+          </div>
+        </div>
+        {% if current_plan != 'max' %}
+        <button type="button" onclick="openModal('upgradeModal')" class="flex-shrink-0 text-xs font-semibold px-3 py-2 rounded-lg bg-amber-50 dark:bg-amber-900/30 text-amber-600 dark:text-amber-400 hover:bg-amber-100 dark:hover:bg-amber-900/50">
+          <i class="fas fa-bolt mr-1"></i> Nâng cấp
+        </button>
+        {% endif %}
+      </div>
       <div>
         <label class="text-sm font-semibold block mb-2">Giao diện</label>
         <div class="grid grid-cols-3 gap-2" id="themeOptions">
@@ -1040,42 +1274,52 @@ HTML = r'''
   </div>
 
   <!-- Nâng cấp gói -->
-  <div id="upgradeModal" class="hidden modal-panel bg-white dark:bg-gray-800 rounded-2xl shadow-2xl w-full max-w-lg max-h-[85vh] overflow-y-auto">
+  <div id="upgradeModal" class="hidden modal-panel bg-white dark:bg-gray-800 rounded-2xl shadow-2xl w-full max-w-3xl max-h-[85vh] overflow-y-auto">
     <div class="flex items-center justify-between px-5 py-4 border-b border-gray-100 dark:border-gray-700">
       <h3 class="font-bold text-lg flex items-center gap-2"><i class="fas fa-bolt text-amber-500"></i> Nâng cấp gói</h3>
       <button onclick="closeAllModals()" class="w-8 h-8 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 flex items-center justify-center"><i class="fas fa-xmark"></i></button>
     </div>
     <div class="p-5">
       <p class="text-xs text-center text-gray-400 mb-4">🚧 Đây là bản xem trước — chưa có thanh toán thật, chỉ để minh hoạ hướng phát triển.</p>
-      <div class="grid sm:grid-cols-2 gap-4">
-        <div class="border border-gray-200 dark:border-gray-700 rounded-2xl p-4">
-          <p class="font-bold">Free</p>
-          <p class="text-2xl font-extrabold my-2">0₫</p>
-          <ul class="text-sm text-gray-500 space-y-1.5 mb-4">
-            <li><i class="fas fa-check text-emerald-500 mr-1.5"></i> Chat không giới hạn số đoạn</li>
-            <li><i class="fas fa-check text-emerald-500 mr-1.5"></i> Đọc file & ảnh</li>
+      <div class="grid sm:grid-cols-3 gap-4">
+        {% for p in plan_order %}
+        {% set meta = plan_meta[p] %}
+        {% set limits = plan_limits[p] %}
+        {% set is_current = (p == current_plan) %}
+        <div class="rounded-2xl p-4 relative flex flex-col {{ 'border-2 border-blue-500' if is_current else 'border border-gray-200 dark:border-gray-700' }}">
+          {% if is_current %}
+          <span class="absolute -top-2.5 left-4 bg-blue-500 text-white text-[10px] font-bold px-2 py-0.5 rounded-full">GÓI HIỆN TẠI</span>
+          {% endif %}
+          <p class="font-bold flex items-center gap-1.5">{{ meta.icon }} {{ meta.label }}</p>
+          <ul class="text-sm text-gray-500 dark:text-gray-400 space-y-1.5 my-3 flex-1">
+            <li><i class="fas fa-check text-emerald-500 mr-1.5"></i>
+              {% if limits.daily_uploads is none %}Đọc file &amp; ảnh không giới hạn{% else %}{{ limits.daily_uploads }} lượt đọc file/ảnh mỗi 24h{% endif %}
+            </li>
+            <li><i class="fas fa-check text-emerald-500 mr-1.5"></i> Mỗi file/ảnh tối đa {{ limits.max_file_mb }}MB</li>
+            <li><i class="fas fa-check text-emerald-500 mr-1.5"></i> Chat &amp; lịch sử không giới hạn số đoạn</li>
             <li><i class="fas fa-check text-emerald-500 mr-1.5"></i> Dự án &amp; ghim đoạn chat</li>
+            {% for key in unlocked_by_plan[p] %}
+            <li><i class="fas fa-brain text-indigo-400 mr-1.5"></i> Chế độ suy nghĩ {{ thinking_modes[key].icon }} {{ thinking_modes[key].label }}</li>
+            {% endfor %}
           </ul>
+          {% if is_current %}
           <button disabled class="w-full py-2 rounded-xl bg-gray-100 dark:bg-gray-700 text-gray-400 text-sm font-semibold">Gói hiện tại</button>
-        </div>
-        <div class="border-2 border-blue-500 rounded-2xl p-4 relative">
-          <span class="absolute -top-2.5 left-4 bg-blue-500 text-white text-[10px] font-bold px-2 py-0.5 rounded-full">SẮP RA MẮT</span>
-          <p class="font-bold">Pro</p>
-          <p class="text-2xl font-extrabold my-2">—</p>
-          <ul class="text-sm text-gray-500 space-y-1.5 mb-4">
-            <li><i class="fas fa-check text-emerald-500 mr-1.5"></i> Phản hồi ưu tiên, tốc độ cao hơn</li>
-            <li><i class="fas fa-check text-emerald-500 mr-1.5"></i> Giới hạn câu hỏi/ngày cao hơn</li>
-            <li><i class="fas fa-check text-emerald-500 mr-1.5"></i> Hỗ trợ ưu tiên</li>
-          </ul>
+          {% else %}
           <button disabled class="w-full py-2 rounded-xl bg-blue-200 dark:bg-blue-900 text-blue-500 dark:text-blue-300 text-sm font-semibold cursor-not-allowed">Chưa khả dụng</button>
+          {% endif %}
         </div>
+        {% endfor %}
       </div>
+      {% if is_plan_role_based %}
+      <p class="text-xs text-center text-gray-400 mt-4"><i class="fas fa-circle-info mr-1"></i> Tài khoản {{ role_label }} được cấp gói Max vô điều kiện theo vai trò, không cần nâng cấp.</p>
+      {% endif %}
     </div>
   </div>
 </div>
 
 <script>
 const CURRENT_USERNAME = {{ username|tojson }};
+const APP_NAME = {{ app_name|tojson }};
 let uploadedFileContext = "";
 let uploadedFileName = "";
 let uploadedImageDataUrl = "";
@@ -1146,6 +1390,57 @@ function closeAllModals() {
   modalBackdrop.classList.add('hidden');
   modalBackdrop.classList.remove('flex');
   document.querySelectorAll('.modal-panel').forEach(m => m.classList.add('hidden'));
+}
+
+// ---------- Chế độ suy nghĩ (Trợ Lý / Học Giả / Giáo Sư / Thiên Tài) ----------
+let currentThinkingMode = 'standard';
+const thinkingModeBtn = document.getElementById('thinkingModeBtn');
+const thinkingModeMenu = document.getElementById('thinkingModeMenu');
+thinkingModeBtn.addEventListener('click', (e) => {
+  e.stopPropagation();
+  thinkingModeMenu.classList.toggle('hidden');
+});
+document.addEventListener('click', () => thinkingModeMenu.classList.add('hidden'));
+thinkingModeMenu.addEventListener('click', (e) => e.stopPropagation());
+
+document.querySelectorAll('.thinking-mode-item').forEach(item => {
+  item.addEventListener('click', () => {
+    const mode = item.dataset.mode;
+    const unlocked = item.dataset.unlocked === '1';
+    thinkingModeMenu.classList.add('hidden');
+    if (!unlocked) {
+      openModal('upgradeModal');
+      return;
+    }
+    currentThinkingMode = mode;
+    const icon = item.querySelector('.text-base').textContent;
+    const label = item.querySelector('.font-medium').childNodes[0].textContent.trim();
+    document.getElementById('thinkingModeIcon').textContent = icon;
+    document.getElementById('thinkingModeLabel').textContent = label;
+  });
+});
+
+// ---------- Gói sử dụng (Free/Premium/Max) — hiển thị ở Cài đặt ----------
+async function loadPlanInfo() {
+  try {
+    const res = await fetch('/api/plan');
+    if (!res.ok) return;
+    const data = await res.json();
+    const badge = document.getElementById('planBadge');
+    const text = document.getElementById('planQuotaText');
+    const bar = document.getElementById('planQuotaBar');
+    if (badge) badge.textContent = `${data.icon} ${data.label}`;
+    if (data.daily_upload_limit === null) {
+      if (text) text.textContent = data.is_role_based
+        ? 'Đọc file & ảnh không giới hạn (theo vai trò tài khoản).'
+        : 'Đọc file & ảnh không giới hạn.';
+      if (bar) bar.style.width = '100%';
+    } else {
+      const pct = Math.min(100, Math.round((data.daily_uploads_used / data.daily_upload_limit) * 100));
+      if (text) text.textContent = `Đã dùng ${data.daily_uploads_used}/${data.daily_upload_limit} lượt đọc file/ảnh trong 24h qua`;
+      if (bar) bar.style.width = pct + '%';
+    }
+  } catch (e) { /* im lặng bỏ qua lỗi mạng */ }
 }
 
 // ---------- Ngôn ngữ (i18n nhẹ cho các nhãn chính trong giao diện) ----------
@@ -1345,7 +1640,7 @@ function updateAiStreamBubble(bubble, text, showCursor) {
 }
 
 function showWelcome() {
-  addMessage('ai', '👋 Chào em! Thầy/Cô là **StudyMate AI Pro**.\n\nEm chọn **Môn học** và **Chế độ** ở phía trên, gõ câu hỏi rồi bấm Enter (hoặc nút gửi) nhé! Em cũng có thể đính kèm file (PDF/Word/txt/csv) hoặc ảnh bằng nút 📎, hay kéo-thả trực tiếp vào khung chat. 🚀', true);
+  addMessage('ai', `👋 Chào em! Thầy/Cô là **${APP_NAME}**.\n\nEm chọn **Môn học** và **Chế độ** ở phía trên, gõ câu hỏi rồi bấm Enter (hoặc nút gửi) nhé! Em cũng có thể đính kèm file (PDF/Word/txt/csv) hoặc ảnh bằng nút 📎, hay kéo-thả trực tiếp vào khung chat. 🚀`, true);
 }
 
 // ---------- Lịch sử hội thoại (theo tài khoản) + Dự án + Ghim + Tìm kiếm ----------
@@ -1607,7 +1902,8 @@ async function sendMessage() {
         fileContext: uploadedFileContext,
         fileName: uploadedFileName,
         imageData: uploadedImageDataUrl,
-        conversationId: currentConversationId
+        conversationId: currentConversationId,
+        thinkingMode: currentThinkingMode
       })
     });
 
@@ -1769,11 +2065,11 @@ async function processFile(file) {
       const pageInfo = data.pages ? ` (${data.pages} trang)` : '';
       updateAiStreamBubble(noticeDiv, `✅ Thầy/Cô đã đọc xong file **${file.name}**${pageInfo}. Bây giờ em có thể hỏi bất cứ điều gì về nội dung file này nhé! 📖`, false);
     }
+    loadPlanInfo();
   } catch (err) {
     updateAiStreamBubble(noticeDiv, '🔌 Không tải được file lên server. Em thử lại nhé!', false);
   }
 }
-
 document.getElementById('fileInput').addEventListener('change', function (e) {
   if (e.target.files.length) processFile(e.target.files[0]);
   e.target.value = '';
@@ -1820,6 +2116,7 @@ window.onload = () => {
   loadProjects();
   loadConversations();
   loadBanner();
+  loadPlanInfo();
 };
 </script>
 </body>
@@ -1835,7 +2132,7 @@ SECURITY_HTML = r'''
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Bảo mật ứng dụng StudyMate AI Pro với HTTPS</title>
+    <title>Bảo mật ứng dụng StudyMate AI với HTTPS</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>
@@ -1872,7 +2169,7 @@ SECURITY_HTML = r'''
     <main class="max-w-7xl mx-auto px-4 py-8 sm:px-6 lg:px-8">
 
         <header class="mb-12 text-center">
-            <h1 class="text-4xl font-extrabold text-gray-900 mb-4">Nâng cấp Bảo mật cho StudyMate AI Pro</h1>
+            <h1 class="text-4xl font-extrabold text-gray-900 mb-4">Nâng cấp Bảo mật cho StudyMate AI</h1>
             <p class="text-lg text-gray-600 max-w-3xl mx-auto">
                 Làm thế nào để đưa ứng dụng <code class="bg-gray-200 px-2 py-1 rounded">app.py</code> từ môi trường Local lên môi trường Web Secured (HTTPS)
                 với biểu tượng ổ khóa an toàn mà không cần thay đổi logic Flask.
@@ -2071,7 +2368,7 @@ server {
 
     <footer class="bg-gray-900 text-gray-400 py-12 px-4">
         <div class="max-w-7xl mx-auto text-center">
-            <p class="mb-4">Báo cáo được thực hiện cho dự án StudyMate AI Pro</p>
+            <p class="mb-4">Báo cáo được thực hiện cho dự án StudyMate AI</p>
             <div class="flex justify-center gap-6 text-sm">
                 <span>Tình trạng mã nguồn: <span class="text-emerald-500">Giữ nguyên logic gốc</span></span>
                 <span>Tiêu chuẩn: <span class="text-blue-500">Web Secured 2024</span></span>
@@ -2138,7 +2435,7 @@ DEV_STATS_HTML = r'''
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Thống kê sử dụng — StudyMate AI Pro</title>
+  <title>Thống kê sử dụng — StudyMate AI Max</title>
   <script src="https://cdn.tailwindcss.com"></script>
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.6.0/css/all.min.css">
   <style>
@@ -2358,6 +2655,7 @@ DEV_STATS_HTML = r'''
             <th class="py-2 pr-3">ID</th>
             <th class="py-2 pr-3">Người dùng</th>
             <th class="py-2 pr-3">Vai trò</th>
+            <th class="py-2 pr-3">Gói</th>
             <th class="py-2 pr-3">Ngày tạo</th>
             <th class="py-2 text-right">Hành động</th>
           </tr>
@@ -2372,6 +2670,12 @@ DEV_STATS_HTML = r'''
                 {{ role_meta[u.role].icon }} {{ role_meta[u.role].label }}
               </span>
               {% if u.is_locked %}<span class="ml-1 text-[10px] font-semibold px-1.5 py-0.5 rounded bg-red-600 text-white">ĐÃ KHOÁ</span>{% endif %}
+            </td>
+            <td class="py-2.5 pr-3">
+              <span class="text-[11px] font-semibold px-2 py-0.5 rounded-full {{ plan_meta[u.effective_plan].badge }}">
+                {{ plan_meta[u.effective_plan].icon }} {{ plan_meta[u.effective_plan].label }}
+              </span>
+              {% if u.plan_is_role_based %}<span class="ml-1 text-[10px] text-gray-400 italic">(theo vai trò)</span>{% endif %}
             </td>
             <td class="py-2.5 pr-3 text-gray-400">{{ u.created_at[:10] }}</td>
             <td class="py-2.5 text-right">
@@ -2393,6 +2697,17 @@ DEV_STATS_HTML = r'''
                   </select>
                   <button type="submit" class="text-xs font-semibold px-2.5 py-1.5 rounded-lg bg-indigo-50 dark:bg-indigo-900/30 text-indigo-600 dark:text-indigo-400 hover:bg-indigo-100">Cập nhật</button>
                 </form>
+
+                {% if u.role == 'user' %}
+                <form method="POST" action="{{ url_for('developer_change_plan', user_id=u.id) }}" class="inline-flex items-center gap-1">
+                  <select name="plan" class="text-xs px-2 py-1.5 rounded-lg bg-gray-100 dark:bg-gray-800 border-0 focus:outline-none focus:ring-1 focus:ring-indigo-500">
+                    {% for p in plan_order %}
+                    <option value="{{ p }}" {{ 'selected' if u.plan == p else '' }}>{{ plan_meta[p].icon }} {{ plan_meta[p].label }}</option>
+                    {% endfor %}
+                  </select>
+                  <button type="submit" class="text-xs font-semibold px-2.5 py-1.5 rounded-lg bg-emerald-50 dark:bg-emerald-900/30 text-emerald-600 dark:text-emerald-400 hover:bg-emerald-100">Đổi gói</button>
+                </form>
+                {% endif %}
 
                 <form method="POST" action="{{ url_for('developer_toggle_lock', user_id=u.id) }}" class="inline"
                   onsubmit="return {{ 'true' if u.is_locked else 'confirm(\'Khoá tài khoản này?\')' }};">
@@ -2630,6 +2945,11 @@ def logout():
 @login_required
 def home():
     role = current_user_role()
+    user = current_user()
+    plan = effective_plan(user)
+    unlocked_by_plan = {
+        p: [k for k in THINKING_MODE_ORDER if thinking_mode_unlocked(k, p)] for p in PLAN_ORDER
+    }
     return render_template_string(
         HTML,
         username=session.get('username', ''),
@@ -2638,6 +2958,16 @@ def home():
         role_label=role_meta(role)['label'],
         is_developer=(role_rank(role) >= role_rank('developer')),
         is_admin=(role_rank(role) >= role_rank('admin')),
+        app_name=app_display_name(user),
+        current_plan=plan,
+        plan_order=PLAN_ORDER,
+        plan_meta=PLAN_META,
+        plan_limits=PLAN_LIMITS,
+        is_plan_role_based=(role_rank(role) >= role_rank('developer')),
+        thinking_modes=THINKING_MODES,
+        thinking_mode_order=THINKING_MODE_ORDER,
+        unlocked_thinking_modes=unlocked_by_plan[plan],
+        unlocked_by_plan=unlocked_by_plan,
     )
 
 
@@ -2736,7 +3066,7 @@ def developer_stats():
         })
 
     all_users = db.execute(
-        'SELECT id, username, role, created_at, is_locked, lock_reason FROM users ORDER BY id ASC'
+        'SELECT id, username, role, plan, created_at, is_locked, lock_reason FROM users ORDER BY id ASC'
     ).fetchall()
 
     token_row = db.execute(
@@ -2761,9 +3091,11 @@ def developer_stats():
         subject_stats=subject_stats,
         mode_stats=mode_stats,
         top_users=top_users,
-        all_users=[dict(u) for u in all_users],
+        all_users=[dict(u, effective_plan=effective_plan(u), plan_is_role_based=(role_rank(u['role']) >= role_rank('developer'))) for u in all_users],
         role_meta=ROLE_META,
         role_rank_map={r: role_rank(r) for r in ROLE_ORDER},
+        plan_meta=PLAN_META,
+        plan_order=PLAN_ORDER,
         current_role=role,
         is_admin=(role_rank(role) >= role_rank('admin')),
         is_super_admin=(role_rank(role) >= role_rank('super_admin')),
@@ -2809,6 +3141,34 @@ def developer_change_role(user_id):
     db.commit()
     write_audit('change_role', target['username'], f"{target['role']} → {new_role}")
     flash(f"Đã đổi vai trò của '{target['username']}' thành {role_meta(new_role)['label']}.")
+    return redirect(url_for('developer_stats'))
+
+
+@app.route('/developer/users/<int:user_id>/plan', methods=['POST'])
+@admin_required
+def developer_change_plan(user_id):
+    """Gán gói Free/Premium/Max cho 1 tài khoản (không có cổng thanh toán thật — đây là cách
+    Admin "nâng cấp" thủ công cho học sinh). Không áp dụng cho Developer trở lên vì các vai
+    trò đó đã luôn có Max vô điều kiện (xem effective_plan())."""
+    db = get_db()
+    target = db.execute('SELECT id, role, username, plan FROM users WHERE id = ?', (user_id,)).fetchone()
+    if not target:
+        flash('Không tìm thấy tài khoản.')
+        return redirect(url_for('developer_stats'))
+
+    if role_rank(target['role']) >= role_rank('developer'):
+        flash(f"'{target['username']}' đã tự động có gói Max theo vai trò, không cần đổi gói.")
+        return redirect(url_for('developer_stats'))
+
+    new_plan = (request.form.get('plan') or '').strip()
+    if new_plan not in PLAN_ORDER:
+        flash('Gói không hợp lệ.')
+        return redirect(url_for('developer_stats'))
+
+    db.execute('UPDATE users SET plan = ? WHERE id = ?', (new_plan, user_id))
+    db.commit()
+    write_audit('change_plan', target['username'], f"{target['plan']} → {new_plan}")
+    flash(f"Đã đổi gói của '{target['username']}' thành {plan_meta(new_plan)['label']}.")
     return redirect(url_for('developer_stats'))
 
 
@@ -2988,7 +3348,7 @@ AUDIT_LOG_HTML = r'''
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Nhật ký hệ thống - StudyMate AI Pro</title>
+  <title>Nhật ký hệ thống - StudyMate AI Max</title>
   <script src="https://cdn.tailwindcss.com"></script>
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.6.0/css/all.min.css">
 </head>
@@ -3042,11 +3402,14 @@ def developer_audit_log():
 # ==========================================
 # 7. GỌI API AI (xAI / Consolex-compatible) — STREAMING
 # ==========================================
-def stream_consolex_ai(system_prompt: str, user_content):
+def stream_consolex_ai(system_prompt: str, user_content, max_tokens: int = 800):
     """Gọi xAI API ở chế độ stream=True và yield từng đoạn token nhận được.
 
     Dùng SESSION (requests.Session) để tái sử dụng kết nối TCP/TLS,
     giúp giảm độ trễ so với việc tạo kết nối mới mỗi lần gọi.
+
+    `max_tokens` thay đổi theo "Chế độ suy nghĩ" đang chọn (Trợ Lý/Học Giả/Giáo Sư/Thiên Tài)
+    — chế độ càng sâu thì ngân sách token càng cao để AI có "chỗ" suy luận/giải thích kỹ hơn.
     """
     if not XAI_API_KEY:
         raise RuntimeError("Thiếu XAI_API_KEY. Vui lòng thiết lập biến môi trường trước khi chạy server.")
@@ -3073,7 +3436,7 @@ def stream_consolex_ai(system_prompt: str, user_content):
             {"role": "user", "content": user_content},
         ],
         "temperature": temperature,
-        "max_tokens": 800,
+        "max_tokens": max_tokens,
         "stream": True,
     }
 
@@ -3105,18 +3468,18 @@ def stream_consolex_ai(system_prompt: str, user_content):
 # ==========================================
 # 8. UPLOAD FILE / ẢNH
 # ==========================================
-def _truncate_text(full_text: str, unlimited: bool = False) -> str:
-    if unlimited:
+def _truncate_text(full_text: str, text_limit=None) -> str:
+    if text_limit is None:
         return full_text
-    truncated = full_text[:MAX_FILE_CHARS]
-    if len(full_text) > MAX_FILE_CHARS:
-        truncated += "\n\n[... nội dung bị cắt bớt do quá dài ...]"
+    truncated = full_text[:text_limit]
+    if len(full_text) > text_limit:
+        truncated += "\n\n[... nội dung bị cắt bớt do quá dài — nâng cấp gói để trích xuất được nhiều hơn ...]"
     return truncated
 
 
-def handle_pdf_upload(f, unlimited=False):
+def handle_pdf_upload(raw, text_limit=None):
     try:
-        reader = PdfReader(f.stream)
+        reader = PdfReader(io.BytesIO(raw))
         num_pages = len(reader.pages)
         text_parts = []
         for page in reader.pages:
@@ -3131,18 +3494,18 @@ def handle_pdf_upload(f, unlimited=False):
                          "Em thử gõ trực tiếp câu hỏi hoặc nội dung cần hỏi nhé!"
             }), 200
 
-        return jsonify({"text": _truncate_text(full_text, unlimited), "pages": num_pages})
+        return jsonify({"text": _truncate_text(full_text, text_limit), "pages": num_pages})
     except Exception as e:
         return jsonify({"error": f"Không đọc được file PDF: {e}"}), 500
 
 
-def handle_docx_upload(f, unlimited=False):
+def handle_docx_upload(raw, text_limit=None):
     if docx_lib is None:
         return jsonify({
             "error": "Server chưa cài thư viện đọc Word. Vui lòng chạy: pip install python-docx"
         }), 500
     try:
-        document = docx_lib.Document(f.stream)
+        document = docx_lib.Document(io.BytesIO(raw))
         paragraphs = [p.text for p in document.paragraphs if p.text.strip()]
         # Cũng lấy nội dung trong các bảng (table) nếu có.
         for table in document.tables:
@@ -3155,14 +3518,13 @@ def handle_docx_upload(f, unlimited=False):
         if not full_text:
             return jsonify({"error": "File Word này không có nội dung văn bản để đọc."}), 200
 
-        return jsonify({"text": _truncate_text(full_text, unlimited), "pages": None})
+        return jsonify({"text": _truncate_text(full_text, text_limit), "pages": None})
     except Exception as e:
         return jsonify({"error": f"Không đọc được file Word: {e}"}), 500
 
 
-def handle_text_upload(f, unlimited=False):
+def handle_text_upload(raw, text_limit=None):
     try:
-        raw = f.read()
         try:
             text = raw.decode('utf-8')
         except UnicodeDecodeError:
@@ -3172,18 +3534,14 @@ def handle_text_upload(f, unlimited=False):
         if not text:
             return jsonify({"error": "File này không có nội dung."}), 200
 
-        return jsonify({"text": _truncate_text(text, unlimited), "pages": None})
+        return jsonify({"text": _truncate_text(text, text_limit), "pages": None})
     except Exception as e:
         return jsonify({"error": f"Không đọc được file: {e}"}), 500
 
 
-def handle_image_upload(f, filename, ext, unlimited=False):
-    raw = f.read()
-    if not unlimited and len(raw) > MAX_IMAGE_BYTES:
-        return jsonify({
-            "error": f"Ảnh quá lớn (>{MAX_IMAGE_BYTES // (1024 * 1024)}MB). Em thử ảnh nhỏ hơn nhé!"
-        }), 400
-
+def handle_image_upload(raw, filename, ext):
+    # Dung lượng đã được kiểm tra theo gói (Free/Premium/Max) ở route /api/upload trước khi
+    # gọi tới đây, nên không cần kiểm tra lại giới hạn cứng ở bước này nữa.
     mime_map = {
         '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
         '.gif': 'image/gif', '.webp': 'image/webp',
@@ -3220,6 +3578,14 @@ def handle_image_upload(f, filename, ext, unlimited=False):
     return jsonify({"type": "image", "dataUrl": data_url, "name": filename})
 
 
+def _uploads_used_last_24h(user_id):
+    window_start = (datetime.now(timezone.utc) - timedelta(hours=UPLOAD_QUOTA_WINDOW_HOURS)).isoformat()
+    return get_db().execute(
+        'SELECT COUNT(*) c FROM file_uploads WHERE user_id = ? AND created_at >= ?',
+        (user_id, window_start)
+    ).fetchone()['c']
+
+
 @app.route('/api/upload', methods=['POST'])
 @login_required
 def upload_file():
@@ -3230,23 +3596,76 @@ def upload_file():
     filename = f.filename or ''
     ext = os.path.splitext(filename.lower())[1]
 
-    # Admin trở lên: không bị giới hạn dung lượng ảnh (6MB) hay độ dài văn bản trích xuất (12,000
-    # ký tự) — chỉ còn bị giới hạn bởi mức trần cứng của toàn server (MAX_CONTENT_LENGTH, 50MB/request).
-    unlimited = role_rank(current_user_role()) >= role_rank('admin')
+    if ext not in ALLOWED_IMAGE_EXT and ext not in ALLOWED_DOC_EXT:
+        return jsonify({
+            "error": f"Định dạng {ext or 'không xác định'} chưa được hỗ trợ. "
+                     "Em thử PDF, Word (.docx), .txt, .csv hoặc ảnh (PNG/JPG/GIF/WEBP) nhé!"
+        }), 400
+
+    user = current_user()
+    plan = effective_plan(user)
+    limits = plan_limits(plan)
+    label = plan_meta(plan)['label']
+
+    # 1) Giới hạn dung lượng MỖI file/ảnh theo gói (Free ≤20MB, Premium ≤500MB, Max ≤1GB).
+    raw = f.read()
+    size_mb = len(raw) / (1024 * 1024)
+    if size_mb > limits['max_file_mb']:
+        return jsonify({
+            "error": f"File/ảnh này khoảng {size_mb:.1f}MB, vượt quá giới hạn {limits['max_file_mb']}MB "
+                     f"của gói {label}. " + ("Em thử file nhỏ hơn nhé!" if plan == 'max'
+                                              else "Em thử file nhỏ hơn hoặc nâng cấp gói nhé!")
+        }), 400
+
+    # 2) Giới hạn SỐ LƯỢT tải file/ảnh trong 24h gần nhất theo gói (Free: 20, Premium: 50,
+    #    Max: không giới hạn). Đếm theo cửa sổ trượt 24h, tự "làm mới" dần theo thời gian.
+    if limits['daily_uploads'] is not None:
+        used = _uploads_used_last_24h(user['id'])
+        if used >= limits['daily_uploads']:
+            return jsonify({
+                "error": f"Em đã dùng hết {limits['daily_uploads']} lượt tải file/ảnh trong 24h qua "
+                         f"(gói {label}). Giới hạn sẽ tự làm mới dần trong vòng 24h tới, hoặc nâng cấp "
+                         "gói để có thêm lượt tải nhé!"
+            }), 429
+
+    kind = 'image' if ext in ALLOWED_IMAGE_EXT else 'file'
+    db = get_db()
+    db.execute(
+        'INSERT INTO file_uploads (user_id, kind, size_bytes, created_at) VALUES (?, ?, ?, ?)',
+        (user['id'], kind, len(raw), now_iso())
+    )
+    db.commit()
 
     if ext in ALLOWED_IMAGE_EXT:
-        return handle_image_upload(f, filename, ext, unlimited)
+        return handle_image_upload(raw, filename, ext)
     if ext == '.pdf':
-        return handle_pdf_upload(f, unlimited)
+        return handle_pdf_upload(raw, limits['text_chars'])
     if ext == '.docx':
-        return handle_docx_upload(f, unlimited)
-    if ext in ('.txt', '.csv'):
-        return handle_text_upload(f, unlimited)
+        return handle_docx_upload(raw, limits['text_chars'])
+    return handle_text_upload(raw, limits['text_chars'])
 
+
+@app.route('/api/plan', methods=['GET'])
+@login_required
+def api_plan():
+    """Thông tin gói hiện tại + số lượt tải file/ảnh đã dùng trong 24h — dùng để hiển thị
+    ở màn hình Cài đặt và hộp thoại Nâng cấp gói phía client."""
+    user = current_user()
+    plan = effective_plan(user)
+    limits = plan_limits(plan)
+    used = _uploads_used_last_24h(user['id']) if limits['daily_uploads'] is not None else 0
     return jsonify({
-        "error": f"Định dạng {ext or 'không xác định'} chưa được hỗ trợ. "
-                 "Em thử PDF, Word (.docx), .txt, .csv hoặc ảnh (PNG/JPG/GIF/WEBP) nhé!"
-    }), 400
+        'plan': plan,
+        'label': plan_meta(plan)['label'],
+        'icon': plan_meta(plan)['icon'],
+        'is_role_based': role_rank(user['role']) >= role_rank('developer'),
+        'daily_upload_limit': limits['daily_uploads'],
+        'daily_uploads_used': used,
+        'max_file_mb': limits['max_file_mb'],
+        'unlocked_thinking_modes': [
+            k for k in THINKING_MODE_ORDER if thinking_mode_unlocked(k, plan)
+        ],
+    })
 
 
 # ==========================================
@@ -3589,9 +4008,18 @@ def chat():
     image_data = (data.get('imageData') or '').strip()
     raw_conv_id = data.get('conversationId')
     raw_tutor_id = data.get('tutorId')
+    raw_thinking_mode = (data.get('thinkingMode') or 'standard').strip()
 
     role = current_user_role()
     unlimited = role_rank(role) >= role_rank('admin')  # Admin/Super Admin: không giới hạn độ dài tin nhắn
+
+    user_for_plan = current_user()
+    plan = effective_plan(user_for_plan)
+    # Chốt lại chế độ suy nghĩ hợp lệ theo gói — nếu client cố gửi thẳng 1 chế độ đang bị khoá
+    # (vd sửa tay request API), tự động rơi về "Trợ Lý" (standard) thay vì tin tưởng client.
+    thinking_mode = resolve_thinking_mode(raw_thinking_mode, plan)
+    tm_conf = THINKING_MODES[thinking_mode]
+    app_name = app_display_name(user_for_plan)
 
     # Chế độ bảo trì: chặn học sinh thường, Admin trở lên vẫn dùng được để kiểm tra hệ thống.
     if get_setting('maintenance_mode', 'off') == 'on' and role_rank(role) < role_rank('admin'):
@@ -3654,7 +4082,7 @@ def chat():
 
     if custom_tutor:
         system_prompt = f"""
-    Bạn là "{custom_tutor['name']}", một AI Tutor tuỳ chỉnh do chính người dùng tạo ra trên StudyMate AI Pro.
+    Bạn là "{custom_tutor['name']}", một AI Tutor tuỳ chỉnh do chính người dùng tạo ra trên {app_name}.
     Hãy làm theo đúng hướng dẫn/vai trò sau đây do người tạo đặt ra:
     ---
     {custom_tutor['system_prompt']}
@@ -3664,7 +4092,7 @@ def chat():
     """
     else:
         system_prompt = f"""
-    Bạn là StudyMate AI Pro, gia sư THCS (lớp 6-9) tận tâm.
+    Bạn là {app_name}, một gia sư AI tận tâm cho học sinh.
     Môn học: {subject}. Chế độ: {mode}.
     Quy tắc:
     1. Xưng "Thầy/Cô", gọi "em".
@@ -3678,6 +4106,14 @@ def chat():
     4. Với công thức/phép toán: LUÔN đặt trong cú pháp LaTeX chuẩn — công thức trên
        dòng riêng thì bọc trong "$$...$$", công thức ngắn giữa câu thì bọc trong
        "\\(...\\)". Không viết công thức dưới dạng chữ thường lẫn trong đoạn văn.
+    """
+
+    # "Chế độ suy nghĩ" (Trợ Lý/Học Giả/Giáo Sư/Thiên Tài) — Học Giả/Giáo Sư mở khoá từ gói
+    # Premium, Thiên Tài độc quyền gói Max. Chỉ thêm hướng dẫn khi khác "Trợ Lý" mặc định.
+    if tm_conf['prompt_hint']:
+        system_prompt += f"""
+
+    Chế độ suy nghĩ đang bật: "{tm_conf['icon']} {tm_conf['label']}". {tm_conf['prompt_hint']}
     """
 
     # Admin có thể thêm 1 đoạn hướng dẫn chung áp dụng cho MỌI cuộc trò chuyện (vd: quy định
@@ -3718,21 +4154,28 @@ def chat():
         user_content = user_message
 
     def generate():
-        yield f"data: {json.dumps({'conversationId': conv_id})}\n\n"
+        yield f"data: {json.dumps({'conversationId': conv_id, 'thinkingMode': thinking_mode})}\n\n"
         collected = []
         try:
-            for token in stream_consolex_ai(system_prompt, user_content):
+            for token in stream_consolex_ai(system_prompt, user_content, max_tokens=tm_conf['max_tokens']):
                 collected.append(token)
                 yield f"data: {json.dumps({'token': token})}\n\n"
 
             assistant_text = ''.join(collected).strip()
             if assistant_text:
-                db.execute(
-                    'INSERT INTO messages (conversation_id, role, content, created_at) VALUES (?, ?, ?, ?)',
-                    (conv_id, 'assistant', assistant_text, now_iso())
-                )
-                db.execute('UPDATE conversations SET updated_at = ? WHERE id = ?', (now_iso(), conv_id))
-                db.commit()
+                # Kết nối riêng (không dùng `db`/`g` của request) — xem giải thích chi tiết
+                # ở docstring của open_write_db(): tới lúc này request context gốc có thể
+                # đã bị teardown (đóng kết nối `db`) trước khi generator chạy tới đây.
+                write_conn = open_write_db()
+                try:
+                    write_conn.execute(
+                        'INSERT INTO messages (conversation_id, role, content, created_at) VALUES (?, ?, ?, ?)',
+                        (conv_id, 'assistant', assistant_text, now_iso())
+                    )
+                    write_conn.execute('UPDATE conversations SET updated_at = ? WHERE id = ?', (now_iso(), conv_id))
+                    write_conn.commit()
+                finally:
+                    write_conn.close()
 
             log_usage(user_id, subject, mode, len(user_message), len(assistant_text),
                       bool(file_context), bool(image_data), 'ok' if assistant_text else 'empty')
@@ -3771,7 +4214,7 @@ except Exception as e:
 
 if __name__ == '__main__':
     init_db()
-    print("🚀 StudyMate AI Pro đang chạy... Truy cập: http://localhost:5000")
+    print("🚀 StudyMate AI đang chạy... Truy cập: http://localhost:5000")
     print("👤 Trang đăng nhập: http://localhost:5000/login")
     print(f"🔑 Đăng nhập Google: {'BẬT' if GOOGLE_OAUTH_ENABLED else 'tắt (chưa cấu hình .env)'}")
     print("🛡️ Để xem bảng báo cáo bảo mật... Truy cập: http://localhost:5000/security")
