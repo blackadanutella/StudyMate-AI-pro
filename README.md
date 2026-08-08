@@ -60,6 +60,8 @@ CONSOLEX_MODEL=grok-4.5
 SECRET_KEY=mot-chuoi-ngau-nhien-that-dai-va-kho-doan
 ```
 
+Muốn bật thanh toán thật cho Premium/Max, xem thêm biến `.env` cho VNPAY/VietQR ở mục 14.
+
 Chạy:
 
 ```bash
@@ -177,7 +179,7 @@ Trang `/developer` có thêm mục **"Quản lý hệ thống"**:
 
 ## 10. Gói sử dụng: Free / Premium / Max (mới)
 
-> ⚠️ Lưu ý: bản `app.py` bạn gửi lần này là một nhánh phát triển khác với các bản trước (đã có sẵn hệ thống vai trò `user → developer → admin → super_admin`, AI Tutor tuỳ chỉnh, nhật ký audit, v.v. — xem mục 12). Mục 10–11 dưới đây là phần mình vừa hoàn thiện theo đúng yêu cầu mới nhất của bạn. Hai mục "Báo lỗi câu trả lời" / "Bộ nhớ AI" ở bản README cũ **không có trong nhánh `app.py` này** nên đã được gỡ khỏi tài liệu để tránh nhầm lẫn — nếu bạn vẫn muốn 2 tính năng đó trong nhánh này, cứ nhắn mình làm tiếp.
+> ⚠️ Lưu ý: bản `app.py` bạn gửi lần này là một nhánh phát triển khác với các bản trước (đã có sẵn hệ thống vai trò `user → developer → admin → super_admin`, AI Tutor tuỳ chỉnh, nhật ký audit, v.v. — xem mục 13). Mục 10–11 dưới đây là phần mình vừa hoàn thiện theo đúng yêu cầu mới nhất của bạn (mục 10 nay đã cập nhật để khớp với cổng thanh toán thật ở mục 14). "Báo lỗi câu trả lời", "Bộ nhớ AI" và điểm thưởng/chuỗi ngày học (gamification) **đã có sẵn** trong nhánh này — xem mục 16.
 
 Đã bỏ hẳn chữ **"Pro"** khỏi mọi nơi hiển thị cho tài khoản thường — tên app giờ đổi động theo gói:
 
@@ -189,9 +191,9 @@ Trang `/developer` có thêm mục **"Quản lý hệ thống"**:
 
 - Cột `plan` mới trong bảng `users` (mặc định `'free'`) lưu gói do Admin gán thủ công — **nhưng** tài khoản có vai trò `developer`/`admin`/`super_admin` luôn được tính là **Max vô điều kiện** ngay cả khi cột `plan` vẫn ghi `'free'` (hàm `effective_plan()` ưu tiên vai trò trước, không cần Admin phải gán tay cho từng dev). Vì vậy trang `/developer` **không cho đổi gói** với các tài khoản từ Developer trở lên (nút bị ẩn, kèm chú thích lý do).
 - Giới hạn *số lượt* đọc file/ảnh tính theo **cửa sổ trượt 24 giờ** (không phải theo lịch nửa đêm reset) — bảng mới `file_uploads` ghi lại mỗi lượt tải lên, cứ quá 24h thì lượt đó "hết hạn" và tự nhường chỗ cho lượt mới. Giới hạn dung lượng còn siết luôn cả bước trích chữ từ PDF/Word: Free cắt ở ~12.000 ký tự, Premium ~48.000 ký tự, Max không cắt.
-- **Đổi gói (Admin trở lên)**: bảng "Toàn bộ tài khoản" ở `/developer` có thêm cột **Gói** + dropdown đổi gói tại chỗ (`POST /developer/users/<id>/plan`), có ghi audit log.
-- **Xem gói + hạn mức của chính mình**: `GET /api/plan` trả về gói hiện tại, đã dùng bao nhiêu/bao nhiêu lượt hôm nay, có phải "miễn phí theo vai trò" không. Hiển thị ngay trong **Cài đặt** (thanh tiến trình nhỏ, tự làm mới sau mỗi lần tải file).
-- **Hộp thoại "Nâng cấp gói"** làm lại hoàn toàn: hiện đúng 3 cột Free/Premium/Max với số liệu thật (không còn số liệu giả), tự khoanh viền cột gói hiện tại của người xem, và liệt kê luôn các Chế độ suy nghĩ mở khoá ở từng gói (xem mục 11). Chưa có cổng thanh toán thật — bấm nút ở 2 cột còn lại chỉ hiện "Chưa khả dụng", đúng như bản trước.
+- **Đổi gói (Admin trở lên)**: bảng "Toàn bộ tài khoản" ở `/developer` có thêm cột **Gói** + dropdown đổi gói tại chỗ (`POST /developer/users/<id>/plan`), có ghi audit log. Đổi sang Free thì xoá hạn dùng ngay; đổi sang Premium/Max thì **chỉ tặng đúng 1 tháng miễn phí** (dùng chung hàm `grant_plan_upgrade()` với cổng thanh toán thật ở mục 14, không phải gán vĩnh viễn) — hết hạn tự rơi về Free như một lượt nâng cấp bình thường.
+- **Xem gói + hạn mức của chính mình**: `GET /api/plan` trả về gói hiện tại, hạn dùng còn lại (nếu là gói trả phí), đã dùng bao nhiêu/bao nhiêu lượt hôm nay, có phải "miễn phí theo vai trò" không, và có đang được hưởng ưu đãi lần đầu không. Hiển thị ngay trong **Cài đặt** (thanh tiến trình nhỏ, tự làm mới sau mỗi lần tải file).
+- **Hộp thoại "Nâng cấp gói"**: hiện đúng 3 cột Free/Premium/Max với số liệu thật, tự khoanh viền cột gói hiện tại của người xem, liệt kê các Chế độ suy nghĩ mở khoá ở từng gói (xem mục 11), và **giờ có cổng thanh toán thật** — xem chi tiết ở mục 14.
 
 ## 11. Chế độ suy nghĩ của AI: Trợ Lý / Học Giả / Giáo Sư / Thiên Tài (mới)
 
@@ -223,6 +225,49 @@ Trong lúc kiểm thử tính năng ở mục 10–11, phát hiện một lỗi 
 
 Để tránh trùng lặp tài liệu, đây là danh sách nhanh những gì `app.py` bạn gửi **đã có sẵn** trước khi mình động vào (mình chỉ dùng/nối thêm vào, không viết lại): hệ thống vai trò 4 cấp `user → developer → admin → super_admin` (`ROLE_ORDER`/`role_rank()`), khoá/mở khoá tài khoản, reset session, xoá tài khoản, AI Tutor tuỳ chỉnh (`/api/tutors`), API key cá nhân (`/api/keys`, `/api/v1/ping`), Playground thử prompt cho Developer trở lên, ghi đè model/temperature/system-prompt chung không cần restart, chế độ bảo trì, và nhật ký audit (`/developer/audit`, chỉ Super Admin xem được). Nếu cần tài liệu chi tiết cho từng phần này, cho mình biết để viết bổ sung.
 
+## 14. Nâng cấp gói: thanh toán thật theo tháng + ưu đãi lần đầu (mới)
+
+Gói Premium/Max giờ là **thuê bao theo THÁNG** (không còn "gán vĩnh viễn"), có 2 cách thanh toán:
+
+| Gói | Giá gốc | Ưu đãi lần đầu |
+|---|---|---|
+| 💎 Premium | 30.000đ/tháng | **50%** cho 3 tháng đầu → 15.000đ/tháng |
+| 🚀 Max | 50.000đ/tháng | **50%** cho 3 tháng đầu → 25.000đ/tháng |
+
+- **Ưu đãi lần đầu**: đếm theo tổng số đơn **đã thanh toán thành công** trong lịch sử tài khoản (`payment_orders.status = 'paid'`), không phân biệt Premium hay Max — đủ 3 đơn thì từ đơn thứ 4 trở đi tính giá bình thường, không cần làm gì thêm. Chỉnh mức % hoặc số tháng ưu đãi ở 2 hằng số `FIRST_TIME_DISCOUNT_PCT` / `FIRST_TIME_DISCOUNT_MONTHS` đầu file `app.py`.
+- **Hết hạn tự rơi về Free**: mỗi lượt thanh toán chỉ cấp đúng 1 tháng (cột `plan_expires_at` mới trong bảng `users`), tính lại từ **thời điểm thanh toán** (không cộng dồn nếu gia hạn sớm). Hết hạn mà chưa thanh toán tiếp thì `effective_plan()` tự trả về Free ngay lần tải trang kế tiếp — không cần cron job/background task nào.
+- **2 phương thức thanh toán**, cấu hình qua `.env` (thiếu biến nào thì phương thức đó tự ẩn khỏi giao diện, không lỗi):
+  ```
+  # VNPAY (thẻ ATM nội địa/Visa/Mastercard/JCB) — đăng ký merchant tại https://vnpay.vn
+  VNPAY_TMN_CODE=xxxxxxxx
+  VNPAY_HASH_SECRET=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+  VNPAY_PAYMENT_URL=https://sandbox.vnpayment.vn/paymentv2/vpcpay.html   # đổi sang URL production khi go-live
+
+  # Chuyển khoản VietQR (quét mã QR bằng app ngân hàng/MoMo/ZaloPay) — không cần đăng ký merchant
+  VIETQR_BANK_ID=mbbank          # tên ngân hàng hoặc mã BIN, xem danh sách tại vietqr.io
+  VIETQR_ACCOUNT_NO=xxxxxxxxxxxx
+  VIETQR_ACCOUNT_NAME=NGUYEN VAN A
+  ```
+  - VNPAY chốt đơn **tự động** qua IPN (`vnpay_ipn()`), có xác thực chữ ký HMAC-SHA512 — không tin bất kỳ tham số nào từ trình duyệt gửi lên.
+  - Chuyển khoản VietQR chốt đơn **thủ công**: Admin vào `/developer` bấm "Xác nhận đã nhận tiền" sau khi kiểm tra sao kê (app không có quyền đọc sao kê ngân hàng tự động).
+- **Admin "tặng" gói cho học sinh**: vẫn thao tác y hệt mục 10 (đổi gói trực tiếp từ `/developer`), nhưng giờ dùng chung logic với cổng thanh toán thật nên **chỉ tặng đúng 1 tháng miễn phí**, không phải vĩnh viễn — hết tháng đó học sinh cần tự thanh toán tiếp (hoặc Admin tặng lại) như mọi tài khoản khác. Không áp dụng cho tài khoản Developer trở lên vì các vai trò đó đã luôn có Max vô điều kiện.
+- Hộp thoại "Nâng cấp gói" tự hiện huy hiệu "🎁 Giảm 50% — còn N tháng ưu đãi" + giá gốc gạch ngang khi tài khoản còn đủ điều kiện; hết ưu đãi thì tự quay lại hiện giá gốc, không cần Admin can thiệp.
+
+⚠️ Chưa có: gia hạn tự động trừ tiền định kỳ (app không lưu thông tin thẻ để làm việc đó — học sinh cần tự vào lại nâng cấp mỗi tháng), hoá đơn/biên lai điện tử, hoàn tiền.
+
+## 15. Sửa lỗi giao diện (mới)
+
+- **Nút "Báo lỗi" dưới câu trả lời AI bị vô hình**: nút vẫn nằm trong DOM và bấm được, nhưng CSS `.ai-msg-group:hover .msg-actions` yêu cầu nút phải là **con** của khung tin nhắn để hiện khi rê chuột — trong khi JS lại chèn nút bằng `wrapper.after(bar)`, tức là **anh em cùng cấp**, không phải con, nên `opacity` luôn bằng 0. Đã đổi sang bộ chọn anh em `.ai-msg-group:hover ~ .msg-actions` + thêm `:hover`/`:focus-within` riêng cho nút để cả di động (không có hover) và bàn phím đều bấm được.
+- **Nút chuyển giao diện Sáng/Tối không đổi gì cả**: Tailwind được nhúng qua CDN (`cdn.tailwindcss.com`), mặc định chế độ tối theo `prefers-color-scheme` của hệ điều hành (`darkMode: 'media'`) — nghĩa là JS tự bật/tắt class `dark` trên thẻ `<html>` **không có tác dụng gì** với các lớp `dark:` nếu không khai báo lại. Đã thêm `<script>tailwind.config = { darkMode: 'class' }</script>` ngay sau mỗi lần nhúng CDN Tailwind (6 trang HTML trong `app.py`) để JS điều khiển được thật.
+- **Avatar robot có hiệu ứng "đang suy nghĩ"**: một dải sáng quét dọc từ **dưới lên trên**, lặp lại — chạy nhanh & rõ trên avatar khi AI đang trả lời, chạy chậm & mờ liên tục ở logo robot trong sidebar để làm avatar chung của cả web.
+- **Lỗi "Cannot operate on a closed database" do tự restart giữa lúc đang trả lời**: nguyên nhân khác với lỗi đã sửa ở mục 12 (đó là do `teardown_appcontext` đóng kết nối sớm; lỗi này là do Werkzeug **tự restart cả tiến trình**). Khi chạy bằng `python app.py` với `debug=True`, Werkzeug mặc định bật `use_reloader` — theo dõi thư mục dự án, hễ có file thay đổi là tự khởi động lại server. Vì `studymate.db` (SQLite) bị ghi mỗi khi có tin nhắn mới, nó cũng bị tính là "file thay đổi" → server tự restart ngay giữa lúc đang stream câu trả lời, kết nối SQLite của request đó bị đóng đột ngột. Đã thêm `use_reloader=False` vào `app.run(...)` ở cuối file để tắt cơ chế tự restart này (vẫn giữ `debug=True` để còn thấy traceback khi phát triển) — sửa xong code thì tự dừng (`Ctrl+C`) và chạy lại thủ công.
+
+## 16. Báo lỗi câu trả lời, Bộ nhớ AI, Điểm thưởng & Chuỗi ngày học (đã có sẵn trong nhánh này)
+
+- **Báo lỗi câu trả lời**: mỗi câu trả lời của AI có nút "Báo lỗi" (hiện khi rê chuột/chạm vào tin nhắn — xem lỗi hiển thị đã sửa ở mục 15), mở hộp thoại cho học sinh chọn lý do + ghi chú thêm, lưu vào `/developer` để Admin xem và đánh dấu đã xử lý.
+- **Bộ nhớ AI**: AI tự trích và ghi nhớ vài thông tin học sinh nhắc tới trong lúc trò chuyện (vd: đang học lớp mấy) để cá nhân hoá câu trả lời sau này — có toast nhỏ báo "Đã ghi nhớ: ..." ngay khi xảy ra. Học sinh có thể xoá toàn bộ bộ nhớ này bất cứ lúc nào bằng nút **"Xoá bộ nhớ AI của tôi"** trong Cài đặt.
+- **Điểm thưởng (XP) & chuỗi ngày học**: mỗi lượt hỏi AI thành công được cộng XP, tính streak theo ngày (múi giờ VN, không tính 2 lượt cùng ngày là 2 ngày streak) — hiện ở góc sidebar. Có 4 thành tựu mở khoá tự động: 🧠 Bài học đầu tiên, 🔥 Chuỗi 7 ngày, 🏆 Chuỗi 30 ngày, 📚 100 câu hỏi — báo bằng toast khi vừa đạt được.
+
 ## Chưa làm (nằm ngoài phạm vi yêu cầu lần này)
 Phần đầu prompt gốc của bạn từng có yêu cầu dựng lại toàn bộ thành một sản phẩm Next.js/TypeScript quy mô lớn (nhiều trang, Dashboard, Blog, Pricing...). Bản cập nhật này vẫn giữ nguyên nền tảng Flask hiện có của bạn. Nếu bạn vẫn muốn bản Next.js quy mô lớn, đó sẽ là một dự án tách riêng — cho mình biết nếu bạn muốn triển khai.
 
@@ -230,4 +275,4 @@ Vài ý tưởng hợp lý để làm tiếp sau này (chưa làm, vì nằm ngo
 - Trang đổi mật khẩu cho tài khoản đăng nhập bằng mật khẩu (hiện chỉ có thể đổi qua thao tác thủ công trong DB).
 - Rate limiting cho `/login`, `/register` để chống spam/brute-force khi deploy công khai (gợi ý: `flask-limiter`).
 - Lưu "Chế độ suy nghĩ" đang chọn vào tuỳ chọn cá nhân để nhớ qua các lần đăng nhập (xem ghi chú cuối mục 11).
-- Cổng thanh toán thật cho Premium/Max (hiện Admin chỉ gán gói thủ công, chưa có Stripe/VNPay/Momo...).
+- Gia hạn tự động trừ tiền định kỳ, hoá đơn/biên lai điện tử, hoàn tiền (xem ghi chú cuối mục 14).
