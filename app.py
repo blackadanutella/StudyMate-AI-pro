@@ -169,10 +169,38 @@ def init_db():
     ''')
     conn.commit()
 
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS projects (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            name TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (user_id) REFERENCES users (id)
+        )
+    ''')
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS system_settings (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+    ''')
+    conn.commit()
+
     # ---- Di trú (migration) cho database cũ đã tồn tại trước khi có cột "role" ----
     existing_cols = [r[1] for r in conn.execute('PRAGMA table_info(users)').fetchall()]
     if 'role' not in existing_cols:
         conn.execute("ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT 'user'")
+        conn.commit()
+    if 'preferences' not in existing_cols:
+        conn.execute("ALTER TABLE users ADD COLUMN preferences TEXT")
+        conn.commit()
+
+    conv_cols = [r[1] for r in conn.execute('PRAGMA table_info(conversations)').fetchall()]
+    if 'pinned' not in conv_cols:
+        conn.execute("ALTER TABLE conversations ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0")
+        conn.commit()
+    if 'project_id' not in conv_cols:
+        conn.execute("ALTER TABLE conversations ADD COLUMN project_id INTEGER")
         conn.commit()
 
     # ---- Di trú cho đăng nhập Google (OAuth) ----
@@ -271,12 +299,13 @@ def developer_required(view):
     """Chỉ cho phép tài khoản có role = 'developer' truy cập (vd: trang thống kê)."""
     @wraps(view)
     def wrapped(*args, **kwargs):
+        wants_json = request.path.startswith('/api/') or request.method != 'GET'
         if not current_user_id():
-            if request.path.startswith('/api/'):
+            if wants_json:
                 return jsonify({"error": "Vui lòng đăng nhập để tiếp tục."}), 401
             return redirect(url_for('login_page', next=request.path))
         if current_user_role() != 'developer':
-            if request.path.startswith('/api/'):
+            if wants_json:
                 return jsonify({"error": "Bạn không có quyền truy cập chức năng này."}), 403
             flash('Tài khoản của em không có quyền truy cập trang này.')
             return redirect(url_for('home'))
@@ -299,6 +328,78 @@ def log_usage(user_id, subject, mode, message_chars, response_chars, had_file, h
     except Exception:
         # Không để lỗi ghi log ảnh hưởng tới trải nghiệm chat của học sinh.
         pass
+
+
+# ==========================================
+# 0.3. TÙY CHỌN NGƯỜI DÙNG (preferences), DỰ ÁN (projects), CÀI ĐẶT HỆ THỐNG
+# ==========================================
+DEFAULT_PREFERENCES = {
+    "theme": "system",       # light | dark | system
+    "language": "vi",        # vi | en
+    "default_subject": "",
+    "default_mode": "",
+}
+
+
+def get_preferences(user_id):
+    db = get_db()
+    row = db.execute('SELECT preferences FROM users WHERE id = ?', (user_id,)).fetchone()
+    prefs = dict(DEFAULT_PREFERENCES)
+    if row and row['preferences']:
+        try:
+            prefs.update(json.loads(row['preferences']))
+        except Exception:
+            pass
+    return prefs
+
+
+def set_preferences(user_id, updates):
+    prefs = get_preferences(user_id)
+    for k in DEFAULT_PREFERENCES:
+        if k in updates:
+            prefs[k] = updates[k]
+    db = get_db()
+    db.execute('UPDATE users SET preferences = ? WHERE id = ?', (json.dumps(prefs), user_id))
+    db.commit()
+    return prefs
+
+
+def get_setting(key, default=None):
+    db = get_db()
+    row = db.execute('SELECT value FROM system_settings WHERE key = ?', (key,)).fetchone()
+    if row is None:
+        return default
+    return row['value']
+
+
+def set_setting(key, value):
+    db = get_db()
+    db.execute(
+        'INSERT INTO system_settings (key, value) VALUES (?, ?) '
+        'ON CONFLICT(key) DO UPDATE SET value = excluded.value',
+        (key, value)
+    )
+    db.commit()
+
+
+def google_login_effective():
+    """Cờ bật/tắt đăng nhập Google tại runtime, do developer điều khiển, độc lập với .env.
+    Giá trị trong system_settings: 'on' / 'off' / (không đặt = theo cấu hình .env mặc định)."""
+    if not GOOGLE_OAUTH_ENABLED:
+        return False
+    override = get_setting('google_login_override')
+    if override == 'off':
+        return False
+    if override == 'on':
+        return True
+    return True  # mặc định: bật nếu .env đã cấu hình client id/secret
+
+
+def get_banner():
+    return {
+        "text": get_setting('banner_text', '') or '',
+        "active": get_setting('banner_active', '0') == '1',
+    }
 
 
 # ==========================================
@@ -498,6 +599,25 @@ HTML = r'''
 
     .attachment-chip img { border: 1px solid rgba(0,0,0,0.08); }
 
+    /* ---- Modal system ---- */
+    #modalOverlay.open { display: flex; }
+    .modal-card.open { display: block; }
+    .conv-item { position: relative; }
+    .conv-menu-btn { opacity: 0; }
+    .conv-item:hover .conv-menu-btn, .conv-menu-btn.force-visible { opacity: 1; }
+    .conv-menu-dropdown {
+      position: absolute; right: 0; top: 100%; margin-top: 4px; z-index: 30;
+      min-width: 160px; background: white; border: 1px solid #e5e7eb; border-radius: 0.75rem;
+      box-shadow: 0 10px 25px rgba(0,0,0,0.12); overflow: hidden;
+    }
+    .dark .conv-menu-dropdown { background: #1f2937; border-color: #374151; }
+    .conv-menu-dropdown button {
+      width: 100%; text-align: left; padding: 0.5rem 0.9rem; font-size: 0.8rem;
+      display: flex; align-items: center; gap: 0.5rem;
+    }
+    .conv-menu-dropdown button:hover { background: rgba(0,0,0,0.05); }
+    .dark .conv-menu-dropdown button:hover { background: rgba(255,255,255,0.08); }
+
     #sidebar { transition: transform 0.2s ease; }
     @media (max-width: 1023px) { #sidebar { transform: translateX(-100%); } #sidebar.open { transform: translateX(0); } }
 
@@ -523,14 +643,38 @@ HTML = r'''
       </button>
     </div>
 
-    <div class="px-3 mt-1">
+    <div class="px-3 mt-1 space-y-2">
       <button id="newChatBtn" class="w-full flex items-center gap-2 px-3 py-2.5 rounded-xl border border-gray-300 dark:border-gray-700 hover:bg-gray-100 dark:hover:bg-gray-800 font-medium text-sm transition-colors">
-        <i class="fas fa-plus"></i> Đoạn chat mới
+        <i class="fas fa-plus"></i> <span data-i18n="new_chat">Đoạn chat mới</span>
       </button>
+      <div class="relative">
+        <i class="fas fa-magnifying-glass absolute left-3 top-1/2 -translate-y-1/2 text-gray-400 text-xs"></i>
+        <input id="convSearchInput" type="text" data-i18n-placeholder="search_chats" placeholder="Tìm đoạn chat..."
+               class="w-full pl-8 pr-3 py-2 text-sm rounded-xl bg-gray-100 dark:bg-gray-800 border-0 focus:outline-none focus:ring-2 focus:ring-blue-500 dark:text-white">
+      </div>
     </div>
 
-    <div class="px-3 mt-4 mb-1 text-xs font-semibold text-gray-400 uppercase tracking-wide">Lịch sử trò chuyện</div>
-    <div id="convList" class="flex-1 overflow-y-auto px-3 pb-3 space-y-1 text-sm"></div>
+    <div class="px-3 mt-4 mb-1 flex items-center justify-between">
+      <span class="text-xs font-semibold text-gray-400 uppercase tracking-wide" data-i18n="projects">Dự án</span>
+      <button id="newProjectBtn" class="w-5 h-5 flex items-center justify-center rounded hover:bg-gray-200 dark:hover:bg-gray-800 text-gray-400" title="Tạo dự án mới">
+        <i class="fas fa-plus text-xs"></i>
+      </button>
+    </div>
+    <div id="projectList" class="px-3 space-y-0.5 text-sm"></div>
+
+    <div id="pinnedSection" class="hidden">
+      <div class="px-3 mt-4 mb-1 text-xs font-semibold text-gray-400 uppercase tracking-wide" data-i18n="pinned">Đã ghim</div>
+      <div id="pinnedList" class="px-3 space-y-0.5 text-sm"></div>
+    </div>
+
+    <div class="px-3 mt-4 mb-1 text-xs font-semibold text-gray-400 uppercase tracking-wide" data-i18n="recent">Gần đây</div>
+    <div id="convList" class="flex-1 overflow-y-auto px-3 pb-3 space-y-0.5 text-sm"></div>
+
+    <div id="systemBanner" class="hidden mx-3 mb-2 px-3 py-2 rounded-lg bg-indigo-50 dark:bg-indigo-900/30 border border-indigo-200 dark:border-indigo-800 text-xs text-indigo-700 dark:text-indigo-300 flex items-start gap-2">
+      <i class="fas fa-bullhorn mt-0.5"></i>
+      <span id="systemBannerText" class="flex-1"></span>
+      <button id="systemBannerClose" class="text-indigo-400 hover:text-indigo-600 flex-shrink-0"><i class="fas fa-xmark"></i></button>
+    </div>
 
     <div class="border-t border-gray-200 dark:border-gray-800 p-3 relative">
       <button id="userMenuBtn" type="button" class="w-full flex items-center gap-3 px-2 py-2 rounded-xl hover:bg-gray-100 dark:hover:bg-gray-800 transition-colors">
@@ -539,18 +683,109 @@ HTML = r'''
         <i class="fas fa-chevron-up text-xs text-gray-400"></i>
       </button>
       <div id="userMenu" class="hidden absolute bottom-[64px] left-3 right-3 bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-xl shadow-lg overflow-hidden z-10">
+        <button id="openSettingsBtn" type="button" class="w-full flex items-center gap-2 px-4 py-3 text-sm hover:bg-gray-100 dark:hover:bg-gray-700 text-left">
+          <i class="fas fa-gear text-gray-400 w-4"></i> <span data-i18n="settings">Cài đặt</span>
+        </button>
+        <button id="openHelpBtn" type="button" class="w-full flex items-center gap-2 px-4 py-3 text-sm hover:bg-gray-100 dark:hover:bg-gray-700 text-left">
+          <i class="fas fa-circle-question text-gray-400 w-4"></i> <span data-i18n="help">Trợ giúp &amp; phím tắt</span>
+        </button>
+        <button id="openUpgradeBtn" type="button" class="w-full flex items-center gap-2 px-4 py-3 text-sm hover:bg-gray-100 dark:hover:bg-gray-700 text-left border-b border-gray-100 dark:border-gray-700">
+          <i class="fas fa-arrow-up-right-dots text-gray-400 w-4"></i> <span data-i18n="upgrade">Nâng cấp gói</span>
+        </button>
         {% if is_developer %}
         <a href="/developer" class="flex items-center gap-2 px-4 py-3 text-sm hover:bg-gray-100 dark:hover:bg-gray-700 text-indigo-600 dark:text-indigo-400 border-b border-gray-100 dark:border-gray-700">
-          <i class="fas fa-chart-line"></i> Thống kê (Developer)
+          <i class="fas fa-chart-line w-4"></i> Thống kê (Developer)
         </a>
         {% endif %}
         <a href="/logout" class="flex items-center gap-2 px-4 py-3 text-sm hover:bg-gray-100 dark:hover:bg-gray-700 text-red-600 dark:text-red-400">
-          <i class="fas fa-right-from-bracket"></i> Đăng xuất
+          <i class="fas fa-right-from-bracket w-4"></i> <span data-i18n="logout">Đăng xuất</span>
         </a>
       </div>
     </div>
   </aside>
   <div id="sidebarOverlay" class="hidden fixed inset-0 bg-black/40 z-40 lg:hidden"></div>
+
+  <!-- ===================== MODALS ===================== -->
+  <div id="modalOverlay" class="hidden fixed inset-0 bg-black/50 z-[60] flex items-center justify-center p-4">
+
+    <div id="settingsModal" class="modal-card hidden bg-white dark:bg-gray-900 rounded-2xl shadow-2xl w-full max-w-md max-h-[85vh] overflow-y-auto">
+      <div class="flex items-center justify-between px-5 py-4 border-b border-gray-200 dark:border-gray-800">
+        <h3 class="font-semibold text-lg" data-i18n="settings">Cài đặt</h3>
+        <button class="modal-close-btn text-gray-400 hover:text-gray-600 w-8 h-8 flex items-center justify-center"><i class="fas fa-xmark"></i></button>
+      </div>
+      <div class="p-5 space-y-5 text-sm">
+        <div>
+          <label class="block font-medium mb-1.5" data-i18n="theme">Giao diện</label>
+          <select id="settingTheme" class="w-full px-3 py-2 rounded-lg bg-gray-100 dark:bg-gray-800 border-0 focus:outline-none focus:ring-2 focus:ring-blue-500 dark:text-white">
+            <option value="light" data-i18n="theme_light">Sáng</option>
+            <option value="dark" data-i18n="theme_dark">Tối</option>
+            <option value="system" data-i18n="theme_system">Theo hệ thống</option>
+          </select>
+        </div>
+        <div>
+          <label class="block font-medium mb-1.5" data-i18n="language">Ngôn ngữ</label>
+          <select id="settingLanguage" class="w-full px-3 py-2 rounded-lg bg-gray-100 dark:bg-gray-800 border-0 focus:outline-none focus:ring-2 focus:ring-blue-500 dark:text-white">
+            <option value="vi">Tiếng Việt</option>
+            <option value="en">English</option>
+          </select>
+        </div>
+        <div>
+          <label class="block font-medium mb-1.5" data-i18n="default_subject">Môn học mặc định</label>
+          <select id="settingDefaultSubject" class="w-full px-3 py-2 rounded-lg bg-gray-100 dark:bg-gray-800 border-0 focus:outline-none focus:ring-2 focus:ring-blue-500 dark:text-white">
+            <option value="">— <span data-i18n="none">Không</span> —</option>
+            <option value="Toán">📐 Toán Học</option>
+            <option value="Ngữ Văn">📖 Ngữ Văn</option>
+            <option value="Tiếng Anh">🇬🇧 Tiếng Anh</option>
+            <option value="Vật Lý">⚛️ Vật Lý</option>
+            <option value="Hóa Học">🧪 Hóa Học</option>
+            <option value="Sinh Học">🌱 Sinh Học</option>
+            <option value="Lịch sử & Địa lý">🌍 Lịch sử & Địa lý</option>
+            <option value="Tin Học">💻 Tin Học</option>
+          </select>
+        </div>
+        <div>
+          <label class="block font-medium mb-1.5" data-i18n="default_mode">Chế độ mặc định</label>
+          <select id="settingDefaultMode" class="w-full px-3 py-2 rounded-lg bg-gray-100 dark:bg-gray-800 border-0 focus:outline-none focus:ring-2 focus:ring-blue-500 dark:text-white">
+            <option value="">— <span data-i18n="none">Không</span> —</option>
+            <option value="Giải thích">📘 Giải Thích Dễ Hiểu</option>
+            <option value="Gợi ý">💡 Gợi Ý Từng Bước</option>
+            <option value="Kiểm tra bài làm">✅ Kiểm Tra Bài Làm</option>
+            <option value="Luyện tập">📝 Ra Bài Luyện Tập</option>
+            <option value="Ôn tập">🔄 Tổng Hợp Ôn Tập</option>
+          </select>
+        </div>
+        <div class="pt-3 border-t border-gray-200 dark:border-gray-800">
+          <button id="deleteAllHistoryBtn" class="w-full flex items-center justify-center gap-2 px-4 py-2.5 rounded-lg bg-red-50 dark:bg-red-900/30 text-red-600 dark:text-red-400 hover:bg-red-100 dark:hover:bg-red-900/50 font-medium text-sm">
+            <i class="fas fa-trash-can"></i> <span data-i18n="delete_all_history">Xoá toàn bộ lịch sử</span>
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <div id="helpModal" class="modal-card hidden bg-white dark:bg-gray-900 rounded-2xl shadow-2xl w-full max-w-md max-h-[85vh] overflow-y-auto">
+      <div class="flex items-center justify-between px-5 py-4 border-b border-gray-200 dark:border-gray-800">
+        <h3 class="font-semibold text-lg" data-i18n="help">Trợ giúp &amp; phím tắt</h3>
+        <button class="modal-close-btn text-gray-400 hover:text-gray-600 w-8 h-8 flex items-center justify-center"><i class="fas fa-xmark"></i></button>
+      </div>
+      <div class="p-5 space-y-3 text-sm">
+        <div class="flex items-center justify-between"><span data-i18n="shortcut_new_chat">Đoạn chat mới</span><kbd class="px-2 py-1 rounded bg-gray-100 dark:bg-gray-800 text-xs font-mono">Ctrl/Cmd + K</kbd></div>
+        <div class="flex items-center justify-between"><span data-i18n="shortcut_help">Mở trợ giúp</span><kbd class="px-2 py-1 rounded bg-gray-100 dark:bg-gray-800 text-xs font-mono">Ctrl/Cmd + /</kbd></div>
+        <div class="flex items-center justify-between"><span data-i18n="shortcut_close">Đóng hộp thoại</span><kbd class="px-2 py-1 rounded bg-gray-100 dark:bg-gray-800 text-xs font-mono">Esc</kbd></div>
+        <div class="flex items-center justify-between"><span data-i18n="shortcut_send">Gửi câu hỏi</span><kbd class="px-2 py-1 rounded bg-gray-100 dark:bg-gray-800 text-xs font-mono">Enter</kbd></div>
+      </div>
+    </div>
+
+    <div id="upgradeModal" class="modal-card hidden bg-white dark:bg-gray-900 rounded-2xl shadow-2xl w-full max-w-md max-h-[85vh] overflow-y-auto">
+      <div class="flex items-center justify-between px-5 py-4 border-b border-gray-200 dark:border-gray-800">
+        <h3 class="font-semibold text-lg" data-i18n="upgrade">Nâng cấp gói</h3>
+        <button class="modal-close-btn text-gray-400 hover:text-gray-600 w-8 h-8 flex items-center justify-center"><i class="fas fa-xmark"></i></button>
+      </div>
+      <div class="p-5 text-sm text-gray-500 dark:text-gray-400 space-y-3">
+        <p data-i18n="upgrade_preview">Tính năng nâng cấp gói đang được xây dựng và hiện chưa hỗ trợ thanh toán. Đây chỉ là bản xem trước giao diện.</p>
+      </div>
+    </div>
+
+  </div>
 
   <!-- ===================== MAIN ===================== -->
   <div class="flex-1 flex flex-col min-w-0">
@@ -620,6 +855,8 @@ HTML = r'''
 
 <script>
 const CURRENT_USERNAME = {{ username|tojson }};
+let PREFERENCES = {{ preferences|tojson }};
+const INITIAL_BANNER = {{ banner|tojson }};
 let uploadedFileContext = "";
 let uploadedFileName = "";
 let uploadedImageDataUrl = "";
@@ -651,12 +888,156 @@ function renderMathIn(el) {
 document.getElementById('userNameLabel').textContent = CURRENT_USERNAME;
 document.getElementById('userAvatar').textContent = (CURRENT_USERNAME || '?').trim().charAt(0).toUpperCase();
 
-function toggleTheme() {
-  html.classList.toggle('dark');
-  const icon = document.getElementById('themeIcon');
-  if (html.classList.contains('dark')) icon.classList.replace('fa-moon', 'fa-sun');
-  else icon.classList.replace('fa-sun', 'fa-moon');
+// ---------- i18n (nhẹ) ----------
+const I18N = {
+  vi: {
+    new_chat: 'Đoạn chat mới', search_chats: 'Tìm đoạn chat...', projects: 'Dự án', pinned: 'Đã ghim',
+    recent: 'Gần đây', settings: 'Cài đặt', help: 'Trợ giúp & phím tắt', upgrade: 'Nâng cấp gói',
+    logout: 'Đăng xuất', theme: 'Giao diện', theme_light: 'Sáng', theme_dark: 'Tối', theme_system: 'Theo hệ thống',
+    language: 'Ngôn ngữ', default_subject: 'Môn học mặc định', default_mode: 'Chế độ mặc định', none: 'Không',
+    delete_all_history: 'Xoá toàn bộ lịch sử', shortcut_new_chat: 'Đoạn chat mới', shortcut_help: 'Mở trợ giúp',
+    shortcut_close: 'Đóng hộp thoại', shortcut_send: 'Gửi câu hỏi',
+    upgrade_preview: 'Tính năng nâng cấp gói đang được xây dựng và hiện chưa hỗ trợ thanh toán. Đây chỉ là bản xem trước giao diện.',
+  },
+  en: {
+    new_chat: 'New chat', search_chats: 'Search chats...', projects: 'Projects', pinned: 'Pinned',
+    recent: 'Recent', settings: 'Settings', help: 'Help & shortcuts', upgrade: 'Upgrade plan',
+    logout: 'Log out', theme: 'Theme', theme_light: 'Light', theme_dark: 'Dark', theme_system: 'System',
+    language: 'Language', default_subject: 'Default subject', default_mode: 'Default mode', none: 'None',
+    delete_all_history: 'Delete all history', shortcut_new_chat: 'New chat', shortcut_help: 'Open help',
+    shortcut_close: 'Close dialog', shortcut_send: 'Send message',
+    upgrade_preview: 'The upgrade flow is a UI preview only — no billing is implemented yet.',
+  },
+};
+function applyLanguage(lang) {
+  const dict = I18N[lang] || I18N.vi;
+  document.querySelectorAll('[data-i18n]').forEach(el => {
+    const key = el.getAttribute('data-i18n');
+    if (dict[key]) el.textContent = dict[key];
+  });
+  document.querySelectorAll('[data-i18n-placeholder]').forEach(el => {
+    const key = el.getAttribute('data-i18n-placeholder');
+    if (dict[key]) el.placeholder = dict[key];
+  });
 }
+
+// ---------- Theme (đồng bộ với preferences) ----------
+function applyTheme(mode) {
+  const icon = document.getElementById('themeIcon');
+  const prefersDark = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
+  const isDark = mode === 'dark' || (mode === 'system' && prefersDark);
+  html.classList.toggle('dark', isDark);
+  if (icon) { icon.classList.toggle('fa-sun', isDark); icon.classList.toggle('fa-moon', !isDark); }
+}
+function toggleTheme() {
+  const isDark = html.classList.contains('dark');
+  const newMode = isDark ? 'light' : 'dark';
+  PREFERENCES.theme = newMode;
+  applyTheme(newMode);
+  savePreferences({ theme: newMode });
+  const sel = document.getElementById('settingTheme');
+  if (sel) sel.value = newMode;
+}
+
+async function savePreferences(updates) {
+  try {
+    const res = await fetch('/api/preferences', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(updates)
+    });
+    if (res.ok) PREFERENCES = await res.json();
+  } catch (e) { /* im lặng bỏ qua lỗi mạng */ }
+}
+
+function applyPreferencesToUI() {
+  applyTheme(PREFERENCES.theme || 'system');
+  applyLanguage(PREFERENCES.language || 'vi');
+  const themeSel = document.getElementById('settingTheme');
+  const langSel = document.getElementById('settingLanguage');
+  const subjSel = document.getElementById('settingDefaultSubject');
+  const modeSel = document.getElementById('settingDefaultMode');
+  if (themeSel) themeSel.value = PREFERENCES.theme || 'system';
+  if (langSel) langSel.value = PREFERENCES.language || 'vi';
+  if (subjSel) subjSel.value = PREFERENCES.default_subject || '';
+  if (modeSel) modeSel.value = PREFERENCES.default_mode || '';
+  if (PREFERENCES.default_subject) {
+    const s = document.getElementById('subject');
+    if (s && [...s.options].some(o => o.value === PREFERENCES.default_subject)) s.value = PREFERENCES.default_subject;
+  }
+  if (PREFERENCES.default_mode) {
+    const m = document.getElementById('modeSelect');
+    if (m && [...m.options].some(o => o.value === PREFERENCES.default_mode)) m.value = PREFERENCES.default_mode;
+  }
+}
+applyPreferencesToUI();
+if (window.matchMedia) {
+  window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => {
+    if (PREFERENCES.theme === 'system') applyTheme('system');
+  });
+}
+
+document.getElementById('settingTheme').addEventListener('change', (e) => {
+  PREFERENCES.theme = e.target.value; applyTheme(e.target.value); savePreferences({ theme: e.target.value });
+});
+document.getElementById('settingLanguage').addEventListener('change', (e) => {
+  PREFERENCES.language = e.target.value; applyLanguage(e.target.value); savePreferences({ language: e.target.value });
+});
+document.getElementById('settingDefaultSubject').addEventListener('change', (e) => {
+  PREFERENCES.default_subject = e.target.value; savePreferences({ default_subject: e.target.value });
+});
+document.getElementById('settingDefaultMode').addEventListener('change', (e) => {
+  PREFERENCES.default_mode = e.target.value; savePreferences({ default_mode: e.target.value });
+});
+document.getElementById('deleteAllHistoryBtn').addEventListener('click', async () => {
+  const msg = (I18N[PREFERENCES.language || 'vi'].delete_all_history) + '?';
+  if (!confirm(msg + ' ' + (PREFERENCES.language === 'en' ? 'This cannot be undone.' : 'Hành động này không thể hoàn tác.'))) return;
+  try {
+    await fetch('/api/conversations/delete-all', { method: 'POST' });
+    newChat();
+  } catch (e) { /* im lặng bỏ qua lỗi mạng */ }
+});
+
+// ---------- Modal system ---------- 
+const modalOverlay = document.getElementById('modalOverlay');
+function openModal(id) {
+  modalOverlay.classList.add('open');
+  document.querySelectorAll('.modal-card').forEach(c => c.classList.remove('open'));
+  document.getElementById(id).classList.add('open');
+}
+function closeModal() {
+  modalOverlay.classList.remove('open');
+  document.querySelectorAll('.modal-card').forEach(c => c.classList.remove('open'));
+}
+modalOverlay.addEventListener('click', (e) => { if (e.target === modalOverlay) closeModal(); });
+document.querySelectorAll('.modal-close-btn').forEach(btn => btn.addEventListener('click', closeModal));
+document.getElementById('openSettingsBtn').addEventListener('click', () => { userMenu.classList.add('hidden'); openModal('settingsModal'); });
+document.getElementById('openHelpBtn').addEventListener('click', () => { userMenu.classList.add('hidden'); openModal('helpModal'); });
+document.getElementById('openUpgradeBtn').addEventListener('click', () => { userMenu.classList.add('hidden'); openModal('upgradeModal'); });
+
+// ---------- Phím tắt ----------
+document.addEventListener('keydown', (e) => {
+  const cmd = e.ctrlKey || e.metaKey;
+  if (cmd && e.key.toLowerCase() === 'k') { e.preventDefault(); newChat(); }
+  else if (cmd && e.key === '/') { e.preventDefault(); openModal('helpModal'); }
+  else if (e.key === 'Escape') { closeModal(); }
+});
+
+// ---------- Banner hệ thống ----------
+function renderBanner(banner) {
+  const el = document.getElementById('systemBanner');
+  const dismissedText = sessionStorage.getItem('bannerDismissedText');
+  if (banner && banner.active && banner.text && banner.text !== dismissedText) {
+    document.getElementById('systemBannerText').textContent = banner.text;
+    el.classList.remove('hidden');
+  } else {
+    el.classList.add('hidden');
+  }
+}
+renderBanner(INITIAL_BANNER);
+document.getElementById('systemBannerClose').addEventListener('click', () => {
+  const text = document.getElementById('systemBannerText').textContent;
+  sessionStorage.setItem('bannerDismissedText', text);
+  document.getElementById('systemBanner').classList.add('hidden');
+});
 
 // ---------- Sidebar (mobile) ----------
 const sidebar = document.getElementById('sidebar');
@@ -746,21 +1127,72 @@ function showWelcome() {
   addMessage('ai', '👋 Chào em! Thầy/Cô là **StudyMate AI Pro**.\n\nEm chọn **Môn học** và **Chế độ** ở phía trên, gõ câu hỏi rồi bấm Enter (hoặc nút gửi) nhé! Em cũng có thể đính kèm file (PDF/Word/txt/csv) hoặc ảnh bằng nút 📎, hay kéo-thả trực tiếp vào khung chat. 🚀', true);
 }
 
+// ---------- Dự án (Projects) ----------
+let PROJECTS = [];
+async function loadProjects() {
+  try {
+    const res = await fetch('/api/projects');
+    if (!res.ok) return;
+    PROJECTS = await res.json();
+    renderProjectList();
+  } catch (e) { /* im lặng bỏ qua lỗi mạng */ }
+}
+function renderProjectList() {
+  const container = document.getElementById('projectList');
+  container.innerHTML = '';
+  PROJECTS.forEach(p => {
+    const item = document.createElement('div');
+    item.className = 'flex items-center gap-2 rounded-xl px-3 py-1.5 hover:bg-gray-200 dark:hover:bg-gray-800 cursor-pointer text-gray-600 dark:text-gray-300';
+    item.innerHTML = `<i class="fas fa-folder text-xs text-gray-400"></i><span class="flex-1 truncate">${escapeHtml(p.name)}</span>`;
+    item.addEventListener('click', () => { activeProjectFilter = (activeProjectFilter === p.id ? null : p.id); loadConversations(); });
+    container.appendChild(item);
+  });
+}
+document.getElementById('newProjectBtn').addEventListener('click', async () => {
+  const name = prompt(PREFERENCES.language === 'en' ? 'Project name:' : 'Tên dự án:');
+  if (!name || !name.trim()) return;
+  try {
+    const res = await fetch('/api/projects', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: name.trim() })
+    });
+    if (res.ok) loadProjects();
+  } catch (e) { /* im lặng bỏ qua lỗi mạng */ }
+});
+
 // ---------- Lịch sử hội thoại (theo tài khoản) ----------
+let ALL_CONVERSATIONS = [];
+let activeProjectFilter = null;
+let openConvMenuId = null;
+
 async function loadConversations() {
   try {
     const res = await fetch('/api/conversations');
     if (res.status === 401) { window.location.href = '/login'; return; }
     if (!res.ok) return;
-    renderConversationList(await res.json());
+    ALL_CONVERSATIONS = await res.json();
+    renderConversationList();
   } catch (e) { /* im lặng bỏ qua lỗi mạng khi tải danh sách */ }
 }
 
-function renderConversationList(list) {
-  const container = document.getElementById('convList');
+function renderConversationList() {
+  const query = (document.getElementById('convSearchInput').value || '').trim().toLowerCase();
+  let list = ALL_CONVERSATIONS;
+  if (query) list = list.filter(c => (c.title || '').toLowerCase().includes(query));
+  if (activeProjectFilter) list = list.filter(c => c.project_id === activeProjectFilter);
+
+  const pinned = list.filter(c => c.pinned);
+  const recent = list.filter(c => !c.pinned);
+
+  document.getElementById('pinnedSection').classList.toggle('hidden', pinned.length === 0);
+  renderConvGroup('pinnedList', pinned);
+  renderConvGroup('convList', recent, recent.length === 0 && pinned.length === 0);
+}
+
+function renderConvGroup(containerId, list, showEmptyState) {
+  const container = document.getElementById(containerId);
   container.innerHTML = '';
   if (!list.length) {
-    container.innerHTML = '<div class="text-gray-400 text-xs px-2 py-4 text-center">Chưa có đoạn chat nào</div>';
+    if (showEmptyState) container.innerHTML = '<div class="text-gray-400 text-xs px-2 py-4 text-center">Chưa có đoạn chat nào</div>';
     return;
   }
   list.forEach(conv => {
@@ -768,15 +1200,70 @@ function renderConversationList(list) {
     const active = conv.id === currentConversationId;
     item.className = 'conv-item group flex items-center gap-1 rounded-xl px-3 py-2 cursor-pointer transition-colors ' +
       (active ? 'bg-gray-200 dark:bg-gray-800' : 'hover:bg-gray-200 dark:hover:bg-gray-800');
-    item.innerHTML = `<span class="flex-1 truncate">${escapeHtml(conv.title || 'Đoạn chat mới')}</span>
-      <button class="del-btn text-gray-400 hover:text-red-500 w-6 h-6 flex items-center justify-center flex-shrink-0 transition-opacity" title="Xóa đoạn chat">
-        <i class="fas fa-trash-can text-xs"></i>
+    item.innerHTML = `
+      ${conv.pinned ? '<i class="fas fa-thumbtack text-xs text-gray-400"></i>' : ''}
+      <span class="flex-1 truncate">${escapeHtml(conv.title || 'Đoạn chat mới')}</span>
+      <button class="conv-menu-btn text-gray-400 hover:text-gray-600 w-6 h-6 flex items-center justify-center flex-shrink-0 transition-opacity" title="Tùy chọn">
+        <i class="fas fa-ellipsis text-xs"></i>
       </button>`;
     item.querySelector('span').addEventListener('click', () => openConversation(conv.id));
-    item.querySelector('button').addEventListener('click', (e) => { e.stopPropagation(); deleteConversation(conv.id); });
+    item.querySelector('.conv-menu-btn').addEventListener('click', (e) => {
+      e.stopPropagation();
+      toggleConvMenu(item, conv);
+    });
     container.appendChild(item);
   });
 }
+
+function toggleConvMenu(item, conv) {
+  const existing = item.querySelector('.conv-menu-dropdown');
+  document.querySelectorAll('.conv-menu-dropdown').forEach(d => d.remove());
+  if (existing) { openConvMenuId = null; return; }
+  openConvMenuId = conv.id;
+  const dd = document.createElement('div');
+  dd.className = 'conv-menu-dropdown';
+  const pinLabel = conv.pinned ? (PREFERENCES.language === 'en' ? 'Unpin' : 'Bỏ ghim') : (PREFERENCES.language === 'en' ? 'Pin' : 'Ghim');
+  const renameLabel = PREFERENCES.language === 'en' ? 'Rename' : 'Đổi tên';
+  const moveLabel = PREFERENCES.language === 'en' ? 'Move to project' : 'Chuyển vào dự án';
+  const delLabel = PREFERENCES.language === 'en' ? 'Delete' : 'Xóa';
+  dd.innerHTML = `
+    <button data-act="pin"><i class="fas fa-thumbtack w-3"></i>${pinLabel}</button>
+    <button data-act="rename"><i class="fas fa-pen w-3"></i>${renameLabel}</button>
+    ${PROJECTS.length ? `<button data-act="move"><i class="fas fa-folder w-3"></i>${moveLabel}</button>` : ''}
+    <button data-act="delete" class="text-red-500"><i class="fas fa-trash-can w-3"></i>${delLabel}</button>`;
+  dd.querySelector('[data-act="pin"]').addEventListener('click', (e) => { e.stopPropagation(); pinConversation(conv); });
+  dd.querySelector('[data-act="rename"]').addEventListener('click', (e) => { e.stopPropagation(); renameConversation(conv); });
+  const moveBtn = dd.querySelector('[data-act="move"]');
+  if (moveBtn) moveBtn.addEventListener('click', (e) => { e.stopPropagation(); moveConversation(conv); });
+  dd.querySelector('[data-act="delete"]').addEventListener('click', (e) => { e.stopPropagation(); deleteConversation(conv.id); });
+  item.appendChild(dd);
+}
+document.addEventListener('click', () => { document.querySelectorAll('.conv-menu-dropdown').forEach(d => d.remove()); openConvMenuId = null; });
+
+async function patchConversation(id, updates) {
+  try {
+    const res = await fetch(`/api/conversations/${id}`, {
+      method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(updates)
+    });
+    if (res.ok) loadConversations();
+  } catch (e) { /* im lặng bỏ qua lỗi mạng */ }
+}
+function pinConversation(conv) { patchConversation(conv.id, { pinned: !conv.pinned }); }
+function renameConversation(conv) {
+  const title = prompt(PREFERENCES.language === 'en' ? 'New title:' : 'Tên mới:', conv.title || '');
+  if (title === null || !title.trim()) return;
+  patchConversation(conv.id, { title: title.trim() });
+}
+function moveConversation(conv) {
+  const options = PROJECTS.map((p, i) => `${i + 1}. ${p.name}`).join('\n');
+  const choice = prompt((PREFERENCES.language === 'en' ? 'Move to which project?\n' : 'Chuyển vào dự án nào?\n') + options);
+  if (!choice) return;
+  const idx = parseInt(choice, 10) - 1;
+  if (isNaN(idx) || !PROJECTS[idx]) return;
+  patchConversation(conv.id, { project_id: PROJECTS[idx].id });
+}
+
+document.getElementById('convSearchInput').addEventListener('input', renderConversationList);
 
 async function openConversation(id) {
   try {
@@ -813,6 +1300,7 @@ function newChat() {
   loadConversations();
 }
 document.getElementById('newChatBtn').addEventListener('click', newChat);
+loadProjects();
 
 // ---------- Gửi tin nhắn (streaming) ----------
 async function sendMessage() {
@@ -1538,32 +2026,95 @@ DEV_STATS_HTML = r'''
       </table>
     </div>
 
+    <!-- Quản lý hệ thống -->
+    <div class="bg-white dark:bg-[#1c1c1c] rounded-2xl border border-gray-100 dark:border-gray-800 p-5 shadow-sm">
+      <h2 class="font-bold mb-4 flex items-center gap-2"><i class="fas fa-sliders text-gray-500"></i> Quản lý hệ thống</h2>
+
+      <div class="grid md:grid-cols-2 gap-6">
+        <div>
+          <div class="text-sm font-semibold mb-2">Banner thông báo toàn hệ thống</div>
+          <form id="bannerForm" class="space-y-2">
+            <textarea id="bannerTextInput" rows="2" maxlength="300" placeholder="Nội dung thông báo hiển thị cho mọi người dùng..."
+              class="w-full px-3 py-2 text-sm rounded-lg bg-gray-100 dark:bg-gray-800 border-0 focus:outline-none focus:ring-2 focus:ring-indigo-500 dark:text-white">{{ banner.text }}</textarea>
+            <label class="flex items-center gap-2 text-sm">
+              <input type="checkbox" id="bannerActiveInput" {% if banner.active %}checked{% endif %}>
+              Bật banner
+            </label>
+            <button type="submit" class="px-4 py-2 rounded-lg bg-indigo-600 hover:bg-indigo-700 text-white text-sm font-medium">Lưu banner</button>
+            <span id="bannerSaveStatus" class="text-xs text-green-600 ml-2 hidden">Đã lưu ✓</span>
+          </form>
+        </div>
+
+        <div>
+          <div class="text-sm font-semibold mb-2">Đăng nhập Google (runtime)</div>
+          {% if google_oauth_configured %}
+          <p class="text-xs text-gray-400 mb-2">Client ID/Secret đã cấu hình trong .env. Bạn có thể tạm tắt nút "Đăng nhập với Google" mà không cần sửa .env.</p>
+          <div class="flex gap-2">
+            <button data-mode="on" class="google-toggle-btn px-3 py-2 rounded-lg text-sm font-medium {{ 'bg-green-600 text-white' if google_login_on else 'bg-gray-100 dark:bg-gray-800 text-gray-600 dark:text-gray-300' }}">Bật</button>
+            <button data-mode="off" class="google-toggle-btn px-3 py-2 rounded-lg text-sm font-medium {{ 'bg-red-600 text-white' if not google_login_on else 'bg-gray-100 dark:bg-gray-800 text-gray-600 dark:text-gray-300' }}">Tắt</button>
+            <button data-mode="default" class="google-toggle-btn px-3 py-2 rounded-lg text-sm font-medium bg-gray-100 dark:bg-gray-800 text-gray-600 dark:text-gray-300">Mặc định (.env)</button>
+          </div>
+          <p class="text-xs text-gray-400 mt-2">Trạng thái hiện tại: <strong>{{ 'BẬT' if google_login_on else 'TẮT' }}</strong></p>
+          {% else %}
+          <p class="text-xs text-gray-400">Chưa cấu hình GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET trong .env — không có gì để bật/tắt.</p>
+          {% endif %}
+
+          <div class="mt-5">
+            <div class="text-sm font-semibold mb-2">Xuất dữ liệu</div>
+            <a href="/developer/export.csv" class="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-gray-100 dark:bg-gray-800 hover:bg-gray-200 dark:hover:bg-gray-700 text-sm font-medium">
+              <i class="fas fa-file-csv"></i> Tải usage_logs.csv
+            </a>
+          </div>
+        </div>
+      </div>
+    </div>
+
     <!-- Toàn bộ tài khoản -->
     <div class="bg-white dark:bg-[#1c1c1c] rounded-2xl border border-gray-100 dark:border-gray-800 p-5 shadow-sm overflow-x-auto">
-      <h2 class="font-bold mb-4 flex items-center gap-2"><i class="fas fa-address-card text-gray-500"></i> Toàn bộ tài khoản ({{ total_users }})</h2>
-      <table class="w-full text-sm min-w-[420px]">
+      <div class="flex items-center justify-between mb-4 flex-wrap gap-2">
+        <h2 class="font-bold flex items-center gap-2"><i class="fas fa-address-card text-gray-500"></i> Toàn bộ tài khoản ({{ total_users }})</h2>
+        <form method="GET" class="flex items-center gap-2">
+          <input type="text" name="q" value="{{ search_q }}" placeholder="Tìm theo tên đăng nhập..."
+            class="px-3 py-1.5 text-sm rounded-lg bg-gray-100 dark:bg-gray-800 border-0 focus:outline-none focus:ring-2 focus:ring-indigo-500 dark:text-white">
+          <button type="submit" class="px-3 py-1.5 rounded-lg bg-gray-100 dark:bg-gray-800 text-sm"><i class="fas fa-magnifying-glass"></i></button>
+        </form>
+      </div>
+      <table class="w-full text-sm min-w-[520px]">
         <thead>
           <tr class="text-left text-gray-400 text-xs uppercase border-b border-gray-100 dark:border-gray-800">
             <th class="py-2 pr-3">ID</th>
             <th class="py-2 pr-3">Người dùng</th>
             <th class="py-2 pr-3">Vai trò</th>
-            <th class="py-2">Ngày tạo</th>
+            <th class="py-2 pr-3">Ngày tạo</th>
+            <th class="py-2">Hành động</th>
           </tr>
         </thead>
         <tbody>
           {% for u in all_users %}
-          <tr class="border-b border-gray-50 dark:border-gray-900">
+          <tr class="border-b border-gray-50 dark:border-gray-900" data-user-id="{{ u.id }}" data-username="{{ u.username }}">
             <td class="py-2.5 pr-3 text-gray-400">#{{ u.id }}</td>
             <td class="py-2.5 pr-3 font-medium">{{ u.username }}</td>
-            <td class="py-2.5 pr-3">
+            <td class="py-2.5 pr-3 role-cell">
               {% if u.role == 'developer' %}
                 <span class="text-[11px] font-semibold px-2 py-0.5 rounded-full bg-indigo-100 dark:bg-indigo-900 text-indigo-600 dark:text-indigo-300">developer</span>
               {% else %}
                 <span class="text-[11px] font-semibold px-2 py-0.5 rounded-full bg-gray-100 dark:bg-gray-800 text-gray-500 dark:text-gray-400">user</span>
               {% endif %}
             </td>
-            <td class="py-2.5 text-gray-400">{{ u.created_at[:10] }}</td>
+            <td class="py-2.5 pr-3 text-gray-400">{{ u.created_at[:10] }}</td>
+            <td class="py-2.5">
+              {% if u.username != current_username %}
+              <button class="role-toggle-btn text-xs font-medium px-2.5 py-1 rounded-lg bg-gray-100 dark:bg-gray-800 hover:bg-gray-200 dark:hover:bg-gray-700"
+                      data-current-role="{{ u.role }}">
+                {{ 'Hạ xuống user' if u.role == 'developer' else 'Nâng lên developer' }}
+              </button>
+              {% else %}
+              <span class="text-xs text-gray-400">(bạn)</span>
+              {% endif %}
+            </td>
           </tr>
+          {% else %}
+          <tr><td colspan="5" class="py-4 text-center text-gray-400">Không tìm thấy tài khoản nào.</td></tr>
           {% endfor %}
         </tbody>
       </table>
@@ -1573,6 +2124,63 @@ DEV_STATS_HTML = r'''
       Trang này chỉ hiển thị số liệu tổng hợp (số lượt, độ dài, môn học, chế độ) — không lưu/hiển thị nội dung câu hỏi hay câu trả lời của học sinh.
     </p>
   </main>
+
+<script>
+  document.getElementById('bannerForm').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const text = document.getElementById('bannerTextInput').value.trim();
+    const active = document.getElementById('bannerActiveInput').checked;
+    try {
+      const res = await fetch('/developer/banner', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text, active })
+      });
+      if (res.ok) {
+        const status = document.getElementById('bannerSaveStatus');
+        status.classList.remove('hidden');
+        setTimeout(() => status.classList.add('hidden'), 2000);
+      } else {
+        alert('Không lưu được banner.');
+      }
+    } catch (err) { alert('Lỗi mạng khi lưu banner.'); }
+  });
+
+  document.querySelectorAll('.google-toggle-btn').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      try {
+        const res = await fetch('/developer/google-login', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ mode: btn.dataset.mode })
+        });
+        if (res.ok) window.location.reload();
+        else alert('Không đổi được trạng thái đăng nhập Google.');
+      } catch (err) { alert('Lỗi mạng.'); }
+    });
+  });
+
+  document.querySelectorAll('.role-toggle-btn').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      const row = btn.closest('tr');
+      const userId = row.dataset.userId;
+      const username = row.dataset.username;
+      const currentRole = btn.dataset.currentRole;
+      const newRole = currentRole === 'developer' ? 'user' : 'developer';
+      const confirmMsg = newRole === 'developer'
+        ? `Nâng "${username}" lên quyền developer?`
+        : `Hạ quyền developer của "${username}" xuống user?`;
+      if (!confirm(confirmMsg)) return;
+      try {
+        const res = await fetch(`/developer/users/${userId}/role`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ role: newRole })
+        });
+        const data = await res.json();
+        if (!res.ok) { alert(data.error || 'Không cập nhật được vai trò.'); return; }
+        window.location.reload();
+      } catch (err) { alert('Lỗi mạng khi cập nhật vai trò.'); }
+    });
+  });
+</script>
 </body>
 </html>
 '''
@@ -1637,7 +2245,7 @@ def _login_session_for(user):
 
 @app.route('/auth/<provider>')
 def oauth_start(provider):
-    if provider != 'google' or not oauth or not hasattr(oauth, provider):
+    if provider != 'google' or not oauth or not hasattr(oauth, provider) or not google_login_effective():
         flash('Phương thức đăng nhập này hiện chưa được bật.')
         return redirect(url_for('login_page'))
     redirect_uri = url_for('oauth_callback', provider=provider, _external=True)
@@ -1680,7 +2288,7 @@ def oauth_callback(provider):
 # 4. ĐỊNH TUYẾN TÀI KHOẢN (Đăng ký / Đăng nhập / Đăng xuất)
 # ==========================================
 def _auth_ctx(**extra):
-    ctx = {'google_enabled': GOOGLE_OAUTH_ENABLED}
+    ctx = {'google_enabled': google_login_effective()}
     ctx.update(extra)
     return ctx
 
@@ -1768,6 +2376,8 @@ def home():
         HTML,
         username=session.get('username', ''),
         is_developer=(current_user_role() == 'developer'),
+        preferences=get_preferences(current_user_id()),
+        banner=get_banner(),
     )
 
 
@@ -1865,9 +2475,18 @@ def developer_stats():
             'last_used': last_used[:16].replace('T', ' ') if last_used else None,
         })
 
-    all_users = db.execute(
-        'SELECT id, username, role, created_at FROM users ORDER BY id ASC'
-    ).fetchall()
+    q = (request.args.get('q') or '').strip()
+    if q:
+        all_users = db.execute(
+            'SELECT id, username, role, created_at FROM users WHERE username LIKE ? ORDER BY id ASC',
+            (f'%{q}%',)
+        ).fetchall()
+    else:
+        all_users = db.execute(
+            'SELECT id, username, role, created_at FROM users ORDER BY id ASC'
+        ).fetchall()
+
+    developer_count = db.execute("SELECT COUNT(*) c FROM users WHERE role = 'developer'").fetchone()['c']
 
     return render_template_string(
         DEV_STATS_HTML,
@@ -1884,6 +2503,95 @@ def developer_stats():
         mode_stats=mode_stats,
         top_users=top_users,
         all_users=[dict(u) for u in all_users],
+        search_q=q,
+        current_username=session.get('username', ''),
+        developer_count=developer_count,
+        banner=get_banner(),
+        google_oauth_configured=GOOGLE_OAUTH_ENABLED,
+        google_login_on=google_login_effective(),
+    )
+
+
+@app.route('/developer/users/<int:user_id>/role', methods=['POST'])
+@developer_required
+def developer_set_role(user_id):
+    """Thăng/hạ quyền developer cho 1 tài khoản. Chặn: tự hạ quyền chính mình,
+    và hạ quyền developer cuối cùng của hệ thống (luôn phải còn ít nhất 1 developer)."""
+    db = get_db()
+    target = db.execute('SELECT id, username, role FROM users WHERE id = ?', (user_id,)).fetchone()
+    if not target:
+        return jsonify({"error": "Không tìm thấy tài khoản này."}), 404
+
+    data = request.get_json(silent=True) or {}
+    new_role = data.get('role')
+    if new_role not in ('user', 'developer'):
+        return jsonify({"error": "Vai trò không hợp lệ."}), 400
+
+    if target['role'] == new_role:
+        return jsonify({"success": True, "role": new_role})
+
+    if new_role == 'user':
+        if target['id'] == current_user_id():
+            return jsonify({"error": "Bạn không thể tự hạ quyền chính mình."}), 400
+        dev_count = db.execute("SELECT COUNT(*) c FROM users WHERE role = 'developer'").fetchone()['c']
+        if target['role'] == 'developer' and dev_count <= 1:
+            return jsonify({"error": "Không thể hạ quyền — hệ thống cần ít nhất 1 tài khoản developer."}), 400
+
+    db.execute('UPDATE users SET role = ? WHERE id = ?', (new_role, user_id))
+    db.commit()
+    return jsonify({"success": True, "role": new_role})
+
+
+@app.route('/developer/banner', methods=['POST'])
+@developer_required
+def developer_set_banner():
+    data = request.get_json(silent=True) or {}
+    text = (data.get('text') or '').strip()[:300]
+    active = bool(data.get('active'))
+    set_setting('banner_text', text)
+    set_setting('banner_active', '1' if active else '0')
+    return jsonify({"success": True, "banner": get_banner()})
+
+
+@app.route('/developer/google-login', methods=['POST'])
+@developer_required
+def developer_set_google_login():
+    data = request.get_json(silent=True) or {}
+    mode = data.get('mode')
+    if mode not in ('on', 'off', 'default'):
+        return jsonify({"error": "Giá trị không hợp lệ."}), 400
+    if mode == 'default':
+        set_setting('google_login_override', '')
+    else:
+        set_setting('google_login_override', mode)
+    return jsonify({"success": True, "google_login_on": google_login_effective()})
+
+
+@app.route('/developer/export.csv')
+@developer_required
+def developer_export_csv():
+    import csv as csv_module
+    db = get_db()
+    rows = db.execute('''
+        SELECT l.id, u.username AS username, l.endpoint, l.subject, l.mode,
+               l.message_chars, l.response_chars, l.had_file, l.had_image, l.status, l.created_at
+        FROM usage_logs l LEFT JOIN users u ON u.id = l.user_id
+        ORDER BY l.id ASC
+    ''').fetchall()
+
+    buf = io.StringIO()
+    writer = csv_module.writer(buf)
+    writer.writerow(['id', 'username', 'endpoint', 'subject', 'mode', 'message_chars',
+                      'response_chars', 'had_file', 'had_image', 'status', 'created_at'])
+    for r in rows:
+        writer.writerow([r['id'], r['username'] or '', r['endpoint'], r['subject'] or '',
+                          r['mode'] or '', r['message_chars'], r['response_chars'],
+                          r['had_file'], r['had_image'], r['status'], r['created_at']])
+
+    return Response(
+        buf.getvalue(),
+        mimetype='text/csv',
+        headers={'Content-Disposition': 'attachment; filename=usage_logs.csv'}
     )
 
 
@@ -2089,10 +2797,134 @@ def upload_file():
 def list_conversations():
     db = get_db()
     rows = db.execute(
-        'SELECT id, title, updated_at FROM conversations WHERE user_id = ? ORDER BY updated_at DESC',
+        'SELECT id, title, updated_at, pinned, project_id FROM conversations WHERE user_id = ? '
+        'ORDER BY pinned DESC, updated_at DESC',
         (current_user_id(),)
     ).fetchall()
     return jsonify([dict(r) for r in rows])
+
+
+@app.route('/api/conversations/<int:conv_id>', methods=['PATCH'])
+@login_required
+def update_conversation(conv_id):
+    db = get_db()
+    conv = db.execute(
+        'SELECT id FROM conversations WHERE id = ? AND user_id = ?', (conv_id, current_user_id())
+    ).fetchone()
+    if not conv:
+        return jsonify({"error": "Không tìm thấy đoạn chat này."}), 404
+
+    data = request.get_json(silent=True) or {}
+    fields, params = [], []
+
+    if 'title' in data:
+        title = (data.get('title') or '').strip()
+        if not title:
+            return jsonify({"error": "Tên đoạn chat không được để trống."}), 400
+        fields.append('title = ?')
+        params.append(title[:120])
+
+    if 'pinned' in data:
+        fields.append('pinned = ?')
+        params.append(1 if data.get('pinned') else 0)
+
+    if 'project_id' in data:
+        project_id = data.get('project_id')
+        if project_id is not None:
+            proj = db.execute(
+                'SELECT id FROM projects WHERE id = ? AND user_id = ?', (project_id, current_user_id())
+            ).fetchone()
+            if not proj:
+                return jsonify({"error": "Không tìm thấy dự án này."}), 404
+        fields.append('project_id = ?')
+        params.append(project_id)
+
+    if not fields:
+        return jsonify({"error": "Không có gì để cập nhật."}), 400
+
+    params.append(conv_id)
+    db.execute(f"UPDATE conversations SET {', '.join(fields)} WHERE id = ?", params)
+    db.commit()
+    return jsonify({"success": True})
+
+
+@app.route('/api/conversations/delete-all', methods=['POST'])
+@login_required
+def delete_all_conversations():
+    db = get_db()
+    conv_ids = [r['id'] for r in db.execute(
+        'SELECT id FROM conversations WHERE user_id = ?', (current_user_id(),)
+    ).fetchall()]
+    if conv_ids:
+        placeholders = ','.join('?' * len(conv_ids))
+        db.execute(f'DELETE FROM messages WHERE conversation_id IN ({placeholders})', conv_ids)
+        db.execute(f'DELETE FROM conversations WHERE id IN ({placeholders})', conv_ids)
+        db.commit()
+    return jsonify({"success": True, "deleted": len(conv_ids)})
+
+
+# ---- Dự án (Projects) ----
+@app.route('/api/projects', methods=['GET'])
+@login_required
+def list_projects():
+    db = get_db()
+    rows = db.execute(
+        'SELECT id, name, created_at FROM projects WHERE user_id = ? ORDER BY created_at DESC',
+        (current_user_id(),)
+    ).fetchall()
+    return jsonify([dict(r) for r in rows])
+
+
+@app.route('/api/projects', methods=['POST'])
+@login_required
+def create_project():
+    data = request.get_json(silent=True) or {}
+    name = (data.get('name') or '').strip()
+    if not name:
+        return jsonify({"error": "Tên dự án không được để trống."}), 400
+    db = get_db()
+    cur = db.execute(
+        'INSERT INTO projects (user_id, name, created_at) VALUES (?, ?, ?)',
+        (current_user_id(), name[:80], now_iso())
+    )
+    db.commit()
+    return jsonify({"id": cur.lastrowid, "name": name[:80]})
+
+
+@app.route('/api/projects/<int:project_id>', methods=['DELETE'])
+@login_required
+def delete_project(project_id):
+    db = get_db()
+    proj = db.execute(
+        'SELECT id FROM projects WHERE id = ? AND user_id = ?', (project_id, current_user_id())
+    ).fetchone()
+    if not proj:
+        return jsonify({"error": "Không tìm thấy dự án này."}), 404
+    db.execute('UPDATE conversations SET project_id = NULL WHERE project_id = ?', (project_id,))
+    db.execute('DELETE FROM projects WHERE id = ?', (project_id,))
+    db.commit()
+    return jsonify({"success": True})
+
+
+# ---- Tùy chọn cá nhân (Preferences) ----
+@app.route('/api/preferences', methods=['GET'])
+@login_required
+def api_get_preferences():
+    return jsonify(get_preferences(current_user_id()))
+
+
+@app.route('/api/preferences', methods=['POST'])
+@login_required
+def api_set_preferences():
+    data = request.get_json(silent=True) or {}
+    return jsonify(set_preferences(current_user_id(), data))
+
+
+# ---- Banner hệ thống (chỉ đọc, cho mọi người dùng đã đăng nhập) ----
+@app.route('/api/banner', methods=['GET'])
+@login_required
+def api_get_banner():
+    return jsonify(get_banner())
 
 
 @app.route('/api/conversations/<int:conv_id>/messages', methods=['GET'])
