@@ -175,5 +175,35 @@ Trang `/developer` có thêm mục **"Quản lý hệ thống"**:
 
 ⚠️ Không cần cài thêm thư viện nào cho các tính năng ở mục 8–9 — toàn bộ dùng lại `flask`, `sqlite3`, `csv` (thư viện chuẩn của Python), không cập nhật `requirements.txt`.
 
+## 10. Báo lỗi câu trả lời (mới)
+
+Học sinh giờ có thể báo lỗi trực tiếp ngay dưới bất kỳ câu trả lời nào của AI:
+
+- Dưới mỗi câu trả lời (hiện khi rê chuột / chạm vào), có nút **"🚩 Báo lỗi"**. Bấm vào sẽ mở hộp thoại cho học sinh mô tả vấn đề (sai kiến thức, khó hiểu, lạc đề, v.v.).
+- Báo cáo được gửi kèm: tên tài khoản, đoạn chat liên quan (`conversation_id`), một đoạn trích câu trả lời bị báo lỗi (tối đa 2000 ký tự), và mô tả của học sinh — lưu vào bảng mới `issue_reports`.
+- Trang `/developer` có thêm:
+  - Thẻ tổng quan thứ 5: **"Báo lỗi đang mở"** (số lượng đang chờ xử lý / tổng số báo cáo).
+  - Banner nhỏ màu đỏ ở đầu trang khi có báo cáo đang mở, bấm vào để nhảy thẳng xuống panel báo cáo.
+  - Panel **"Báo cáo lỗi từ học sinh"**: liệt kê từng báo cáo (người gửi, thời gian, mô tả, đoạn trích liên quan), có nút **"Đánh dấu đã xử lý"** / **"Mở lại"** để developer cập nhật trạng thái ngay tại chỗ (không cần reload thủ công — trang tự tải lại sau khi bấm).
+- API liên quan: `POST /api/report-issue` (học sinh gửi báo cáo), `POST /developer/issues/<id>/resolve` (developer đổi trạng thái, chỉ tài khoản `role = developer` mới gọi được).
+
+## 11. "Bộ nhớ" AI — cá nhân hoá câu trả lời (mới)
+
+Lấy cảm hứng từ tính năng Memory của các AI phổ biến, nhưng làm gọn nhẹ, **không tốn thêm lượt gọi API AI nào**:
+
+- **Ghi nhớ theo yêu cầu**: học sinh gõ những câu như *"ghi nhớ giúp em là em học lớp 8 và yếu phần hình học"*, *"hãy nhớ mình sắp thi học kỳ môn Hóa"* — hệ thống nhận diện bằng regex (các cụm kích hoạt: "ghi nhớ", "hãy nhớ", "nhớ giúp", "note giúp", "lưu ý giúp"), lưu nội dung vào bảng mới `memories`, và hiện một toast nhỏ **"🧠 Đã ghi nhớ: ..."** ở góc dưới màn hình để xác nhận ngay lập tức.
+- **Tự nhận diện lớp học**: nếu học sinh nhắc "lớp 6/7/8/9" ở bất kỳ tin nhắn nào, hệ thống tự ghi nhớ 1 lần duy nhất (không lặp lại mỗi lần nhắc).
+- **Dùng lại để cá nhân hoá**: ở mỗi lượt chat tiếp theo, tối đa 5 mục ghi nhớ gần nhất của học sinh đó được đưa vào system prompt, giúp AI trả lời đúng trình độ / bối cảnh hơn mà không cần học sinh lặp lại thông tin.
+- **Quyền riêng tư**: học sinh có thể tự xoá toàn bộ bộ nhớ của mình bất cứ lúc nào qua **Cài đặt → "Xoá bộ nhớ AI của tôi"** (`DELETE /api/memories`) — chỉ xoá được bộ nhớ của chính tài khoản đang đăng nhập.
+- **Xem tổng hợp (developer)**: trang `/developer` có panel **"Bộ nhớ AI gần đây"** hiển thị 10 mục mới nhất trên toàn hệ thống (tài khoản, nội dung, thời gian, nguồn gốc "tự động"/"học sinh yêu cầu") kèm tổng số mục — giúp hiểu học sinh đang cần hỗ trợ gì mà không cần đọc toàn bộ lịch sử chat.
+
+⚠️ Lưu ý: đây là cơ chế "bộ nhớ" dựa trên quy tắc (regex) đơn giản, không phải AI tự suy luận/tổng hợp — độ chính xác phụ thuộc vào cách học sinh diễn đạt câu yêu cầu ghi nhớ. Không cập nhật `requirements.txt` cho mục 10–11 (chỉ dùng `flask`, `sqlite3`, `re` có sẵn).
+
 ## Chưa làm (nằm ngoài phạm vi yêu cầu lần này)
-Phần đầu prompt gốc của bạn từng có yêu cầu dựng lại toàn bộ thành một sản phẩm Next.js/TypeScript quy mô lớn (nhiều trang, Dashboard, Blog, Pricing...). Bản cập nhật này vẫn giữ nguyên nền tảng Flask hiện có của bạn và chỉ tập trung vào 2 yêu cầu mới nhất: giao diện giống các AI phổ biến + hệ thống tài khoản. Nếu bạn vẫn muốn bản Next.js quy mô lớn, đó sẽ là một dự án tách riêng — cho mình biết nếu bạn muốn triển khai.
+Phần đầu prompt gốc của bạn từng có yêu cầu dựng lại toàn bộ thành một sản phẩm Next.js/TypeScript quy mô lớn (nhiều trang, Dashboard, Blog, Pricing...). Bản cập nhật này vẫn giữ nguyên nền tảng Flask hiện có của bạn. Nếu bạn vẫn muốn bản Next.js quy mô lớn, đó sẽ là một dự án tách riêng — cho mình biết nếu bạn muốn triển khai.
+
+Vài ý tưởng hợp lý để làm tiếp sau này (chưa làm, vì nằm ngoài yêu cầu lần này):
+- Trang đổi mật khẩu cho tài khoản đăng nhập bằng mật khẩu (hiện chỉ có thể đổi qua thao tác thủ công trong DB).
+- Rate limiting cho `/login`, `/register`, `/api/report-issue` để chống spam/brute-force khi deploy công khai (gợi ý: `flask-limiter`).
+- Cho học sinh tự xem "bộ nhớ" của mình (hiện chỉ có nút xoá, chưa có màn hình xem danh sách) — có thể thêm 1 modal nhỏ dùng `GET /api/memories` đã có sẵn.
+- Gửi email/webhook thông báo cho developer khi có báo cáo lỗi mới, thay vì phải tự vào `/developer` kiểm tra.
