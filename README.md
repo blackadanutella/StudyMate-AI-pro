@@ -565,6 +565,32 @@ Trước đây: quên mật khẩu = hết cách, phải nhờ Admin sửa tay t
 - Đã kiểm thử cả 2 chiều: kịch bản tấn công (bị chặn đúng lúc, kể cả thử mật khẩu ĐÚNG cũng bị chặn nếu đang trong thời gian giới hạn — tránh dò được thời điểm) VÀ kịch bản dùng bình thường (không bị chặn oan).
 - ⚠️ Giới hạn: bộ đếm nằm trong RAM của tiến trình — nếu sau này chạy nhiều worker process (`gunicorn -w 4`), mỗi worker đếm riêng, ngưỡng thực tế sẽ cao hơn số cấu hình. Đủ chặn spam/bot thông thường; quy mô lớn hơn cần Redis.
 
+## 35. Bảng Tiến Độ Học Tập (Progress Dashboard) — "đột phá" không phải bằng tính năng mới, mà bằng KẾT NỐI những gì đã có (mới)
+
+Bạn hỏi "còn thiếu gì, cần thứ đột phá" — nhận định của mình: sau bao nhiêu lượt, app đã có RẤT NHIỀU dữ liệu học tập (XP/streak, Sổ lỗi sai, điểm Quiz, tiến độ Kế hoạch ôn tập, điểm cao 3 trò chơi, môn học hay hỏi nhất) — nhưng **mỗi thứ nằm 1 nơi riêng biệt**, học sinh không có chỗ nào xem TỔNG QUAN chính mình đang học thế nào. Đây chính là hướng "hiểu người học, không chỉ hiểu câu hỏi" mà bạn từng nói tới rất lâu trước đây trong cuộc trò chuyện này — giờ mới thực sự làm được, vì cần đủ dữ liệu từ các tính năng đã xây trước đó.
+
+**Cách vào**: bấm vào khung XP/streak ở sidebar (giờ có thể bấm được, trước đây chỉ để xem) → mở "Tiến độ học tập của em".
+
+**Nội dung tổng hợp từ TẤT CẢ hệ thống đã có, không cần xây dữ liệu mới**:
+- Cấp độ / Streak (dài nhất) / Tổng XP.
+- **Môn học hay hỏi nhất** — đếm từ lịch sử chat, hiện dạng thanh ngang.
+- **Điểm yếu cần ôn** — lấy từ Sổ lỗi sai (chỉ lỗi CHƯA khắc phục), có nút "Ôn lại" ngay tại chỗ.
+- **Kết quả Quiz gần đây** — điểm trung bình + 5 lần gần nhất.
+- **Kế hoạch ôn tập** — % hoàn thành từng kế hoạch, bấm vào mở thẳng chi tiết.
+- **Điểm cao trò chơi** — cả 3 game.
+- **Bộ sưu tập thành tựu đầy đủ** — cả đã mở khoá lẫn chưa (mờ đi), không chỉ liệt kê cái đã có.
+
+**"Gợi ý hôm nay"** — tính bằng LUẬT ĐƠN GIẢN (không gọi thêm AI, nhanh, miễn phí, kết quả đoán trước được để test), ưu tiên theo mức độ khẩn cấp thực tế:
+1. Có lỗi sai lặp lại ≥2 lần chưa khắc phục → gợi ý ôn đúng lỗi đó, kèm nút hành động.
+2. Streak về 0 nhưng từng có streak dài → khuyến khích quay lại.
+3. Có kế hoạch ôn tập bị trễ tiến độ → gợi ý sắp xếp lại.
+4. Còn 1 ngày nữa là đạt mốc streak tiếp theo → nhắc đừng bỏ lỡ.
+5. Không có gì đặc biệt → lời động viên chung theo cấp độ hiện tại.
+
+Đã kiểm thử cả 5 nhánh gợi ý bằng dữ liệu giả lập tương ứng, xác nhận đúng thứ tự ưu tiên, và kiểm thử toàn bộ luồng tổng hợp dữ liệu thật (chat nhiều môn, lỗi sai lặp lại, làm quiz, tạo kế hoạch, chơi game) cho ra đúng số liệu ở mọi mục.
+
+⚠️ **Tự bắt được 1 lỗi nghiêm trọng trong lúc làm**: 1 thao tác chỉnh sửa đã vô tình xoá mất dòng khai báo `function openPalette() {` (bảng lệnh nhanh Ctrl+K), làm phần thân hàm bị "mồ côi" — biến thành code chạy ngay lúc tải trang thay vì đợi người dùng bấm. Việc chạy lại kiểm tra cú pháp JS bằng Node.js sau MỖI thay đổi lớn (không chỉ tin `python3 -m py_compile`, vì lệnh đó chỉ kiểm tra phần Python bao quanh) đã bắt được lỗi này ngay lập tức — đã sửa và xác nhận lại bảng lệnh nhanh hoạt động bình thường trước khi giao.
+
 ## Chưa làm (nằm ngoài phạm vi yêu cầu lần này)
 Phần đầu prompt gốc của bạn từng có yêu cầu dựng lại toàn bộ thành một sản phẩm Next.js/TypeScript quy mô lớn (nhiều trang, Dashboard, Blog, Pricing...). Bản cập nhật này vẫn giữ nguyên nền tảng Flask hiện có của bạn. Nếu bạn vẫn muốn bản Next.js quy mô lớn, đó sẽ là một dự án tách riêng — cho mình biết nếu bạn muốn triển khai.
 
