@@ -128,7 +128,23 @@ if not GOOGLE_OAUTH_ENABLED:
 # ==========================================
 # 0.1. CƠ SỞ DỮ LIỆU (Tài khoản + Lịch sử chat) — SQLite
 # ==========================================
-DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'studymate.db')
+# Mặc định: file studymate.db nằm CẠNH app.py — đúng cho chạy local hoặc VPS tự quản lý (thư
+# mục code = nơi lưu database luôn, đơn giản). Trên các nền tảng PaaS có ổ đĩa tạm (Render
+# Free, Railway...), thư mục này bị XOÁ mỗi lần deploy lại — muốn giữ dữ liệu qua các lần
+# deploy, đặt biến môi trường DB_PATH trỏ vào ổ đĩa BỀN VỮNG (Persistent Disk) đã gắn riêng,
+# vd trên Render: DB_PATH=/data/studymate.db (xem README mục 31 để biết cách gắn Disk).
+_db_path_override = os.environ.get('DB_PATH', '').strip()
+if _db_path_override:
+    DB_PATH = _db_path_override
+    os.makedirs(os.path.dirname(os.path.abspath(DB_PATH)) or '.', exist_ok=True)
+else:
+    DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'studymate.db')
+
+# Tài khoản DUY NHẤT được phép giữ vai trò Super Admin trong toàn hệ thống — lấy từ .env
+# (SUPER_ADMIN_USERNAME) nếu có, mặc định "BlackadaNutella". Hằng số cấp module để dùng nhất
+# quán ở cả nơi TỰ ĐỘNG nâng quyền (init_db) lẫn nơi CHẶN nâng quyền cho tài khoản khác
+# (can_manage_role) — xem 2 chỗ dùng bên dưới.
+SUPER_ADMIN_USERNAME = (os.environ.get('SUPER_ADMIN_USERNAME', '') or 'BlackadaNutella').strip()
 
 
 def ensure_columns(conn, table, columns):
@@ -625,6 +641,27 @@ def init_db():
         'environment': "TEXT DEFAULT 'production'", 'version': "TEXT DEFAULT '1.0.0'",
         'rollout_pct': 'INTEGER NOT NULL DEFAULT 0', 'depends_on': "TEXT DEFAULT ''", 'expires_at': 'TEXT',
     })
+    # Các tính năng CÓ SẴN, đang hiện cho MỌI người trước khi có hệ thống flag này — "gieo"
+    # (seed) TẤT CẢ với status='public' ngay từ đầu để KHÔNG vô tình ẩn mất tính năng đang
+    # chạy thật ngay khi bản cập nhật này lên (khác với tính năng HOÀN TOÀN MỚI luôn bắt đầu
+    # ở 'internal' khi tạo qua giao diện Dev Lab — xem developer_lab_create_flag()). Từ giờ
+    # Developer/Admin vào /developer/lab đổi trạng thái BẤT KỲ tính năng nào bên dưới để
+    # ẩn/thử nghiệm/giới hạn % người dùng thấy — không cần sửa code, không cần deploy lại.
+    EXISTING_FEATURES_TO_SEED = [
+        ('game_snake_quiz', 'Rắn Săn Chữ (Snake Quiz)', 'games', 'Trò chơi rắn ăn mồi kết hợp câu hỏi phép tính.'),
+        ('game_quick_math', 'Đố Vui Tính Nhanh (Quick Math)', 'games', 'Trò chơi trả lời phép tính trong 60 giây.'),
+        ('game_memory_match', 'Lật Thẻ Ghi Nhớ (Memory Match)', 'games', 'Trò chơi lật thẻ tìm cặp khớp nhau.'),
+    ]
+    for f_key, f_name, f_category, f_desc in EXISTING_FEATURES_TO_SEED:
+        existing_f = conn.execute("SELECT id FROM feature_flags WHERE key = ?", (f_key,)).fetchone()
+        if not existing_f:
+            conn.execute(
+                '''INSERT INTO feature_flags (key, name, status, category, description, owner_username,
+                   environment, version, rollout_pct, created_at, updated_at)
+                   VALUES (?, ?, 'public', ?, ?, 'system', 'production', '1.0.0', 0, ?, ?)''',
+                (f_key, f_name, f_category, f_desc, now_iso(), now_iso())
+            )
+    conn.commit()
 
     # "Đố Vui Tính Nhanh" (Quick Math) — lưu kết quả từng ván để tính XP/thành tựu + báo cáo
     # điểm yếu theo TỪNG PHÉP TÍNH (không cần gọi AI — số liệu tự thống kê từ ván chơi).
@@ -676,15 +713,28 @@ def init_db():
 
     # ---- Nâng tài khoản chỉ định thành Super Admin ----
     # Super Admin đứng trên cùng hệ thống phân quyền (bao hàm mọi quyền của Admin/Developer/User).
-    # Tên tài khoản lấy từ .env (SUPER_ADMIN_USERNAME) — mặc định "BlackadaNutella" theo yêu cầu.
+    # Tên tài khoản lấy từ SUPER_ADMIN_USERNAME (hằng số cấp module, mặc định "BlackadaNutella").
     # Chỉ áp dụng nếu tài khoản đã tồn tại sẵn — không tự tạo tài khoản mới ở đây vì không có
     # mật khẩu do người dùng đặt để gán vào.
-    super_admin_username = (os.environ.get('SUPER_ADMIN_USERNAME', '') or 'BlackadaNutella').strip()
-    sa_row = conn.execute('SELECT id, role FROM users WHERE username = ?', (super_admin_username,)).fetchone()
+    sa_row = conn.execute('SELECT id, role FROM users WHERE username = ?', (SUPER_ADMIN_USERNAME,)).fetchone()
     if sa_row and sa_row[1] != 'super_admin':
         conn.execute("UPDATE users SET role = 'super_admin' WHERE id = ?", (sa_row[0],))
         conn.commit()
-        print(f"👑 Đã nâng tài khoản '{super_admin_username}' thành Super Admin (có toàn bộ quyền, kể cả Developer).")
+        print(f"👑 Đã nâng tài khoản '{SUPER_ADMIN_USERNAME}' thành Super Admin (có toàn bộ quyền, kể cả Developer).")
+
+    # ---- Dọn dẹp: KHÔNG cho phép tài khoản nào khác ngoài SUPER_ADMIN_USERNAME giữ vai trò
+    # Super Admin (phòng trường hợp trước khi có ràng buộc này, đã lỡ có tài khoản khác được
+    # gán Super Admin bằng tay/qua giao diện cũ) — tự động hạ về 'admin' (vẫn còn quyền quản
+    # trị cao, chỉ mất đúng phần "duy nhất kiểm soát toàn hệ thống").
+    stray_super_admins = conn.execute(
+        "SELECT id, username FROM users WHERE role = 'super_admin' AND username != ?", (SUPER_ADMIN_USERNAME,)
+    ).fetchall()
+    for row in stray_super_admins:
+        conn.execute("UPDATE users SET role = 'admin' WHERE id = ?", (row[0],))
+        print(f"⚠️  Tài khoản '{row[1]}' trước đó có vai trò Super Admin nhưng không phải "
+              f"'{SUPER_ADMIN_USERNAME}' — đã tự hạ về Admin (chỉ '{SUPER_ADMIN_USERNAME}' được giữ Super Admin).")
+    if stray_super_admins:
+        conn.commit()
 
     conn.close()
 
@@ -739,14 +789,26 @@ def role_meta(role):
     return ROLE_META.get(role, ROLE_META['user'])
 
 
-def can_manage_role(actor_role, target_role, new_role):
+def can_manage_role(actor_role, target_role, new_role, is_self=False, target_username=''):
     """Quy tắc: chỉ Super Admin được đụng tới vai trò Admin/Super Admin (cấp hoặc thu hồi).
-    Admin chỉ được đổi qua lại giữa User <-> Developer. Không ai được hạ quyền Super Admin
-    qua giao diện này (an toàn hệ thống — phải sửa trực tiếp trong DB nếu thực sự cần)."""
+    Admin chỉ được đổi qua lại giữa User <-> Developer. Một Super Admin CÓ THỂ hạ quyền một
+    Super Admin KHÁC (vd: tài khoản bị tự động cấp quyền do trùng SUPER_ADMIN_USERNAME, hoặc
+    bị cấp nhầm) — nhưng không ai được tự hạ quyền Super Admin của chính mình qua giao diện
+    này, để luôn còn ít nhất 1 người điều khiển được hệ thống. Số lượng Admin/Super Admin còn
+    lại tối thiểu 1 người được kiểm tra riêng ở nơi gọi hàm này (developer_change_role).
+
+    QUAN TRỌNG: vai trò Super Admin CHỈ được cấp cho ĐÚNG tài khoản SUPER_ADMIN_USERNAME —
+    không ai, kể cả 1 Super Admin khác, được cấp Super Admin cho bất kỳ tài khoản nào khác
+    qua giao diện này (chặn ở đây, trước khi động tới DB)."""
     if new_role not in ROLE_ORDER:
         return False, "Vai trò không hợp lệ."
-    if target_role == 'super_admin' and new_role != 'super_admin':
-        return False, "Không thể hạ quyền Super Admin qua giao diện này."
+    if new_role == 'super_admin' and target_username != SUPER_ADMIN_USERNAME:
+        return False, f"Chỉ tài khoản '{SUPER_ADMIN_USERNAME}' được phép giữ vai trò Super Admin."
+    if target_role == 'super_admin':
+        if actor_role != 'super_admin':
+            return False, "Chỉ Super Admin mới có thể thay đổi vai trò của một Super Admin khác."
+        if is_self and new_role != 'super_admin':
+            return False, "Bạn không thể tự hạ quyền Super Admin của chính mình qua giao diện này."
     if actor_role != 'super_admin':
         if role_rank(target_role) >= role_rank('admin'):
             return False, "Chỉ Super Admin mới có thể thay đổi vai trò của Admin/Super Admin."
@@ -2233,6 +2295,7 @@ HTML = r'''
     <div id="fcGamesListView" class="hidden max-w-3xl mx-auto p-4 lg:p-6">
       <p class="text-xs text-gray-400 mb-4">Học mà chơi — chơi xong tự động lưu điểm yếu vào Sổ lỗi sai để ôn đúng chỗ.</p>
       <div class="grid sm:grid-cols-2 gap-4">
+        {% if game_flags.quick_math %}
         <div class="rounded-2xl border border-gray-200 dark:border-gray-800 p-5">
           <p class="text-3xl mb-2">⚡</p>
           <p class="font-bold">Đố Vui Tính Nhanh</p>
@@ -2240,6 +2303,8 @@ HTML = r'''
           <p class="text-xs text-gray-400 mb-3" id="quickMathBestScore">Điểm cao nhất: —</p>
           <button onclick="openQuickMathSetup()" class="w-full py-2 rounded-xl bg-amber-500 hover:bg-amber-600 text-white text-sm font-semibold">Chơi ngay</button>
         </div>
+        {% endif %}
+        {% if game_flags.snake %}
         <div class="rounded-2xl border border-gray-200 dark:border-gray-800 p-5">
           <p class="text-3xl mb-2">🐍</p>
           <p class="font-bold">Rắn Săn Chữ</p>
@@ -2247,6 +2312,8 @@ HTML = r'''
           <p class="text-xs text-gray-400 mb-3" id="snakeBestScore">Điểm cao nhất: —</p>
           <button onclick="openSnakeSetup()" class="w-full py-2 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white text-sm font-semibold">Chơi ngay</button>
         </div>
+        {% endif %}
+        {% if game_flags.memory_match %}
         <div class="rounded-2xl border border-gray-200 dark:border-gray-800 p-5">
           <p class="text-3xl mb-2">🧠</p>
           <p class="font-bold">Lật thẻ ghi nhớ</p>
@@ -2254,9 +2321,11 @@ HTML = r'''
           <p class="text-xs text-gray-400 mb-3" id="memoryMatchBestScore">Điểm cao nhất: —</p>
           <button onclick="switchFcTab('decks')" class="w-full py-2 rounded-xl bg-blue-600 hover:bg-blue-700 text-white text-sm font-semibold">Chọn bộ thẻ để chơi</button>
         </div>
+        {% endif %}
       </div>
     </div>
 
+    {% if game_flags.snake %}
     <!-- ============ Rắn Săn Chữ: thiết lập ============ -->
     <div id="fcSnakeSetupView" class="hidden max-w-md mx-auto p-4 lg:p-6 text-center">
       <p class="text-4xl mb-3">🐍</p>
@@ -2304,7 +2373,9 @@ HTML = r'''
         <button onclick="switchFcTab('games')" class="px-4 py-2 rounded-xl bg-gray-100 dark:bg-gray-800 text-sm font-semibold">Về thư viện</button>
       </div>
     </div>
+    {% endif %}
 
+    {% if game_flags.quick_math %}
     <!-- ============ Đố Vui Tính Nhanh: thiết lập ============ -->
     <div id="fcQuickMathSetupView" class="hidden max-w-md mx-auto p-4 lg:p-6 text-center">
       <p class="text-4xl mb-3">⚡</p>
@@ -2347,6 +2418,7 @@ HTML = r'''
         <button onclick="switchFcTab('games')" class="px-4 py-2 rounded-xl bg-gray-100 dark:bg-gray-800 text-sm font-semibold">Về thư viện</button>
       </div>
     </div>
+    {% endif %}
 
     <!-- ============ Quiz ============ -->
     <div id="fcQuizListView" class="hidden max-w-4xl mx-auto p-4 lg:p-6">
@@ -2509,7 +2581,9 @@ HTML = r'''
         </div>
         <div class="flex flex-wrap gap-2">
           <button onclick="startStudyMode()" class="px-3.5 py-2 rounded-xl bg-blue-600 hover:bg-blue-700 text-white text-sm font-semibold flex items-center gap-1.5"><i class="fas fa-graduation-cap"></i> Học</button>
+          {% if game_flags.memory_match %}
           <button onclick="startMemoryGame()" class="px-3.5 py-2 rounded-xl bg-amber-500 hover:bg-amber-600 text-white text-sm font-semibold flex items-center gap-1.5"><i class="fas fa-gamepad"></i> Lật thẻ</button>
+          {% endif %}
           <button onclick="deleteCurrentDeck()" class="px-3 py-2 rounded-xl bg-red-50 dark:bg-red-900/20 text-red-600 dark:text-red-400 text-sm hover:bg-red-100 dark:hover:bg-red-900/40"><i class="fas fa-trash-can"></i></button>
         </div>
       </div>
@@ -2541,6 +2615,7 @@ HTML = r'''
       </div>
     </div>
 
+    {% if game_flags.memory_match %}
     <!-- ============ Game: Lật thẻ ghi nhớ (Memory Match) ============ -->
     <div id="fcGameView" class="hidden max-w-2xl mx-auto p-4 lg:p-6">
       <div class="flex items-center justify-between mb-4 text-sm">
@@ -2559,6 +2634,7 @@ HTML = r'''
         </div>
       </div>
     </div>
+    {% endif %}
   </div>
 </div>
 
@@ -6380,13 +6456,14 @@ DEV_STATS_HTML = r'''
             <td class="py-2.5 text-right">
               {% if u.id == current_user_id_val %}
                 <span class="text-xs text-gray-400 italic">(bạn)</span>
-              {% elif u.role == 'super_admin' %}
-                <span class="text-xs text-gray-400 italic">—</span>
+              {% elif u.role == 'super_admin' and not is_super_admin %}
+                <span class="text-xs text-gray-400 italic">Chỉ Super Admin khác mới quản lý được</span>
               {% elif u.role == 'admin' and not is_super_admin %}
                 <span class="text-xs text-gray-400 italic">Chỉ Super Admin quản lý được</span>
               {% else %}
               <div class="flex items-center justify-end gap-1.5 flex-wrap">
-                <form method="POST" action="{{ url_for('developer_change_role', user_id=u.id) }}" class="inline-flex items-center gap-1">
+                <form method="POST" action="{{ url_for('developer_change_role', user_id=u.id) }}" class="inline-flex items-center gap-1"
+                  {% if u.role == 'super_admin' %}onsubmit="return confirm('Hạ quyền Super Admin của {{ u.username }}? Tài khoản này sẽ không còn toàn quyền hệ thống nữa.');"{% endif %}>
                   <select name="role" class="text-xs px-2 py-1.5 rounded-lg bg-gray-100 dark:bg-gray-800 border-0 focus:outline-none focus:ring-1 focus:ring-indigo-500">
                     <option value="user" {{ 'selected' if u.role == 'user' else '' }}>Người dùng</option>
                     <option value="developer" {{ 'selected' if u.role == 'developer' else '' }}>Developer</option>
@@ -6419,7 +6496,7 @@ DEV_STATS_HTML = r'''
                   <button type="submit" class="text-xs font-semibold px-2.5 py-1.5 rounded-lg bg-gray-100 dark:bg-gray-800 text-gray-600 dark:text-gray-300 hover:bg-gray-200">Reset session</button>
                 </form>
 
-                {% if u.role != 'admin' %}
+                {% if u.role not in ('admin', 'super_admin') %}
                 <form method="POST" action="{{ url_for('developer_delete_user', user_id=u.id) }}" class="inline" onsubmit="return confirm('XOÁ VĨNH VIỄN tài khoản này? Không thể hoàn tác.');">
                   <button type="submit" class="text-xs font-semibold px-2.5 py-1.5 rounded-lg bg-red-600 text-white hover:bg-red-700">Xoá</button>
                 </form>
@@ -6768,10 +6845,18 @@ def home():
             discount_amounts[p] = amount
             is_discount_eligible = is_discounted
             discount_months_left = max(0, FIRST_TIME_DISCOUNT_MONTHS - paid_count)
+    # Ví dụ thật cho StudyMate Lab: Rắn Săn Chữ được nối vào flag 'game_snake_quiz' — Developer
+    # có thể ẩn/thử nghiệm % người dùng thấy trực tiếp từ /developer/lab, không cần deploy lại.
+    game_flags = {
+        'snake': is_feature_enabled('game_snake_quiz', user),
+        'quick_math': is_feature_enabled('game_quick_math', user),
+        'memory_match': is_feature_enabled('game_memory_match', user),
+    }
     return render_template_string(
         HTML,
         username=session.get('username', ''),
         role=role,
+        game_flags=game_flags,
         role_icon=role_meta(role)['icon'],
         role_label=role_meta(role)['label'],
         is_developer=(role_rank(role) >= role_rank('developer')),
@@ -6988,7 +7073,8 @@ def developer_change_role(user_id):
 
     new_role = (request.form.get('role') or '').strip()
     actor = current_user()
-    ok, err = can_manage_role(actor['role'], target['role'], new_role)
+    ok, err = can_manage_role(actor['role'], target['role'], new_role,
+                               is_self=(target['id'] == current_user_id()), target_username=target['username'])
     if not ok:
         flash(err)
         return redirect(url_for('developer_stats'))
@@ -8545,6 +8631,8 @@ def api_game_complete():
     riêng khỏi XP mỗi lượt chat) + mở thành tựu 'Người chơi mới' nếu đây là lần đầu."""
     data = request.get_json(silent=True) or {}
     game = (data.get('game') or '').strip()
+    if game == 'memory_match' and not is_feature_enabled('game_memory_match', current_user()):
+        return jsonify({"error": "Trò chơi này hiện chưa khả dụng."}), 403
     try:
         score = int(data.get('score') or 0)
     except (TypeError, ValueError):
@@ -8566,6 +8654,9 @@ def api_quick_math_submit():
     chia"]), server đếm và tự động lưu vào Sổ lỗi sai (dùng lại đúng cơ chế gộp trùng của
     Mistake Book) — đây chính là 'Post-Game Learning Report' của trò chơi này, không cần
     thêm 1 bài quiz AI riêng vì bản thân ván chơi đã LÀ 1 chuỗi câu hỏi rồi."""
+    if not is_feature_enabled('game_quick_math', current_user()):
+        return jsonify({"error": "Trò chơi này hiện chưa khả dụng."}), 403
+
     data = request.get_json(silent=True) or {}
     difficulty = (data.get('difficulty') or 'medium').strip()
     if difficulty not in ('easy', 'medium', 'hard'):
@@ -8638,6 +8729,9 @@ def api_snake_submit():
     câu hỏi = cộng điểm cao hơn + tính 1 câu đúng; game-over khi đâm tường/tự đâm thân — không
     liên quan gì tới việc trả lời đúng/sai (khác Quick Math, chơi vẫn tiếp tục dù trả lời sai
     1 câu hỏi, chỉ đơn giản là bỏ lỡ điểm thưởng lần đó)."""
+    if not is_feature_enabled('game_snake_quiz', current_user()):
+        return jsonify({"error": "Trò chơi này hiện chưa khả dụng."}), 403
+
     data = request.get_json(silent=True) or {}
     difficulty = (data.get('difficulty') or 'medium').strip()
     if difficulty not in ('easy', 'medium', 'hard'):
