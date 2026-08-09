@@ -545,6 +545,26 @@ Trước đây: 1 Super Admin có thể cấp Super Admin cho BẤT KỲ tài kh
 
 **Chưa làm** (như đã nói ở lượt trước, phạm vi lớn hơn hẳn 3 trò chơi): Flashcards, Sổ lỗi sai, Quiz Generator, Kế hoạch ôn tập chưa được nối vào Dev Lab — mỗi tính năng đó có nhiều route API hơn, cần 1 đợt riêng để làm đúng mức cẩn thận đã áp dụng cho 3 trò chơi. Nói mình biết cái nào muốn làm tiếp theo.
 
+## 34. Quên mật khẩu + Chống dò mật khẩu/spam đăng ký (mới) — 2 lỗ hổng nền tảng, không phải tính năng mới
+
+Bạn hỏi "sản phẩm còn thiếu gì" — thay vì thêm tính năng mới, mình chọn vá 2 lỗ hổng thực sự nguy hiểm cho 1 sản phẩm đang có người dùng thật.
+
+### 🔑 Quên mật khẩu (Mã khôi phục)
+Trước đây: quên mật khẩu = hết cách, phải nhờ Admin sửa tay trong database. Không có hạ tầng gửi email (SMTP) nên mình không dùng cách "gửi email đặt lại mật khẩu" — không thể kiểm thử việc gửi email thật trong môi trường của mình, mà mình không giao thứ gì chưa test được. Thay vào đó dùng **mã khôi phục tự chứa**:
+- Đăng ký xong, hiện ra **đúng 1 lần** 1 mã dạng `XXXX-XXXX-XXXX` (bỏ ký tự dễ nhầm 0/O/1/I) — StudyMate chỉ lưu bản băm (hash), giống hệt mật khẩu, không lưu lại bản gốc nên không tự hiện lại lần 2 được.
+- Trang `/forgot-password`: nhập username + mã + mật khẩu mới → đặt lại được ngay, không cần đăng nhập trước.
+- Dùng mã xong tự đổi sang **mã mới** (mã cũ hết hạn ngay) — đúng thông lệ cho mã dùng-một-lần.
+- Tài khoản **có sẵn từ trước** (tạo trước khi có tính năng này) chưa có mã — vào Cài đặt → "Tạo mã khôi phục mật khẩu mới" để tự tạo lần đầu, không cần Admin can thiệp.
+- Không áp dụng cho tài khoản khách/đăng nhập Google (không dùng mật khẩu nên không có gì để "khôi phục").
+- Đã test đầy đủ: đăng ký → thấy mã → dùng mã đặt lại mật khẩu → mã cũ bị từ chối → đăng nhập bằng mật khẩu mới → dùng mã mới đặt lại lần nữa vẫn được.
+
+### 🛡️ Chống dò mật khẩu / spam đăng ký
+- `/login`: giới hạn theo **cặp (IP, tên đăng nhập)** — 8 lần sai/15 phút — KHÔNG tính theo IP đơn thuần, để 1 bạn gõ sai mật khẩu nhiều lần không khoá luôn cả lớp học chung 1 mạng trường (đã kiểm thử đúng kịch bản này: 5 học sinh khác nhau đăng nhập đúng liên tiếp từ CÙNG 1 địa chỉ IP — không ai bị chặn). Có thêm giới hạn tổng theo IP (60 lần/15 phút) chỉ để chặn bot dò quét nhiều tài khoản khác nhau.
+- Đăng nhập đúng thì tự xoá bộ đếm sai (không cộng dồn oan).
+- `/register`: giới hạn 20 lượt/giờ theo IP — đủ rộng cho cả lớp cùng đăng ký trong 1 tiết học, vẫn chặn được spam tạo tài khoản hàng loạt.
+- Đã kiểm thử cả 2 chiều: kịch bản tấn công (bị chặn đúng lúc, kể cả thử mật khẩu ĐÚNG cũng bị chặn nếu đang trong thời gian giới hạn — tránh dò được thời điểm) VÀ kịch bản dùng bình thường (không bị chặn oan).
+- ⚠️ Giới hạn: bộ đếm nằm trong RAM của tiến trình — nếu sau này chạy nhiều worker process (`gunicorn -w 4`), mỗi worker đếm riêng, ngưỡng thực tế sẽ cao hơn số cấu hình. Đủ chặn spam/bot thông thường; quy mô lớn hơn cần Redis.
+
 ## Chưa làm (nằm ngoài phạm vi yêu cầu lần này)
 Phần đầu prompt gốc của bạn từng có yêu cầu dựng lại toàn bộ thành một sản phẩm Next.js/TypeScript quy mô lớn (nhiều trang, Dashboard, Blog, Pricing...). Bản cập nhật này vẫn giữ nguyên nền tảng Flask hiện có của bạn. Nếu bạn vẫn muốn bản Next.js quy mô lớn, đó sẽ là một dự án tách riêng — cho mình biết nếu bạn muốn triển khai.
 
