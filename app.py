@@ -2254,14 +2254,15 @@ HTML = r'''
     </div>
 
     <div id="gamifyWidget" class="hidden px-3 pb-2">
-      <div class="rounded-xl bg-gray-50 dark:bg-gray-900 border border-gray-100 dark:border-gray-800 px-3 py-2.5">
+      <button onclick="openProgressDashboard()" class="w-full text-left rounded-xl bg-gray-50 dark:bg-gray-900 border border-gray-100 dark:border-gray-800 px-3 py-2.5 hover:border-indigo-300 dark:hover:border-indigo-700 transition-colors">
         <div class="flex items-center justify-between text-xs mb-1.5">
           <span class="flex items-center gap-1 font-semibold text-orange-500"><i class="fas fa-fire"></i> <span id="gamifyStreak">0</span> <span data-i18n="streak_days_suffix">ngày</span></span>
           <span class="text-gray-400"><span data-i18n="level_prefix">Cấp</span> <span id="gamifyLevel" class="font-semibold text-gray-600 dark:text-gray-300">1</span></span>
         </div>
         <div class="gamify-xp-track"><div id="gamifyXpBar" class="gamify-xp-fill" style="width: 0%;"></div></div>
         <p id="gamifyXpText" class="text-[10px] text-gray-400 mt-1 text-right">0/100 XP</p>
-      </div>
+        <p class="text-[10px] text-indigo-500 dark:text-indigo-400 font-medium mt-1.5 flex items-center gap-1"><i class="fas fa-chart-line"></i> Xem tiến độ học tập →</p>
+      </button>
     </div>
 
     <div class="border-t border-gray-200 dark:border-gray-800 p-3 relative">
@@ -2777,6 +2778,78 @@ HTML = r'''
       </div>
     </div>
     {% endif %}
+  </div>
+</div>
+
+<div id="progressOverlay" class="hidden fixed inset-0 bg-white dark:bg-[#131313] z-[70] flex flex-col">
+  <div class="flex items-center justify-between px-4 lg:px-6 py-3.5 border-b border-gray-200 dark:border-gray-800 flex-shrink-0">
+    <h2 class="font-bold flex items-center gap-2"><i class="fas fa-chart-line text-indigo-500"></i> Tiến độ học tập của em</h2>
+    <button onclick="document.getElementById('progressOverlay').classList.add('hidden')" class="w-9 h-9 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-800 flex items-center justify-center"><i class="fas fa-xmark"></i></button>
+  </div>
+  <div class="flex-1 overflow-y-auto">
+    <div class="max-w-3xl mx-auto p-4 lg:p-6 space-y-5">
+
+      <!-- Gợi ý hôm nay -->
+      <div id="progressSuggestionBox" class="rounded-2xl p-4 bg-gradient-to-br from-indigo-50 to-purple-50 dark:from-indigo-900/20 dark:to-purple-900/20 border border-indigo-100 dark:border-indigo-900/50">
+        <p class="text-xs font-semibold text-indigo-500 uppercase mb-1.5"><i class="fas fa-lightbulb mr-1"></i>Gợi ý hôm nay</p>
+        <p id="progressSuggestionText" class="text-sm font-medium mb-2"></p>
+        <button id="progressSuggestionAction" class="hidden text-sm font-semibold px-3.5 py-2 rounded-lg bg-indigo-600 hover:bg-indigo-700 text-white"></button>
+      </div>
+
+      <!-- Tổng quan -->
+      <div class="grid grid-cols-3 gap-3">
+        <div class="rounded-2xl border border-gray-200 dark:border-gray-800 p-4 text-center">
+          <p class="text-2xl font-bold text-indigo-600 dark:text-indigo-400" id="progLevel">1</p>
+          <p class="text-[11px] text-gray-400 uppercase mt-0.5">Cấp độ</p>
+        </div>
+        <div class="rounded-2xl border border-gray-200 dark:border-gray-800 p-4 text-center">
+          <p class="text-2xl font-bold text-orange-500" id="progStreak">0</p>
+          <p class="text-[11px] text-gray-400 uppercase mt-0.5">Streak (dài nhất <span id="progLongestStreak">0</span>)</p>
+        </div>
+        <div class="rounded-2xl border border-gray-200 dark:border-gray-800 p-4 text-center">
+          <p class="text-2xl font-bold text-emerald-500" id="progXp">0</p>
+          <p class="text-[11px] text-gray-400 uppercase mt-0.5">Tổng XP</p>
+        </div>
+      </div>
+
+      <!-- Môn học hay hỏi nhất -->
+      <div id="progressSubjectsSection" class="hidden">
+        <h3 class="text-sm font-bold mb-2.5">📚 Môn học hay hỏi nhất</h3>
+        <div id="progressSubjects" class="space-y-2"></div>
+      </div>
+
+      <!-- Điểm yếu cần ôn -->
+      <div id="progressWeakSection" class="hidden">
+        <h3 class="text-sm font-bold mb-2.5">⚠️ Điểm yếu cần ôn (chưa khắc phục)</h3>
+        <div id="progressWeakTopics" class="space-y-2"></div>
+      </div>
+
+      <!-- Quiz -->
+      <div id="progressQuizSection" class="hidden">
+        <h3 class="text-sm font-bold mb-2.5">📝 Kết quả Quiz gần đây</h3>
+        <p class="text-xs text-gray-400 mb-2">Điểm trung bình: <span id="progQuizAvg" class="font-semibold"></span>% (<span id="progQuizCount"></span> bài đã làm)</p>
+        <div id="progressQuizList" class="flex gap-2 flex-wrap"></div>
+      </div>
+
+      <!-- Kế hoạch ôn tập -->
+      <div id="progressPlansSection" class="hidden">
+        <h3 class="text-sm font-bold mb-2.5">🎯 Kế hoạch ôn tập</h3>
+        <div id="progressPlans" class="space-y-2"></div>
+      </div>
+
+      <!-- Trò chơi -->
+      <div id="progressGamesSection" class="hidden">
+        <h3 class="text-sm font-bold mb-2.5">🎮 Điểm cao trò chơi</h3>
+        <div id="progressGames" class="grid grid-cols-3 gap-2"></div>
+      </div>
+
+      <!-- Thành tựu -->
+      <div>
+        <h3 class="text-sm font-bold mb-2.5">🏅 Thành tựu</h3>
+        <div id="progressAchievements" class="grid grid-cols-4 sm:grid-cols-6 gap-2"></div>
+      </div>
+
+    </div>
   </div>
 </div>
 
@@ -3749,6 +3822,155 @@ function getPaletteCommands() {
 
 let paletteSelectedIndex = 0;
 let paletteFiltered = [];
+
+// ==================================================================
+// BẢNG TIẾN ĐỘ HỌC TẬP (Progress Dashboard) — tổng hợp XP/streak/Sổ lỗi
+// sai/Quiz/Kế hoạch ôn tập/Game thành 1 bức tranh duy nhất.
+// ==================================================================
+async function openProgressDashboard() {
+  document.getElementById('progressOverlay').classList.remove('hidden');
+  try {
+    const res = await fetch('/api/progress');
+    if (!res.ok) return;
+    renderProgressDashboard(await res.json());
+  } catch (e) { /* im lặng bỏ qua lỗi mạng */ }
+}
+
+function renderProgressDashboard(data) {
+  document.getElementById('progLevel').textContent = data.level;
+  document.getElementById('progStreak').textContent = data.streak_days;
+  document.getElementById('progLongestStreak').textContent = data.longest_streak;
+  document.getElementById('progXp').textContent = data.xp;
+
+  // ---- Gợi ý hôm nay ----
+  document.getElementById('progressSuggestionText').textContent = data.suggestion.text;
+  const actionBtn = document.getElementById('progressSuggestionAction');
+  actionBtn.classList.add('hidden');
+  actionBtn.onclick = null;
+  if (data.suggestion.type === 'weak_topic') {
+    actionBtn.textContent = 'Ôn lại ngay';
+    actionBtn.classList.remove('hidden');
+    actionBtn.onclick = () => { document.getElementById('progressOverlay').classList.add('hidden'); practiceMistake(data.suggestion.subject, data.suggestion.description); };
+  } else if (data.suggestion.type === 'overdue_plan') {
+    actionBtn.textContent = 'Xem kế hoạch';
+    actionBtn.classList.remove('hidden');
+    actionBtn.onclick = () => { document.getElementById('progressOverlay').classList.add('hidden'); openFlashcards(); switchFcTab('plans'); setTimeout(() => showPlanDetail(data.suggestion.plan_id), 150); };
+  } else if (data.suggestion.type === 'restart_streak' || data.suggestion.type === 'generic') {
+    actionBtn.textContent = 'Bắt đầu học ngay';
+    actionBtn.classList.remove('hidden');
+    actionBtn.onclick = () => { document.getElementById('progressOverlay').classList.add('hidden'); closeSidebar(); newChat(); };
+  }
+
+  // ---- Môn học hay hỏi nhất (thanh ngang bằng CSS, không cần thư viện biểu đồ) ----
+  const subjSection = document.getElementById('progressSubjectsSection');
+  const subjContainer = document.getElementById('progressSubjects');
+  subjContainer.innerHTML = '';
+  subjSection.classList.toggle('hidden', !data.subject_activity.length);
+  const maxCount = data.subject_activity.length ? data.subject_activity[0].count : 1;
+  data.subject_activity.forEach(s => {
+    const pct = Math.round((s.count / maxCount) * 100);
+    const row = document.createElement('div');
+    row.innerHTML = `
+      <div class="flex items-center justify-between text-xs mb-1">
+        <span class="font-medium">${escapeHtml(s.subject)}</span>
+        <span class="text-gray-400">${s.count} lượt hỏi</span>
+      </div>
+      <div class="gamify-xp-track"><div class="gamify-xp-fill" style="width:${pct}%;"></div></div>`;
+    subjContainer.appendChild(row);
+  });
+
+  // ---- Điểm yếu cần ôn ----
+  const weakSection = document.getElementById('progressWeakSection');
+  const weakContainer = document.getElementById('progressWeakTopics');
+  weakContainer.innerHTML = '';
+  weakSection.classList.toggle('hidden', !data.weak_topics.length);
+  data.weak_topics.forEach(w => {
+    const row = document.createElement('div');
+    row.className = 'flex items-center justify-between gap-2 rounded-xl border border-amber-100 dark:border-amber-900/40 bg-amber-50 dark:bg-amber-900/10 px-3.5 py-2.5';
+    row.innerHTML = `
+      <div class="min-w-0">
+        <p class="text-sm truncate">${escapeHtml(w.description)} <span class="text-amber-500 font-semibold">×${w.count}</span></p>
+        <p class="text-[11px] text-gray-400">${escapeHtml(w.subject)}</p>
+      </div>
+      <button class="prog-review-btn flex-shrink-0 text-xs font-semibold px-3 py-1.5 rounded-lg bg-amber-500 hover:bg-amber-600 text-white">Ôn lại</button>`;
+    row.querySelector('.prog-review-btn').addEventListener('click', () => {
+      document.getElementById('progressOverlay').classList.add('hidden');
+      practiceMistake(w.subject, w.description);
+    });
+    weakContainer.appendChild(row);
+  });
+
+  // ---- Quiz ----
+  const quizSection = document.getElementById('progressQuizSection');
+  quizSection.classList.toggle('hidden', !data.quiz_stats.total_attempts);
+  if (data.quiz_stats.total_attempts) {
+    document.getElementById('progQuizAvg').textContent = data.quiz_stats.avg_score_pct;
+    document.getElementById('progQuizCount').textContent = data.quiz_stats.total_attempts;
+    const quizList = document.getElementById('progressQuizList');
+    quizList.innerHTML = '';
+    data.quiz_stats.recent.forEach(q => {
+      const chip = document.createElement('div');
+      const color = q.pct >= 80 ? 'bg-emerald-100 dark:bg-emerald-900/30 text-emerald-700 dark:text-emerald-400' :
+                    q.pct >= 50 ? 'bg-amber-100 dark:bg-amber-900/30 text-amber-700 dark:text-amber-400' :
+                    'bg-red-100 dark:bg-red-900/30 text-red-700 dark:text-red-400';
+      chip.className = `text-xs font-semibold px-2.5 py-1.5 rounded-lg ${color}`;
+      chip.textContent = `${q.score}/${q.total} (${q.pct}%) · ${q.date.slice(5)}`;
+      quizList.appendChild(chip);
+    });
+  }
+
+  // ---- Kế hoạch ôn tập ----
+  const plansSection = document.getElementById('progressPlansSection');
+  const plansContainer = document.getElementById('progressPlans');
+  plansContainer.innerHTML = '';
+  plansSection.classList.toggle('hidden', !data.study_plans.length);
+  data.study_plans.forEach(p => {
+    const row = document.createElement('div');
+    row.className = 'rounded-xl border border-gray-200 dark:border-gray-800 px-3.5 py-2.5 cursor-pointer hover:border-emerald-400 dark:hover:border-emerald-600';
+    row.innerHTML = `
+      <div class="flex items-center justify-between text-xs mb-1">
+        <span class="font-medium truncate">${escapeHtml(p.title)}</span>
+        <span class="text-gray-400">${p.done}/${p.total} việc</span>
+      </div>
+      <div class="gamify-xp-track"><div class="gamify-xp-fill" style="width:${p.pct}%; background: linear-gradient(90deg,#10b981,#14b8a6);"></div></div>`;
+    row.addEventListener('click', () => {
+      document.getElementById('progressOverlay').classList.add('hidden');
+      openFlashcards(); switchFcTab('plans'); setTimeout(() => showPlanDetail(p.id), 150);
+    });
+    plansContainer.appendChild(row);
+  });
+
+  // ---- Điểm cao trò chơi ----
+  const gamesSection = document.getElementById('progressGamesSection');
+  const gamesContainer = document.getElementById('progressGames');
+  gamesContainer.innerHTML = '';
+  const gameLabels = { quick_math: ['⚡', 'Tính Nhanh'], snake: ['🐍', 'Rắn Săn Chữ'], memory_match: ['🧠', 'Lật Thẻ'] };
+  const gameKeys = Object.keys(data.game_stats);
+  gamesSection.classList.toggle('hidden', !gameKeys.length);
+  gameKeys.forEach(k => {
+    const [emoji, label] = gameLabels[k] || ['🎮', k];
+    const g = data.game_stats[k];
+    const cell = document.createElement('div');
+    cell.className = 'rounded-xl border border-gray-200 dark:border-gray-800 p-3 text-center';
+    cell.innerHTML = `<p class="text-xl">${emoji}</p><p class="text-sm font-bold mt-1">${g.bestScore}</p><p class="text-[10px] text-gray-400">${label}</p>`;
+    gamesContainer.appendChild(cell);
+  });
+
+  // ---- Thành tựu (đủ bộ, khoá/mở khoá) ----
+  const achContainer = document.getElementById('progressAchievements');
+  achContainer.innerHTML = '';
+  const earnedCodes = new Set(data.achievements.map(a => a.code));
+  Object.keys(ACHIEVEMENTS_META_JS).forEach(code => {
+    const meta = ACHIEVEMENTS_META_JS[code];
+    const earned = earnedCodes.has(code);
+    const cell = document.createElement('div');
+    cell.className = `rounded-xl border p-2.5 text-center ${earned ? 'border-indigo-200 dark:border-indigo-800 bg-indigo-50 dark:bg-indigo-900/20' : 'border-gray-100 dark:border-gray-800 opacity-40'}`;
+    cell.title = meta.desc;
+    cell.innerHTML = `<p class="text-lg">${meta.icon}</p><p class="text-[9px] mt-0.5 leading-tight">${escapeHtml(meta.label)}</p>`;
+    achContainer.appendChild(cell);
+  });
+}
+
 
 function openPalette() {
   closeAllModals();
@@ -8691,6 +8913,116 @@ def api_plan():
 def api_gamification():
     """XP / streak / thành tựu của tài khoản đang đăng nhập — hiển thị ở sidebar + Cài đặt."""
     return jsonify(get_user_stats(current_user_id()))
+
+
+STREAK_MILESTONES_LIST = [3, 10, 30, 100, 200, 300, 500, 1000]
+
+
+def _compute_progress_suggestion(user_id, db, stats, weak_topics, overdue_plan):
+    """Gợi ý 'hôm nay nên làm gì' — HOÀN TOÀN dựa trên luật (rule-based) từ dữ liệu đã có sẵn,
+    KHÔNG gọi thêm AI nào (nhanh, miễn phí, dễ kiểm thử/dự đoán được kết quả). Trả về dict có
+    'type' để frontend biết hiện nút hành động nào tương ứng. Thứ tự ưu tiên PHẢN ÁNH đúng mức
+    độ khẩn cấp thực tế: lỗi sai lặp lại nhiều nhất trước, rồi tới streak sắp mất, rồi tới kế
+    hoạch bị trễ, rồi tới mốc streak sắp đạt, cuối cùng mới là lời động viên chung chung."""
+    if weak_topics and weak_topics[0]['count'] >= 2:
+        w = weak_topics[0]
+        return {
+            'type': 'weak_topic',
+            'text': f"Em hay sai \"{w['description']}\" ở môn {w['subject']} ({w['count']} lần) — ôn lại ngay nhé?",
+            'subject': w['subject'], 'description': w['description'],
+        }
+
+    if stats['streak_days'] == 0 and stats['longest_streak'] > 0:
+        return {'type': 'restart_streak',
+                'text': f"Em từng đạt streak {stats['longest_streak']} ngày — quay lại học hôm nay để bắt đầu chuỗi mới nhé!"}
+
+    if overdue_plan:
+        return {'type': 'overdue_plan', 'text': f"Kế hoạch \"{overdue_plan['title']}\" đang bị trễ tiến độ — sắp xếp lại nhé?",
+                'plan_id': overdue_plan['id']}
+
+    if stats['streak_days'] > 0:
+        next_milestones = [m for m in STREAK_MILESTONES_LIST if m > stats['streak_days']]
+        if next_milestones and next_milestones[0] - stats['streak_days'] == 1:
+            return {'type': 'streak_milestone',
+                    'text': f"Chỉ còn 1 ngày nữa là em đạt mốc streak {next_milestones[0]} rồi — đừng bỏ lỡ hôm nay! 🔥"}
+
+    return {'type': 'generic',
+            'text': f"Em đang ở cấp {stats['level']} với {stats['xp']} XP — tiếp tục hỏi bài hoặc làm 1 quiz để lên cấp nhé!"}
+
+
+@app.route('/api/progress', methods=['GET'])
+@login_required
+def api_progress():
+    """Tổng hợp TOÀN BỘ dữ liệu học tập rải rác ở nhiều hệ thống khác nhau (XP/streak, Sổ lỗi
+    sai, điểm Quiz, tiến độ Kế hoạch ôn tập, điểm cao trò chơi, môn học hay hỏi nhất) thành 1
+    bức tranh DUY NHẤT cho chính học sinh xem — trước đây mỗi thứ nằm 1 nơi riêng biệt, không
+    có gì kết nối lại. Kèm 1 gợi ý 'hôm nay nên làm gì' tính bằng luật đơn giản (không gọi AI)."""
+    user_id = current_user_id()
+    db = get_db()
+    stats = get_user_stats(user_id)
+
+    subject_rows = db.execute(
+        "SELECT subject, COUNT(*) c FROM usage_logs WHERE user_id = ? AND status = 'ok' AND subject IS NOT NULL "
+        "GROUP BY subject ORDER BY c DESC LIMIT 6", (user_id,)
+    ).fetchall()
+    subject_activity = [{'subject': r['subject'], 'count': r['c']} for r in subject_rows]
+
+    mistake_rows = db.execute(
+        "SELECT subject, description, occurrence_count FROM mistakes WHERE user_id = ? AND resolved = 0 "
+        "ORDER BY occurrence_count DESC LIMIT 5", (user_id,)
+    ).fetchall()
+    weak_topics = [{'subject': r['subject'] or 'Khác', 'description': r['description'], 'count': r['occurrence_count']}
+                    for r in mistake_rows]
+
+    quiz_rows = db.execute(
+        "SELECT score, total, created_at FROM quiz_attempts WHERE user_id = ? ORDER BY created_at DESC LIMIT 10",
+        (user_id,)
+    ).fetchall()
+    quiz_recent = [{'score': r['score'], 'total': r['total'],
+                     'pct': round(100 * r['score'] / r['total']) if r['total'] else 0,
+                     'date': r['created_at'][:10]} for r in quiz_rows]
+    quiz_avg_pct = round(sum(q['pct'] for q in quiz_recent) / len(quiz_recent)) if quiz_recent else None
+
+    plan_rows = db.execute('''
+        SELECT p.id, p.title, p.start_date, COUNT(t.id) AS total,
+               COALESCE(SUM(CASE WHEN t.status = 'done' THEN 1 ELSE 0 END), 0) AS done
+        FROM study_plans p LEFT JOIN study_tasks t ON t.plan_id = p.id
+        WHERE p.user_id = ? GROUP BY p.id ORDER BY p.created_at DESC
+    ''', (user_id,)).fetchall()
+    study_plans, overdue_plan = [], None
+    today = now_iso()[:10]
+    for r in plan_rows:
+        pct = round(100 * r['done'] / r['total']) if r['total'] else 0
+        study_plans.append({'id': r['id'], 'title': r['title'], 'done': r['done'], 'total': r['total'], 'pct': pct})
+        if pct < 100 and not overdue_plan:
+            try:
+                days_since = (datetime.strptime(today, '%Y-%m-%d') - datetime.strptime(r['start_date'][:10], '%Y-%m-%d')).days + 1
+                pending_overdue = db.execute(
+                    "SELECT COUNT(*) c FROM study_tasks WHERE plan_id = ? AND status = 'pending' AND day_number < ?",
+                    (r['id'], days_since)
+                ).fetchone()['c']
+                if pending_overdue > 0:
+                    overdue_plan = {'id': r['id'], 'title': r['title']}
+            except (ValueError, TypeError):
+                pass
+
+    game_rows = db.execute(
+        'SELECT game, MAX(score) AS best_score, COUNT(*) AS play_count FROM game_sessions WHERE user_id = ? GROUP BY game',
+        (user_id,)
+    ).fetchall()
+    game_stats = {r['game']: {'bestScore': r['best_score'], 'playCount': r['play_count']} for r in game_rows}
+
+    suggestion = _compute_progress_suggestion(user_id, db, stats, weak_topics, overdue_plan)
+
+    return jsonify({
+        **stats,
+        'subject_activity': subject_activity,
+        'weak_topics': weak_topics,
+        'quiz_stats': {'total_attempts': len(quiz_recent), 'avg_score_pct': quiz_avg_pct, 'recent': quiz_recent[:5]},
+        'study_plans': study_plans,
+        'game_stats': game_stats,
+        'suggestion': suggestion,
+    })
 
 
 # ==========================================
