@@ -128,7 +128,15 @@ if not GOOGLE_OAUTH_ENABLED:
 # ==========================================
 # 0.1. CƠ SỞ DỮ LIỆU (Tài khoản + Lịch sử chat) — SQLite
 # ==========================================
-DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'studymate.db')
+# Cho phép trỏ studymate.db ra ngoài thư mục chứa app.py — QUAN TRỌNG khi deploy trên Render:
+# filesystem của Render là "ephemeral" (mất hết dữ liệu mỗi lần redeploy/restart/spin-down),
+# TRỪ đường dẫn nằm bên trong một Persistent Disk đã gắn vào service (Render Dashboard ->
+# service -> Disks -> Add Disk -> đặt Mount Path, vd: /var/data). Khi đó, đặt biến môi trường
+# DB_PATH=/var/data/studymate.db trong phần Environment của Render để dữ liệu (tài khoản, lịch
+# sử chat, log sử dụng...) không bị xoá sau mỗi lần deploy. Nếu không đặt DB_PATH, mặc định vẫn
+# lưu cạnh app.py như trước (dùng tốt khi chạy local hoặc trên VPS có ổ đĩa riêng).
+_env_db_path = os.environ.get('DB_PATH', '').strip()
+DB_PATH = _env_db_path or os.path.join(os.path.dirname(os.path.abspath(__file__)), 'studymate.db')
 
 
 def ensure_columns(conn, table, columns):
@@ -6509,6 +6517,15 @@ def home():
 # ==========================================
 # 6. ĐỊNH TUYẾN BẢO MẬT (Trang báo cáo)
 # ==========================================
+@app.route('/healthz')
+def healthz():
+    """Endpoint nhẹ, không cần đăng nhập, không đụng DB — dùng cho các dịch vụ 'ping giữ ấm'
+    (UptimeRobot, cron-job.org...) để giảm khả năng service Free trên Render bị spin-down do
+    15 phút không có traffic. Lưu ý: cách này KHÔNG giúp lưu dữ liệu vĩnh viễn — nó chỉ giữ
+    server không ngủ, không thay thế cho Persistent Disk / Postgres (xem README mục Deploy)."""
+    return jsonify({"status": "ok", "time": now_iso()})
+
+
 @app.route('/security')
 def security_report():
     return render_template_string(SECURITY_HTML)
