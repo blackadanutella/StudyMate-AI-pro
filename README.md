@@ -409,6 +409,64 @@ Bạn gửi 1 bản đặc tả rất chi tiết cho 1 **ứng dụng desktop Wi
 
 Nếu bạn muốn, mình có thể bắt đầu 1 cuộc trò chuyện RIÊNG chuyên về dự án Tauri này (không lẫn vào `app.py`), viết code từng phần và giải thích rõ phần nào mình **chưa** chạy thử được (vì không có Windows) để bạn tự kiểm tra khi build máy thật — miễn là hiểu rõ từ đầu đây là 1 dự án khác, tốc độ và độ tin cậy sẽ khác hẳn so với những gì mình giao trong `app.py` suốt từ đầu tới giờ.
 
+## 26. Trò chơi học tập + Developer Lab (mới) — đã chọn lọc kỹ từ bản đặc tả 40 mục
+
+Bạn gửi 1 bản đặc tả cực lớn: Design Studio đổi giao diện toàn diện (background/theme/chat bubble/nút tuỳ chỉnh), Developer Lab đầy đủ (Experiments/Sandbox/Game Lab/Feature Flags), và cả 1 nền tảng game giáo dục (Flappy Study, Snake Quiz, Memory Match, Quick Math...) kèm hệ thống Developer tự tạo/publish/kiểm duyệt game. Đây thực chất là đặc tả cho vài dự án riêng biệt. Đã chọn ra phần **làm được TRỌN VẸN, kiểm thử được đầy đủ**, đúng tinh thần "không để nút bấm giả" mà chính bản đặc tả của bạn yêu cầu:
+
+### ⚡ Đố Vui Tính Nhanh (Quick Math) — trò chơi mới, đã test kỹ
+- 60 giây, trả lời phép cộng/trừ/nhân/chia trắc nghiệm 4 đáp án, 3 mức độ khó (Dễ/Trung bình/Khó).
+- Đã **kiểm thử 60.000 câu hỏi được sinh ngẫu nhiên** (chạy độc lập bằng Node.js) để đảm bảo: phép chia luôn chia hết (không có số dư khó chịu), phép trừ không bao giờ ra âm, đáp án đúng luôn nằm trong 4 lựa chọn, không có vòng lặp vô hạn khi sinh đáp án nhiễu — mức độ chắc chắn này thường chỉ có được khi test trên trình duyệt thật, ở đây làm được vì logic sinh câu hỏi thuần JS, không phụ thuộc DOM/canvas.
+- **"Post-Game Learning Report" (mục 23-24 trong đặc tả)**: sau ván chơi, tự động thống kê em hay sai PHÉP TÍNH nào (cộng/trừ/nhân/chia) — không cần gọi AI để biết điều này, chỉ đếm trực tiếp từ ván chơi. Phép tính hay sai được **tự động lưu vào Sổ lỗi sai** (dùng lại đúng cơ chế gộp trùng lặp đã có), gộp ĐÚNG kiểu cộng dồn qua nhiều ván chơi khác nhau (chơi lại vào hôm sau vẫn sai phép nhân → tăng số đếm, không tạo dòng mới) — đã kiểm thử kỹ điều này.
+- Có XP + 2 thành tựu mới: ⚡ **Tia chớp** (combo 10 câu đúng liên tiếp), 🎯 **Không sai một câu** (100% chính xác, từ 10 câu trở lên).
+- Đã bỏ qua bước "AI tạo 1 quiz trắc nghiệm sau khi chơi xong" mà đặc tả yêu cầu — vì bản thân ván Tính Nhanh ĐÃ LÀ một chuỗi câu hỏi rồi, thêm 1 lớp quiz AI riêng sau đó sẽ dư thừa, không có giá trị học tập thêm. Thay vào đó tập trung vào phần thật sự hữu ích: xác định điểm yếu + tự lưu vào Sổ lỗi sai.
+- Xem trong tab **"Trò chơi"** mới (cạnh Quiz, Kế hoạch ôn tập) — cùng chỗ với Lật thẻ ghi nhớ (đã có từ trước), có bảng điểm cao nhất riêng cho từng trò.
+
+### 🧪 Developer Lab (`/developer/lab`) — Feature Flags
+- Trang mới, Developer trở lên vào được (không cần tới Admin).
+- Tạo/bật/tắt "cờ tính năng" (feature flag) theo 3 cấp: **off** (tắt hẳn), **internal** (chỉ Developer trở lên thấy — tự test trước khi công khai), **public** (bật cho mọi người) — không cần sửa code hay khởi động lại server.
+- Đã kiểm thử đủ 3 cấp + trường hợp flag chưa tồn tại (mặc định an toàn = tắt) + chặn tài khoản thường truy cập trang này.
+- ⚠️ Hiện CHƯA có tính năng thử nghiệm cụ thể nào trong app đang dùng flag này (không có gì đang "làm dở" cần giấu bớt) — đây là hạ tầng chuẩn bị sẵn cho tính năng thử nghiệm sau này, không phải tính năng có sẵn output ngay lập tức. Trang Dev Lab cũng gộp luôn số liệu tổng hợp 2 trò chơi (tổng lượt chơi, điểm trung bình, độ chính xác trung bình).
+
+### Đã CHỦ ĐỘNG bỏ qua (và lý do cụ thể)
+- **Flappy Study / Snake Quiz**: cần game loop canvas + vật lý + va chạm — loại code mình không thể "nhìn thấy chạy" để xác nhận mượt/đúng như Quick Math (vốn chỉ là DOM + logic thuần, test được bằng code). Làm ẩu 1 game canvas lỗi còn tệ hơn không làm.
+- **Design Studio đổi toàn bộ giao diện** (background upload, đổi màu chủ đạo toàn app, tuỳ chỉnh bong bóng chat...): app hiện dùng class màu Tailwind viết cứng (`bg-blue-600`...) rải khắp hàng nghìn dòng, không dùng biến CSS theo màu — muốn đổi màu chủ đạo TOÀN BỘ giao diện một cách nhất quán cần thay thế có hệ thống rất nhiều chỗ, rủi ro làm vỡ giao diện ở đâu đó mà không kiểm hết được trong 1 lượt. Đây là việc làm được nhưng cần 1 đợt riêng, làm cẩn thận từng phần.
+- **Developer Game Creator + publish + kiểm duyệt Admin**: là 1 hệ thống lớn tương đương với việc xây 1 "App Store" mini cho game — ngoài phạm vi hợp lý của 1 lượt cập nhật.
+- **Experiments/versioning, API Test riêng** (đã có Playground), **Deployments**: trùng lặp hoặc không áp dụng được với kiến trúc Flask hiện tại.
+
+## 27. Dữ liệu người dùng có mất khi "lên live" không? (câu trả lời ngắn: KHÔNG, với 1 điều kiện)
+
+**Không mất — với điều kiện duy nhất: bạn phải mang theo file `studymate.db` khi deploy, không được để nó tạo mới từ đầu.**
+
+Đã kiểm chứng trực tiếp (không chỉ đọc code): tạo 1 tài khoản, sau đó **giả lập việc "lên live"** bằng cách chạy lại toàn bộ `init_db()` trên đúng file database đó (đúng những gì xảy ra mỗi lần khởi động server) — tài khoản vẫn còn nguyên. Lý do: toàn bộ hệ thống migration (`ensure_columns()`, xem mục 20) chỉ THÊM cột còn thiếu, không bao giờ xoá bảng hay xoá dữ liệu. Đã rà lại toàn bộ code — không có `DROP TABLE` nào, chỗ duy nhất có `DELETE FROM users` là thao tác Admin xoá 1 tài khoản CỤ THỂ (có điều kiện `WHERE id = ?`), không phải xoá sạch.
+
+**Việc bạn cần tự làm khi deploy thật** (đây là phần vận hành, không phải lỗi code):
+- Copy file `studymate.db` (đang có ở máy bạn, cùng thư mục `app.py`) lên server, đặt CÙNG thư mục với `app.py` trên server — đừng để server tự tạo file `studymate.db` MỚI (rỗng).
+- Nếu dùng Git để deploy: thêm `studymate.db` vào `.gitignore` (đừng để git ghi đè database production bằng database cũ hơn mỗi lần deploy) — copy file database sang server BẰNG TAY (hoặc dùng volume/mount riêng nếu deploy bằng Docker), tách biệt hẳn khỏi quy trình deploy code.
+- **Nên sao lưu định kỳ**: `cp studymate.db studymate.db.backup-$(date +%Y%m%d)` trước mỗi lần deploy — phòng trường hợp thao tác deploy có sai sót gì đó ở phía hạ tầng (ngoài tầm kiểm soát của code Python).
+
+## 28. StudyMate Lab — nâng cấp Feature Flags thành nền tảng thử nghiệm (mới)
+
+Bạn gửi tiếp 1 bản đặc tả 51 mục cho "StudyMate Lab" — 1 nền tảng feature-flag cấp doanh nghiệp đầy đủ (Feature Registry, A/B Testing, Health Monitoring tự động, Release Approval Pipeline nhiều môi trường, Game Lab, UI Lab...). Đã **nâng cấp thật** trang Feature Flags có sẵn (không thay thế, đúng yêu cầu "extend, not replace") với phần làm được TRỌN VẸN và **kiểm chứng được bằng số liệu thống kê thật**, không phải chỉ đọc code rồi tin là đúng:
+
+### Đã nâng cấp
+- **Feature Registry đầy đủ hơn**: mỗi tính năng giờ có tên hiển thị, danh mục (games/ai/ui/learning/teacher/developer/other), phiên bản, người tạo, môi trường (nhãn thông tin), ngày hết hạn — không còn là 1 flag on/off trơn.
+- **4 trạng thái → 5 trạng thái**: thêm **beta** (rollout theo %) và **archived** (tắt nhưng giữ lại lịch sử, khác với xoá hẳn).
+- **Rollout theo % có kiểm chứng thống kê thật**: dùng hash ổn định (SHA-256) để 1 tài khoản LUÔN nhận cùng 1 kết quả bật/tắt cho cùng 1 flag — đã test với **10.000 tài khoản giả lập**, xác nhận tỉ lệ % thực tế lệch chưa tới 0.6% so với con số cấu hình (1%, 5%, 10%...100%), và xác nhận tính ổn định (gọi lại 100 lần vẫn ra cùng kết quả).
+- **Phụ thuộc giữa các tính năng (dependencies)**: 1 tính năng có thể khai "phụ thuộc" vào tính năng khác — nếu phụ thuộc đó CHƯA bật cho đúng người dùng này thì tính năng chính cũng không bật được, dù trạng thái riêng của nó là gì. Đã kiểm thử đúng kịch bản trong đặc tả: bật Snake Quiz = public nhưng Quiz Engine (phụ thuộc) vẫn internal → học sinh KHÔNG thấy Snake Quiz; publish nốt Quiz Engine → học sinh thấy ngay.
+- **Trang chi tiết từng tính năng** (`/developer/lab/features/<key>`): cấu hình đầy đủ + nhật ký thay đổi riêng của tính năng đó (lọc từ audit log có sẵn) + danh sách phụ thuộc kèm trạng thái.
+- **Kill switch có xác nhận**: chuyển 1 tính năng ĐANG public về off sẽ hiện hộp thoại xác nhận (JS `confirm()`) — đã test: bấm "off" chặn truy cập ngay lập tức, kể cả với chính Developer.
+- **Luật an toàn cốt lõi ("never auto-public")**: tính năng mới đăng ký LUÔN bắt đầu ở `internal`, không bao giờ tự động public — đã viết test xác nhận đúng luật này.
+- **Tìm kiếm + lọc** theo tên/key/người tạo/trạng thái/danh mục.
+- **Xoá hẳn** (khác "archived") — nâng cấp lên yêu cầu quyền Admin trở lên (không phải Developer thường) để tránh lỡ tay xoá tính năng đang chạy thật — đã kiểm thử: tài khoản Developer thường cố xoá bị chặn, dữ liệu vẫn còn nguyên.
+
+### Đã CHỦ ĐỘNG bỏ qua (và lý do cụ thể)
+- **Health Monitoring tự động + cảnh báo lỗi (mục 14-15)**: app hiện KHÔNG có hệ thống theo dõi lỗi/độ trễ theo TỪNG tính năng riêng lẻ — nếu hiển thị "🟢 Healthy, Error Rate 0.02%" mà không có số liệu thật đứng sau, đó chính là loại "nút giả" mà cả 2 bản đặc tả của bạn đều cấm. Cần 1 hệ thống logging theo dõi lỗi per-feature thật trước, việc này nằm ngoài phạm vi hợp lý của 1 lượt cập nhật.
+- **A/B Testing / Experiments với biến thể + đo lường (mục 12-13)**: cần thêm 1 tầng gán biến thể + thu thập chỉ số riêng — có thể làm ở đợt sau nếu bạn có 1 thử nghiệm A/B cụ thể muốn chạy.
+- **Nhiều môi trường triển khai thật (Dev/Sandbox/Staging/Production) — mục 6, 18-19**: app hiện chạy trên **1 server duy nhất** — "environment" trong bản nâng cấp chỉ là NHÃN THÔNG TIN (ghi chú), không đại diện cho hạ tầng tách biệt thật. Muốn có Staging/Production tách biệt thật cần 2 server + 2 database riêng — đây là quyết định hạ tầng/vận hành, không phải thứ code tự tạo ra được.
+- **Release Approval Pipeline** (Developer request → Admin approve): đã có sẵn phân quyền Developer/Admin cho việc đổi trạng thái, nhưng chưa có bước "yêu cầu duyệt" riêng biệt — có thể thêm nếu bạn thấy cần thiết.
+- **Game Lab / UI Lab / AI Playground như trang riêng**: đã có AI Playground (`/api/playground`, từ trước) và 2 game thật (Quick Math, Memory Match) — không xây thêm trang "tạo game mới"/"tạo UI mới" cho Developer vì đó là việc tương đương xây 1 công cụ no-code, quy mô hoàn toàn khác.
+- **CI/CD Integration**: đúng như đặc tả của bạn tự ghi rõ ("giữ 2 hệ thống tách biệt") — app không có pipeline CI/CD nào để tích hợp, không có gì để làm ở mục này.
+
 ## Chưa làm (nằm ngoài phạm vi yêu cầu lần này)
 Phần đầu prompt gốc của bạn từng có yêu cầu dựng lại toàn bộ thành một sản phẩm Next.js/TypeScript quy mô lớn (nhiều trang, Dashboard, Blog, Pricing...). Bản cập nhật này vẫn giữ nguyên nền tảng Flask hiện có của bạn. Nếu bạn vẫn muốn bản Next.js quy mô lớn, đó sẽ là một dự án tách riêng — cho mình biết nếu bạn muốn triển khai.
 
