@@ -509,6 +509,42 @@ Bạn gửi ảnh so sánh giao diện tiếng Việt/tiếng Anh và muốn khi
 
 **Tóm lại**: nếu bạn định deploy thật lên Render, mình khuyên **ưu tiên tìm hiểu mục 3 (chuyển sang Postgres)** hoặc **mục 1 (Starter + Persistent Disk)** — đừng chỉ dùng cách ping (mục 2) rồi yên tâm là dữ liệu an toàn, vì nó không phải vậy.
 
+## 32. Đã làm: cho phép chỉ định nơi lưu database qua biến môi trường `DB_PATH` (phục vụ mục 1 ở trên)
+
+Không chuyển sang Postgres ngay được (đã thử cài thư viện kết nối Postgres trong môi trường code của mình — không có mạng để cài, nghĩa là mình không thể CHẠY THỬ một bản chuyển đổi Postgres trước khi giao cho bạn, mà app này đã có hàng trăm câu SQL viết theo cú pháp SQLite rải khắp code — sửa mù mà không test được là kiểu việc mình tránh làm suốt từ đầu). Vì vậy làm phần **nhỏ, an toàn, test được đầy đủ**: cho phép trỏ file `studymate.db` ra NGOÀI thư mục code, để gắn vào Persistent Disk của Render (mục 1).
+
+**Đã thay đổi**: nếu có biến môi trường `DB_PATH`, app dùng đúng đường dẫn đó để lưu database; nếu không đặt gì (mặc định), hành vi giữ NGUYÊN như trước (file `studymate.db` cạnh `app.py`) — không ảnh hưởng gì tới cách bạn đang chạy local.
+
+**Đã kiểm thử**: (1) hành vi mặc định không đổi khi chưa đặt `DB_PATH`; (2) đặt `DB_PATH` trỏ ra 1 thư mục khác (giả lập ổ đĩa gắn rời) — database được tạo đúng chỗ, không phải cạnh `app.py`; (3) **giả lập nguyên 1 lần "deploy lại"**: xoá sạch thư mục code (đúng như Render làm với ổ đĩa tạm), giữ nguyên thư mục "đĩa gắn rời" — tài khoản tạo trước đó **vẫn còn nguyên** sau khi import lại app từ thư mục code mới.
+
+### Các bước làm trên Render (bạn tự thao tác trong Dashboard, mình không bấm hộ được)
+1. Service của bạn phải đang ở gói **trả phí** (Starter trở lên) — gói Free không cho gắn Persistent Disk.
+2. Vào service trên Render → tab **"Disks"** → **Add Disk**. Đặt tên bất kỳ (vd `data`), **Mount Path** đặt là `/data`, dung lượng 1GB là quá đủ cho SQLite (database hiện tại của bạn chỉ vài trăm KB).
+3. Vào tab **"Environment"** → thêm biến môi trường mới: **Key** = `DB_PATH`, **Value** = `/data/studymate.db`.
+4. Deploy lại 1 lần — từ giờ, mọi lần deploy/restart sau đó, database sẽ đọc/ghi đúng vào ổ đĩa bền vững này, không bị xoá nữa.
+5. **Lưu ý nếu bạn ĐÃ có dữ liệu thật trên gói Free trước đó**: dữ liệu cũ nằm trong ổ đĩa tạm, sẽ mất khi bạn đổi cấu hình này (không có cách "chuyển" dữ liệu cũ ra ngoài trừ khi tải file `studymate.db` xuống thủ công trước khi đổi — Render có mục "Shell" trong Dashboard để bạn `cat`/tải file ra nếu cần giữ lại dữ liệu test hiện có).
+
+⚠️ Nhắc lại 1 lần nữa: cách này **cần trả phí** (Starter ~$7/tháng + phí Disk riêng, xem giá thật lúc bạn tạo trong Dashboard). Nếu muốn 100% miễn phí và chấp nhận dữ liệu có thể mất, giữ nguyên cấu hình hiện tại (không đặt `DB_PATH`) + UptimeRobot (mục 31) là đủ để test/demo.
+
+## 33. Super Admin chỉ dành riêng cho 1 tài khoản + Dev Lab điều khiển được cả 3 trò chơi (mới)
+
+### 🔒 Super Admin — chỉ "BlackadaNutella" (hoặc tài khoản bạn cấu hình)
+Trước đây: 1 Super Admin có thể cấp Super Admin cho BẤT KỲ tài khoản nào khác. Giờ:
+- Hằng số `SUPER_ADMIN_USERNAME` (mặc định `"BlackadaNutella"`, đổi được qua biến môi trường cùng tên trong `.env`) là tài khoản DUY NHẤT được phép giữ vai trò này.
+- Mỗi lần khởi động server: tự động nâng tài khoản đó lên Super Admin (nếu đã tồn tại và chưa phải Super Admin) — **VÀ** tự động hạ bất kỳ tài khoản NÀO KHÁC đang lỡ có vai trò Super Admin xuống Admin.
+- Giao diện quản lý vai trò: không ai — kể cả 1 Super Admin khác — cấp được Super Admin cho tài khoản nào ngoài tài khoản đã chỉ định, dù có cố tình bấm qua form.
+- Đã kiểm thử đầy đủ: tự nâng đúng tài khoản, tự hạ tài khoản "lạ" từng có Super Admin, chặn cấp Super Admin cho tài khoản khác qua giao diện (kèm thông báo rõ ràng), các thao tác đổi vai trò bình thường khác (User↔Developer, Admin) không bị ảnh hưởng.
+- ⚠️ File `studymate.db` bạn gửi kèm chỉ có 1 tài khoản (`developer`) — không khớp với dữ liệu thật đang chạy trên Render (thấy trong ảnh chụp màn hình có `BlackadaNutella`, `HongMaiYnNhi`). File đó là bản cũ/local, không phải database thật — không cần (và không nên) ghi đè database thật bằng file này. Cứ deploy `app.py` mới lên chỗ database thật đang chạy, việc nâng quyền sẽ tự xảy ra ở lần khởi động kế tiếp.
+
+### 🎮 Dev Lab giờ điều khiển được cả 3 trò chơi
+Áp dụng đúng khuôn mẫu đã làm với Rắn Săn Chữ cho **Đố Vui Tính Nhanh** và **Lật thẻ ghi nhớ**:
+- Cả 3 đều có flag riêng trong `/developer/lab` (`game_snake_quiz`, `game_quick_math`, `game_memory_match`), mặc định `public` (không đổi gì cho người dùng hiện tại).
+- Ẩn 1 trò: biến mất khỏi thư viện trò chơi VÀ khỏi MỌI lối vào khác (vd nút "🎮 Lật thẻ" trong trang chi tiết bộ thẻ), route API tương ứng cũng từ chối yêu cầu trực tiếp (403) — không chỉ ẩn trên giao diện mà bấm thẳng API vẫn né được.
+- Trạng thái `internal`: chỉ Developer trở lên vẫn thấy/chơi được (tự test). Trạng thái `off`: tắt hẳn cho TẤT CẢ, kể cả Developer — đúng nghĩa "công tắc khẩn cấp".
+- Đã kiểm thử: bật/tắt từng trò riêng lẻ, tắt cả 3 cùng lúc, xác nhận trang Games tab vẫn hiển thị bình thường (không lỗi JS) kể cả khi rỗng hoàn toàn.
+
+**Chưa làm** (như đã nói ở lượt trước, phạm vi lớn hơn hẳn 3 trò chơi): Flashcards, Sổ lỗi sai, Quiz Generator, Kế hoạch ôn tập chưa được nối vào Dev Lab — mỗi tính năng đó có nhiều route API hơn, cần 1 đợt riêng để làm đúng mức cẩn thận đã áp dụng cho 3 trò chơi. Nói mình biết cái nào muốn làm tiếp theo.
+
 ## Chưa làm (nằm ngoài phạm vi yêu cầu lần này)
 Phần đầu prompt gốc của bạn từng có yêu cầu dựng lại toàn bộ thành một sản phẩm Next.js/TypeScript quy mô lớn (nhiều trang, Dashboard, Blog, Pricing...). Bản cập nhật này vẫn giữ nguyên nền tảng Flask hiện có của bạn. Nếu bạn vẫn muốn bản Next.js quy mô lớn, đó sẽ là một dự án tách riêng — cho mình biết nếu bạn muốn triển khai.
 
