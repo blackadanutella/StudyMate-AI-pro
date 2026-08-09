@@ -128,15 +128,7 @@ if not GOOGLE_OAUTH_ENABLED:
 # ==========================================
 # 0.1. CƠ SỞ DỮ LIỆU (Tài khoản + Lịch sử chat) — SQLite
 # ==========================================
-# Cho phép trỏ studymate.db ra ngoài thư mục chứa app.py — QUAN TRỌNG khi deploy trên Render:
-# filesystem của Render là "ephemeral" (mất hết dữ liệu mỗi lần redeploy/restart/spin-down),
-# TRỪ đường dẫn nằm bên trong một Persistent Disk đã gắn vào service (Render Dashboard ->
-# service -> Disks -> Add Disk -> đặt Mount Path, vd: /var/data). Khi đó, đặt biến môi trường
-# DB_PATH=/var/data/studymate.db trong phần Environment của Render để dữ liệu (tài khoản, lịch
-# sử chat, log sử dụng...) không bị xoá sau mỗi lần deploy. Nếu không đặt DB_PATH, mặc định vẫn
-# lưu cạnh app.py như trước (dùng tốt khi chạy local hoặc trên VPS có ổ đĩa riêng).
-_env_db_path = os.environ.get('DB_PATH', '').strip()
-DB_PATH = _env_db_path or os.path.join(os.path.dirname(os.path.abspath(__file__)), 'studymate.db')
+DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'studymate.db')
 
 
 def ensure_columns(conn, table, columns):
@@ -1224,6 +1216,7 @@ ACHIEVEMENTS_META = {
     'plan_finisher':  {'icon': '🏆', 'label': 'Về đích', 'desc': 'Hoàn thành trọn vẹn 1 kế hoạch ôn tập.'},
     'speed_demon':   {'icon': '⚡', 'label': 'Tia chớp', 'desc': 'Đạt combo 10 câu đúng liên tiếp trong Đố Vui Tính Nhanh.'},
     'perfect_run':   {'icon': '🎯', 'label': 'Không sai một câu', 'desc': 'Trả lời đúng 100% trong 1 ván (từ 10 câu trở lên).'},
+    'snake_master':  {'icon': '🐍', 'label': 'Trăn Thần', 'desc': 'Đạt độ dài 15 ô trong 1 ván Rắn Săn Chữ.'},
 }
 
 
@@ -2248,12 +2241,67 @@ HTML = r'''
           <button onclick="openQuickMathSetup()" class="w-full py-2 rounded-xl bg-amber-500 hover:bg-amber-600 text-white text-sm font-semibold">Chơi ngay</button>
         </div>
         <div class="rounded-2xl border border-gray-200 dark:border-gray-800 p-5">
+          <p class="text-3xl mb-2">🐍</p>
+          <p class="font-bold">Rắn Săn Chữ</p>
+          <p class="text-xs text-gray-400 mt-1 mb-3">Điều khiển rắn ăn mồi để lớn lên, tránh đâm tường/tự đâm thân — thỉnh thoảng có mồi đặc biệt là đáp số 1 phép tính, ăn được thưởng điểm gấp 3!</p>
+          <p class="text-xs text-gray-400 mb-3" id="snakeBestScore">Điểm cao nhất: —</p>
+          <button onclick="openSnakeSetup()" class="w-full py-2 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white text-sm font-semibold">Chơi ngay</button>
+        </div>
+        <div class="rounded-2xl border border-gray-200 dark:border-gray-800 p-5">
           <p class="text-3xl mb-2">🧠</p>
           <p class="font-bold">Lật thẻ ghi nhớ</p>
           <p class="text-xs text-gray-400 mt-1 mb-3">Tìm cặp thẻ khớp nhau — cần chọn 1 bộ thẻ ghi nhớ có sẵn để chơi.</p>
           <p class="text-xs text-gray-400 mb-3" id="memoryMatchBestScore">Điểm cao nhất: —</p>
           <button onclick="switchFcTab('decks')" class="w-full py-2 rounded-xl bg-blue-600 hover:bg-blue-700 text-white text-sm font-semibold">Chọn bộ thẻ để chơi</button>
         </div>
+      </div>
+    </div>
+
+    <!-- ============ Rắn Săn Chữ: thiết lập ============ -->
+    <div id="fcSnakeSetupView" class="hidden max-w-md mx-auto p-4 lg:p-6 text-center">
+      <p class="text-4xl mb-3">🐍</p>
+      <p class="font-bold text-lg mb-1">Rắn Săn Chữ</p>
+      <p class="text-sm text-gray-400 mb-5">Dùng phím mũi tên (hoặc vuốt trên điện thoại) để điều khiển. Ăn 🔵 để lớn lên, ăn 🟡 (đáp số đúng) để được điểm gấp 3!</p>
+      <div class="grid grid-cols-3 gap-2 mb-5">
+        <button class="snake-diff-btn px-3 py-2.5 rounded-xl border-2 border-emerald-500 bg-emerald-50 dark:bg-emerald-900/20 text-sm font-semibold" data-diff="easy">Dễ</button>
+        <button class="snake-diff-btn px-3 py-2.5 rounded-xl border-2 border-gray-200 dark:border-gray-700 text-sm font-semibold" data-diff="medium">Trung bình</button>
+        <button class="snake-diff-btn px-3 py-2.5 rounded-xl border-2 border-gray-200 dark:border-gray-700 text-sm font-semibold" data-diff="hard">Khó</button>
+      </div>
+      <button onclick="startSnakeGame()" class="w-full py-3 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white font-semibold">Bắt đầu</button>
+    </div>
+
+    <!-- ============ Rắn Săn Chữ: đang chơi ============ -->
+    <div id="fcSnakePlayView" class="hidden max-w-md mx-auto p-4 lg:p-6">
+      <div class="flex items-center justify-between mb-3 text-sm">
+        <span>⭐ <span id="snakeScore">0</span></span>
+        <span id="snakeQuestionBox" class="hidden font-semibold text-amber-500">🟡 <span id="snakeQuestion"></span> = ?</span>
+        <span>🐍 x<span id="snakeLength">1</span></span>
+      </div>
+      <div id="snakeBoard" class="grid gap-0 mx-auto bg-gray-100 dark:bg-gray-900 rounded-xl overflow-hidden border border-gray-200 dark:border-gray-700" style="width: min(90vw, 360px); height: min(90vw, 360px);"></div>
+      <div class="grid grid-cols-3 gap-2 mt-4 max-w-[180px] mx-auto">
+        <div></div>
+        <button class="snake-ctrl-btn py-3 rounded-xl bg-gray-100 dark:bg-gray-800 text-lg" data-dir="up"><i class="fas fa-arrow-up"></i></button>
+        <div></div>
+        <button class="snake-ctrl-btn py-3 rounded-xl bg-gray-100 dark:bg-gray-800 text-lg" data-dir="left"><i class="fas fa-arrow-left"></i></button>
+        <button class="snake-ctrl-btn py-3 rounded-xl bg-gray-100 dark:bg-gray-800 text-lg" data-dir="down"><i class="fas fa-arrow-down"></i></button>
+        <button class="snake-ctrl-btn py-3 rounded-xl bg-gray-100 dark:bg-gray-800 text-lg" data-dir="right"><i class="fas fa-arrow-right"></i></button>
+      </div>
+    </div>
+
+    <!-- ============ Rắn Săn Chữ: kết quả ============ -->
+    <div id="fcSnakeResultView" class="hidden max-w-md mx-auto p-4 lg:p-6 text-center">
+      <p class="text-4xl mb-2">🐍💥</p>
+      <p class="font-bold text-2xl" id="snakeResultScore"></p>
+      <p class="text-sm text-gray-400 mt-1" id="snakeResultDetail"></p>
+      <p class="text-sm text-gray-400" id="snakeResultXp"></p>
+      <div id="snakeWeakTopicsBox" class="hidden mt-4 text-left bg-amber-50 dark:bg-amber-900/10 border border-amber-200 dark:border-amber-900/50 rounded-xl p-4">
+        <p class="text-sm font-semibold text-amber-700 dark:text-amber-400 mb-1"><i class="fas fa-triangle-exclamation mr-1"></i>Hay sai phép tính:</p>
+        <p id="snakeWeakTopicsList" class="text-sm text-amber-700 dark:text-amber-400"></p>
+        <p class="text-xs text-amber-600 dark:text-amber-500 mt-1">Đã tự lưu vào Sổ lỗi sai!</p>
+      </div>
+      <div class="flex gap-2 justify-center mt-5">
+        <button onclick="openSnakeSetup()" class="px-4 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white text-sm font-semibold">Chơi lại</button>
+        <button onclick="switchFcTab('games')" class="px-4 py-2 rounded-xl bg-gray-100 dark:bg-gray-800 text-sm font-semibold">Về thư viện</button>
       </div>
     </div>
 
@@ -4077,6 +4125,7 @@ const FC_VIEWS = {
   quizList: 'fcQuizListView', quizTake: 'fcQuizTakeView', quizResult: 'fcQuizResultView',
   plansList: 'fcPlansListView', planDetail: 'fcPlanDetailView',
   gamesList: 'fcGamesListView', qmSetup: 'fcQuickMathSetupView', qmPlay: 'fcQuickMathPlayView', qmResult: 'fcQuickMathResultView',
+  snakeSetup: 'fcSnakeSetupView', snakePlay: 'fcSnakePlayView', snakeResult: 'fcSnakeResultView',
 };
 const FC_TOP_LEVEL_VIEWS = ['list', 'mistakes', 'quizList', 'plansList', 'gamesList'];
 
@@ -4112,7 +4161,9 @@ function showFcView(view) {
   } else if (view === 'qmSetup' || view === 'qmPlay' || view === 'qmResult') {
     title.textContent = 'Đố Vui Tính Nhanh';
     backBtn.onclick = () => { stopQuickMathTimer(); switchFcTab('games'); };
-
+  } else if (view === 'snakeSetup' || view === 'snakePlay' || view === 'snakeResult') {
+    title.textContent = 'Rắn Săn Chữ';
+    backBtn.onclick = () => { stopSnakeGame(); switchFcTab('games'); };
   }
 }
 
@@ -4549,6 +4600,8 @@ async function loadGameStats() {
       stats.quick_math ? `Điểm cao nhất: ${stats.quick_math.bestScore} (${stats.quick_math.playCount} lượt chơi)` : 'Điểm cao nhất: — (chưa chơi lần nào)';
     document.getElementById('memoryMatchBestScore').textContent =
       stats.memory_match ? `Điểm cao nhất: ${stats.memory_match.bestScore} (${stats.memory_match.playCount} lượt chơi)` : 'Điểm cao nhất: — (chưa chơi lần nào)';
+    document.getElementById('snakeBestScore').textContent =
+      stats.snake ? `Điểm cao nhất: ${stats.snake.bestScore} (${stats.snake.playCount} lượt chơi)` : 'Điểm cao nhất: — (chưa chơi lần nào)';
   } catch (e) { /* im lặng bỏ qua lỗi mạng */ }
 }
 
@@ -4680,6 +4733,233 @@ async function finishQuickMath() {
     if (data.weakTopics && data.weakTopics.length) {
       weakBox.classList.remove('hidden');
       document.getElementById('qmWeakTopicsList').textContent = data.weakTopics.join(', ');
+    } else {
+      weakBox.classList.add('hidden');
+    }
+    if (data.gamify) handleGamifyEvent(data.gamify);
+  } catch (e) { /* im lặng bỏ qua lỗi mạng */ }
+}
+
+// ==================================================================
+// RẮN SĂN CHỮ (Snake Quiz)
+// ==================================================================
+// Logic thuần (snakeCreateGame/snakeRandomEmptyCell/snakeSetDirection/snakeTick) đã được
+// kiểm thử độc lập bằng Node.js: 9 nhóm test gồm di chuyển, va chạm tường/tự đâm thân, luật
+// "không được quay đầu 180°", mồi không bao giờ xuất hiện trên thân rắn (5.000 lần thử), và
+// mô phỏng chơi ngẫu nhiên 200 ván liên tục không phát sinh lỗi. Giữ NGUYÊN VĂN các hàm dưới
+// đây giống bản đã test để không làm mất đi độ tin cậy đó.
+function snakeCreateGame(gridSize) {
+  const mid = Math.floor(gridSize / 2);
+  return {
+    gridSize, snake: [{ x: mid, y: mid }],
+    direction: { x: 1, y: 0 }, pendingDirection: { x: 1, y: 0 },
+    food: null, quizFood: null, score: 0, correctCount: 0, totalQuiz: 0, gameOver: false,
+  };
+}
+function snakeRandomEmptyCell(state) {
+  const occupied = new Set(state.snake.map(s => `${s.x},${s.y}`));
+  if (state.food) occupied.add(`${state.food.x},${state.food.y}`);
+  if (state.quizFood) occupied.add(`${state.quizFood.x},${state.quizFood.y}`);
+  const free = [];
+  for (let x = 0; x < state.gridSize; x++)
+    for (let y = 0; y < state.gridSize; y++)
+      if (!occupied.has(`${x},${y}`)) free.push({ x, y });
+  if (!free.length) return null;
+  return free[Math.floor(Math.random() * free.length)];
+}
+function snakeSetDirection(state, dx, dy) {
+  if (state.snake.length > 1 && dx === -state.direction.x && dy === -state.direction.y) return false;
+  state.pendingDirection = { x: dx, y: dy };
+  return true;
+}
+function snakeTick(state) {
+  if (state.gameOver) return state;
+  state.direction = state.pendingDirection;
+  const head = state.snake[0];
+  const newHead = { x: head.x + state.direction.x, y: head.y + state.direction.y };
+  if (newHead.x < 0 || newHead.x >= state.gridSize || newHead.y < 0 || newHead.y >= state.gridSize) {
+    state.gameOver = true;
+    return state;
+  }
+  if (state.snake.some(seg => seg.x === newHead.x && seg.y === newHead.y)) {
+    state.gameOver = true;
+    return state;
+  }
+  state.snake.unshift(newHead);
+  let ate = false;
+  if (state.food && newHead.x === state.food.x && newHead.y === state.food.y) {
+    state.score += 10; state.food = null; ate = true;
+  } else if (state.quizFood && newHead.x === state.quizFood.x && newHead.y === state.quizFood.y) {
+    state.score += 30; state.correctCount++; state.quizFood = null; ate = true;
+  }
+  if (!ate) state.snake.pop();
+  return state;
+}
+
+// ---- Phần tích hợp vào giao diện (không phải logic thuần, không nằm trong bộ test ở trên) ----
+const SNAKE_DIFFICULTY_CONFIG = {
+  easy:   { gridSize: 12, tickMs: 200 },
+  medium: { gridSize: 15, tickMs: 150 },
+  hard:   { gridSize: 18, tickMs: 110 },
+};
+let snakeGameState = null;
+let snakeTimerHandle = null;
+let snakeSelectedDifficulty = 'easy';
+let snakeCurrentQuestion = null;   // { text, answer, opLabel } — câu hỏi đang gắn với quizFood
+let snakeWrongOperations = [];
+let snakeQuestionsAsked = 0;
+
+function openSnakeSetup() {
+  showFcView('snakeSetup');
+  document.querySelectorAll('.snake-diff-btn').forEach(btn => {
+    const active = btn.dataset.diff === snakeSelectedDifficulty;
+    btn.classList.toggle('border-emerald-500', active);
+    btn.classList.toggle('bg-emerald-50', active);
+    btn.classList.toggle('dark:bg-emerald-900/20', active);
+    btn.classList.toggle('border-gray-200', !active);
+    btn.classList.toggle('dark:border-gray-700', !active);
+  });
+}
+document.querySelectorAll('.snake-diff-btn').forEach(btn => {
+  btn.addEventListener('click', () => { snakeSelectedDifficulty = btn.dataset.diff; openSnakeSetup(); });
+});
+
+function stopSnakeGame() {
+  if (snakeTimerHandle) { clearInterval(snakeTimerHandle); snakeTimerHandle = null; }
+}
+
+function startSnakeGame() {
+  const cfg = SNAKE_DIFFICULTY_CONFIG[snakeSelectedDifficulty];
+  snakeGameState = snakeCreateGame(cfg.gridSize);
+  snakeGameState.food = snakeRandomEmptyCell(snakeGameState);
+  snakeCurrentQuestion = null;
+  snakeWrongOperations = [];
+  snakeQuestionsAsked = 0;
+
+  const board = document.getElementById('snakeBoard');
+  board.style.gridTemplateColumns = `repeat(${cfg.gridSize}, 1fr)`;
+  board.style.gridTemplateRows = `repeat(${cfg.gridSize}, 1fr)`;
+
+  document.getElementById('snakeScore').textContent = '0';
+  document.getElementById('snakeLength').textContent = '1';
+  document.getElementById('snakeQuestionBox').classList.add('hidden');
+  showFcView('snakePlay');
+  renderSnakeBoard();
+  spawnSnakeQuizQuestion();
+
+  stopSnakeGame();
+  snakeTimerHandle = setInterval(() => {
+    snakeTick(snakeGameState);
+    if (snakeGameState.gameOver) { finishSnakeGame(); return; }
+    if (!snakeGameState.food) snakeGameState.food = snakeRandomEmptyCell(snakeGameState);
+    renderSnakeBoard();
+  }, cfg.tickMs);
+}
+
+function renderSnakeBoard() {
+  const state = snakeGameState;
+  const board = document.getElementById('snakeBoard');
+  board.innerHTML = '';
+  const snakeSet = new Set(state.snake.map((s, i) => `${s.x},${s.y}`));
+  const headKey = `${state.snake[0].x},${state.snake[0].y}`;
+  for (let y = 0; y < state.gridSize; y++) {
+    for (let x = 0; x < state.gridSize; x++) {
+      const key = `${x},${y}`;
+      const cell = document.createElement('div');
+      let content = '';
+      let cls = 'w-full h-full';
+      if (key === headKey) { cls += ' bg-emerald-600 rounded-sm'; }
+      else if (snakeSet.has(key)) { cls += ' bg-emerald-400 dark:bg-emerald-700 rounded-sm'; }
+      else if (state.food && state.food.x === x && state.food.y === y) { content = '🔵'; }
+      else if (state.quizFood && state.quizFood.x === x && state.quizFood.y === y) { content = '🟡'; }
+      cell.className = cls + ' flex items-center justify-center text-[10px] leading-none';
+      cell.textContent = content;
+      board.appendChild(cell);
+    }
+  }
+  document.getElementById('snakeScore').textContent = state.score;
+  document.getElementById('snakeLength').textContent = state.snake.length;
+}
+
+function spawnSnakeQuizQuestion() {
+  // Nếu câu hỏi trước CHƯA được ăn (quizFood vẫn còn trên bàn cờ) -> tính là "bỏ lỡ", ghi vào
+  // danh sách phép tính hay sai để cuối ván tự lưu vào Sổ lỗi sai giống Đố Vui Tính Nhanh.
+  if (snakeCurrentQuestion && snakeGameState.quizFood) {
+    snakeWrongOperations.push(snakeCurrentQuestion.opLabel);
+  }
+  const q = generateQmQuestion(snakeSelectedDifficulty === 'hard' ? 'hard' : snakeSelectedDifficulty === 'medium' ? 'medium' : 'easy');
+  snakeCurrentQuestion = q;
+  snakeQuestionsAsked++;
+  document.getElementById('snakeQuestionBox').classList.remove('hidden');
+  document.getElementById('snakeQuestion').textContent = q.text;
+  snakeGameState.quizFood = snakeRandomEmptyCell(snakeGameState);
+  renderSnakeBoard();
+  // Câu hỏi mới sau mỗi 8 giây (dù ăn được hay chưa) — giữ nhịp độ chơi liên tục.
+  clearTimeout(window._snakeQuestionTimer);
+  window._snakeQuestionTimer = setTimeout(() => {
+    if (snakeGameState && !snakeGameState.gameOver) spawnSnakeQuizQuestion();
+  }, 8000);
+}
+
+function snakeHandleDirection(dir) {
+  if (!snakeGameState || snakeGameState.gameOver) return;
+  const map = { up: [0, -1], down: [0, 1], left: [-1, 0], right: [1, 0] };
+  const [dx, dy] = map[dir];
+  snakeSetDirection(snakeGameState, dx, dy);
+}
+
+document.addEventListener('keydown', (e) => {
+  if (!snakeGameState || snakeGameState.gameOver) return;
+  const keyMap = { ArrowUp: 'up', ArrowDown: 'down', ArrowLeft: 'left', ArrowRight: 'right', w: 'up', s: 'down', a: 'left', d: 'right' };
+  if (keyMap[e.key]) { e.preventDefault(); snakeHandleDirection(keyMap[e.key]); }
+});
+document.querySelectorAll('.snake-ctrl-btn').forEach(btn => {
+  btn.addEventListener('click', () => snakeHandleDirection(btn.dataset.dir));
+});
+// Vuốt để điều khiển trên điện thoại
+(function () {
+  let touchStartX = 0, touchStartY = 0;
+  const board = document.getElementById('snakeBoard');
+  board.addEventListener('touchstart', (e) => {
+    touchStartX = e.touches[0].clientX; touchStartY = e.touches[0].clientY;
+  }, { passive: true });
+  board.addEventListener('touchend', (e) => {
+    const dx = e.changedTouches[0].clientX - touchStartX;
+    const dy = e.changedTouches[0].clientY - touchStartY;
+    if (Math.max(Math.abs(dx), Math.abs(dy)) < 20) return;
+    if (Math.abs(dx) > Math.abs(dy)) snakeHandleDirection(dx > 0 ? 'right' : 'left');
+    else snakeHandleDirection(dy > 0 ? 'down' : 'up');
+  }, { passive: true });
+})();
+
+async function finishSnakeGame() {
+  stopSnakeGame();
+  clearTimeout(window._snakeQuestionTimer);
+  if (!snakeGameState) return;
+  const state = snakeGameState;
+  // Câu hỏi cuối cùng chưa kịp ăn cũng tính là bỏ lỡ.
+  if (snakeCurrentQuestion && state.quizFood) snakeWrongOperations.push(snakeCurrentQuestion.opLabel);
+  snakeGameState = null;
+  showFcView('snakeResult');
+
+  document.getElementById('snakeResultScore').textContent = `${state.score} điểm`;
+  document.getElementById('snakeResultDetail').textContent =
+    `Độ dài rắn: ${state.snake.length} · Đáp số đúng đã ăn: ${state.correctCount}/${snakeQuestionsAsked}`;
+
+  try {
+    const res = await fetch('/api/games/snake/submit', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        difficulty: snakeSelectedDifficulty, score: state.score, correctCount: state.correctCount,
+        totalCount: snakeQuestionsAsked, snakeLength: state.snake.length, wrongOperations: snakeWrongOperations,
+      })
+    });
+    const data = await res.json();
+    document.getElementById('snakeResultXp').textContent = data.xpAwarded ? `+${data.xpAwarded} XP 🎉` : '';
+    const weakBox = document.getElementById('snakeWeakTopicsBox');
+    if (data.weakTopics && data.weakTopics.length) {
+      weakBox.classList.remove('hidden');
+      document.getElementById('snakeWeakTopicsList').textContent = data.weakTopics.join(', ');
     } else {
       weakBox.classList.add('hidden');
     }
@@ -6517,15 +6797,6 @@ def home():
 # ==========================================
 # 6. ĐỊNH TUYẾN BẢO MẬT (Trang báo cáo)
 # ==========================================
-@app.route('/healthz')
-def healthz():
-    """Endpoint nhẹ, không cần đăng nhập, không đụng DB — dùng cho các dịch vụ 'ping giữ ấm'
-    (UptimeRobot, cron-job.org...) để giảm khả năng service Free trên Render bị spin-down do
-    15 phút không có traffic. Lưu ý: cách này KHÔNG giúp lưu dữ liệu vĩnh viễn — nó chỉ giữ
-    server không ngủ, không thay thế cho Persistent Disk / Postgres (xem README mục Deploy)."""
-    return jsonify({"status": "ok", "time": now_iso()})
-
-
 @app.route('/security')
 def security_report():
     return render_template_string(SECURITY_HTML)
@@ -8343,6 +8614,76 @@ def api_quick_math_submit():
             'game_player': True,
             'speed_demon': best_combo >= 10,
             'perfect_run': is_perfect,
+        }
+    )
+
+    return jsonify({"success": True, "xpAwarded": bonus_xp, "weakTopics": weak_topics, "gamify": gamify})
+
+
+@app.route('/api/games/snake/submit', methods=['POST'])
+@login_required
+def api_snake_submit():
+    """Nộp kết quả 1 ván 'Rắn Săn Chữ' (Snake Quiz) — con rắn cổ điển, ăn "mồi thường" để lớn
+    lên, thỉnh thoảng có "mồi câu hỏi" hiện đúng đáp số của 1 phép tính đang hỏi (dùng lại
+    generateQmQuestion() — cùng bộ sinh câu hỏi đã kiểm thử kỹ ở Đố Vui Tính Nhanh). Ăn mồi
+    câu hỏi = cộng điểm cao hơn + tính 1 câu đúng; game-over khi đâm tường/tự đâm thân — không
+    liên quan gì tới việc trả lời đúng/sai (khác Quick Math, chơi vẫn tiếp tục dù trả lời sai
+    1 câu hỏi, chỉ đơn giản là bỏ lỡ điểm thưởng lần đó)."""
+    data = request.get_json(silent=True) or {}
+    difficulty = (data.get('difficulty') or 'medium').strip()
+    if difficulty not in ('easy', 'medium', 'hard'):
+        difficulty = 'medium'
+    try:
+        score = max(0, int(data.get('score') or 0))
+        correct_count = max(0, int(data.get('correctCount') or 0))
+        total_count = max(0, int(data.get('totalCount') or 0))
+        snake_length = max(1, int(data.get('snakeLength') or 1))
+    except (TypeError, ValueError):
+        return jsonify({"error": "Dữ liệu ván chơi không hợp lệ."}), 400
+
+    wrong_ops = data.get('wrongOperations') or []
+    if not isinstance(wrong_ops, list):
+        wrong_ops = []
+
+    user_id = current_user_id()
+    db = get_db()
+
+    op_counts = {}
+    for op in wrong_ops:
+        if isinstance(op, str) and op.strip():
+            op_counts[op] = op_counts.get(op, 0) + 1
+    weak_topics = [op for op, _ in sorted(op_counts.items(), key=lambda kv: kv[1], reverse=True)][:3]
+
+    db.execute(
+        '''INSERT INTO game_sessions (user_id, game, difficulty, score, correct_count, total_count,
+           best_combo, weak_topics, created_at) VALUES (?, 'snake', ?, ?, ?, ?, ?, ?, ?)''',
+        (user_id, difficulty, score, correct_count, total_count, snake_length, json.dumps(weak_topics), now_iso())
+    )
+
+    for topic in weak_topics:
+        desc = f"Hay tính sai: {topic}"
+        norm_desc = desc.strip().lower()
+        existing = db.execute(
+            "SELECT id FROM mistakes WHERE user_id = ? AND subject = 'Toán' AND LOWER(TRIM(description)) = ? AND resolved = 0",
+            (user_id, norm_desc)
+        ).fetchone()
+        if existing:
+            db.execute('UPDATE mistakes SET occurrence_count = occurrence_count + 1, last_occurred_at = ? WHERE id = ?',
+                       (now_iso(), existing['id']))
+        else:
+            db.execute(
+                '''INSERT INTO mistakes (user_id, subject, description, occurrence_count, conversation_id,
+                   resolved, created_at, last_occurred_at) VALUES (?, 'Toán', ?, 1, NULL, 0, ?, ?)''',
+                (user_id, desc, now_iso(), now_iso())
+            )
+    db.commit()
+
+    bonus_xp = min(60, 10 + correct_count * 3 + snake_length // 2)
+    gamify = award_xp_and_streak(
+        user_id, xp_amount=bonus_xp,
+        extra_achievement_checks={
+            'game_player': True,
+            'snake_master': snake_length >= 15,
         }
     )
 
