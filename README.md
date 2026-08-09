@@ -115,32 +115,7 @@ App hiện chạy bằng `app.run(...)` — chỉ phù hợp để **test trên 
 6. Quay lại Google Cloud Console, thêm `https://ten-app.onrender.com/auth/google/callback` vào danh sách Redirect URI (bước ở mục 5 phía trên).
 7. (Tuỳ chọn) Gắn domain riêng của bạn trong tab **Settings → Custom Domain** của Render.
 
-### 6.1 Giữ dữ liệu (`studymate.db`) không bị mất mỗi lần deploy trên Render
-
-Đây là điều **quan trọng nhất** cần biết khi deploy lên Render: mọi service (kể cả gói trả phí thấp nhất nếu chưa gắn Disk) đều có **ổ đĩa tạm (ephemeral filesystem)** — bất kỳ file nào ghi ra ngoài lúc chạy (bao gồm `studymate.db`) **sẽ bị xoá sạch** mỗi khi service redeploy, restart, hoặc (với gói Free) spin-down rồi spin-up lại. Đây không phải lỗi của app — mọi app dùng SQLite trên Render đều gặp vấn đề này.
-
-`app.py` bản này đã hỗ trợ sẵn biến môi trường **`DB_PATH`** để trỏ file DB ra một nơi không bị xoá:
-
-- **Nếu bạn dùng gói Free**: Free service **không thể gắn Persistent Disk** (giới hạn của Render, không phải giới hạn của app). Lựa chọn thực tế để dữ liệu không mất:
-  1. Chấp nhận dữ liệu sẽ reset mỗi lần deploy (được cho dự án demo/thử nghiệm), hoặc
-  2. Chuyển sang một database **miễn phí vĩnh viễn nằm ngoài Render** như [Neon](https://neon.tech) (Postgres, free tier không hết hạn) hoặc [Turso](https://turso.tech) (SQLite-compatible, free tier không hết hạn) — cần sửa lại phần kết nối DB trong `app.py` để dùng `psycopg2`/`libsql` thay vì `sqlite3` trực tiếp. Lưu ý: Postgres **miễn phí của chính Render** sẽ tự xoá sau 30 ngày, nên không phù hợp để lưu vĩnh viễn.
-- **Nếu bạn nâng cấp lên gói trả phí (Starter trở lên, ~7 USD/tháng)**: gắn **Persistent Disk**:
-  1. Vào service trên Render Dashboard → tab **Disks** → **Add Disk**.
-  2. Đặt **Mount Path**, ví dụ `/var/data`.
-  3. Vào tab **Environment**, thêm biến `DB_PATH=/var/data/studymate.db`.
-  4. Deploy lại. Từ giờ toàn bộ tài khoản, lịch sử chat, log sử dụng... sẽ được giữ nguyên qua mỗi lần deploy/restart.
-
-Nếu không đặt `DB_PATH`, app vẫn chạy bình thường và lưu `studymate.db` cạnh `app.py` như trước (phù hợp khi chạy trên máy cá nhân hoặc VPS có ổ đĩa riêng ở Cách B bên dưới).
-
-### 6.2 Giữ app luôn "thức" (tránh bị Render Free cho ngủ)
-
-Gói Free của Render sẽ tự động cho service "ngủ" (spin down) sau **15 phút không có request nào tới**, và mất khoảng 1 phút để "thức dậy" ở request kế tiếp — đây là hành vi mặc định của Render cho gói Free, không thể tắt hoàn toàn nếu không nâng cấp gói.
-
-- App đã có sẵn route **`/healthz`** (không cần đăng nhập, không đụng tới database) — dùng route này để "ping giữ ấm":
-  1. Đăng ký tài khoản miễn phí ở [UptimeRobot](https://uptimerobot.com) hoặc [cron-job.org](https://cron-job.org).
-  2. Tạo 1 "monitor"/"cron job" gọi `GET https://ten-app-cua-ban.onrender.com/healthz` mỗi 5-10 phút.
-  3. Việc này giữ app không bị ngủ, nhưng vẫn tính vào **750 giờ miễn phí/tháng** mà Render cấp cho mỗi workspace (chạy 24/7 cả tháng dùng khoảng 720-744 giờ, vẫn vừa đủ trong hạn mức cho 1 service).
-- Nếu cần đảm bảo **luôn luôn online, không có độ trễ "thức dậy"** (ví dụ app cho nhiều người dùng thật), nên nâng cấp lên gói **Starter trở lên** — các gói trả phí không bị spin-down.
+⚠️ Lưu ý: gói miễn phí của Render dùng ổ đĩa tạm — file `studymate.db` (SQLite) **có thể bị mất khi server khởi động lại**. Với dự án thật có nhiều người dùng, nên: (a) nâng cấp gói có "Persistent Disk", hoặc (b) chuyển sang PostgreSQL (Render có sẵn dịch vụ Postgres miễn phí, cần sửa lại phần kết nối DB trong `app.py`).
 
 ### Cách B — Tự chủ hơn: VPS riêng (DigitalOcean, Vultr, AWS Lightsail...)
 
@@ -491,6 +466,48 @@ Bạn gửi tiếp 1 bản đặc tả 51 mục cho "StudyMate Lab" — 1 nền 
 - **Release Approval Pipeline** (Developer request → Admin approve): đã có sẵn phân quyền Developer/Admin cho việc đổi trạng thái, nhưng chưa có bước "yêu cầu duyệt" riêng biệt — có thể thêm nếu bạn thấy cần thiết.
 - **Game Lab / UI Lab / AI Playground như trang riêng**: đã có AI Playground (`/api/playground`, từ trước) và 2 game thật (Quick Math, Memory Match) — không xây thêm trang "tạo game mới"/"tạo UI mới" cho Developer vì đó là việc tương đương xây 1 công cụ no-code, quy mô hoàn toàn khác.
 - **CI/CD Integration**: đúng như đặc tả của bạn tự ghi rõ ("giữ 2 hệ thống tách biệt") — app không có pipeline CI/CD nào để tích hợp, không có gì để làm ở mục này.
+
+## 29. Đa ngôn ngữ (i18n) — mở rộng thật, không chỉ 9 nhãn như trước (mới)
+
+Bạn gửi ảnh so sánh giao diện tiếng Việt/tiếng Anh và muốn khi đổi ngôn ngữ, MỌI THỨ đổi theo như vậy. Kiểm tra lại thì hệ thống `applyLanguage()` có sẵn từ trước CHỈ có 9 nhãn (Đoạn chat mới, Cài đặt, Đăng xuất...) — ảnh tiếng Anh bạn gửi (thấy cả "Mathematics", "Easy-to-Understand Explanation"...) nhiều khả năng đến từ tính năng dịch của trình duyệt/hệ điều hành, KHÔNG phải từ bộ chuyển ngôn ngữ của app. Đã mở rộng thật:
+
+- Môn học + Chế độ (cả ở thanh trên cùng lẫn trong Cài đặt), 4 Chế độ suy nghĩ (tên + mô tả), placeholder ô nhập câu hỏi, dòng miễn trừ trách nhiệm cuối trang, nhãn "ngày"/"Cấp" ở khung XP, nút "Thẻ ghi nhớ & Trò chơi", trạng thái rỗng "Chưa có đoạn chat nào", toàn bộ mục Cài đặt (Giao diện/Sáng-Tối-Hệ thống/Môn-Chế độ mặc định/Lưu thay đổi/Khu vực nguy hiểm), và hộp thoại Trợ giúp.
+- Sửa 1 lỗi thứ tự tải trang phát hiện được trong lúc làm: tin nhắn chào mừng trước đây hiện ra TRƯỚC KHI tải xong tuỳ chọn ngôn ngữ đã lưu, nên luôn hiện tiếng Việt dù đã chọn tiếng Anh từ trước — đã sửa thứ tự tải (đợi tải xong tuỳ chọn trước, rồi mới hiện lời chào).
+- Đã xác minh bằng cách kiểm tra HTML thật được server trả về (16 điểm kiểm tra) — không chỉ đọc code rồi tin là đúng.
+
+**Còn thiếu (thành thật liệt kê)**: nội dung bên trong overlay Thẻ ghi nhớ/Sổ lỗi sai/Quiz/Kế hoạch ôn tập/Trò chơi (tạo bởi JavaScript, hàng trăm chuỗi tiếng Việt rải trong nhiều hàm khác nhau), các hộp thoại `confirm()`/`alert()`, và toàn bộ trang quản trị Developer/Lab vẫn còn tiếng Việt cố định — dịch hết chỗ này là khối lượng công việc lớn, cần 1 đợt riêng nếu bạn cần.
+
+## 30. Rắn Săn Chữ (Snake Quiz) — game mới, đã kiểm thử độc lập bằng Node.js trước khi ghép vào
+
+Ở bản trước mình có nói Snake cần "canvas + vật lý" nên tạm gác lại. Xem lại kỹ hơn thì Snake thực chất là 1 máy trạng thái RỜI RẠC (di chuyển theo lưới ô vuông, không có vật lý/va chạm pixel liên tục như Flappy Bird) — hoàn toàn kiểm thử được bằng logic thuần, giống hệt cách đã làm với Đố Vui Tính Nhanh. Vì vậy lần này làm thật:
+
+- Điều khiển bằng phím mũi tên/WASD, nút bấm trên màn hình, hoặc vuốt (điện thoại). Ăn 🔵 để lớn lên (+10 điểm), ăn 🟡 — mồi đặc biệt hiện đúng đáp số 1 phép tính đang hỏi phía trên — được +30 điểm và tính 1 câu đúng. Va tường hoặc tự đâm vào thân là thua.
+- 3 mức độ khó (Dễ/Trung bình/Khó) — kích thước bàn cờ và tốc độ khác nhau. Câu hỏi phép tính dùng LẠI đúng bộ sinh câu hỏi đã kiểm thử 60.000 lần ở Đố Vui Tính Nhanh (`generateQmQuestion`), không viết lại logic mới có nguy cơ có lỗi.
+- Bỏ lỡ 1 câu (hết giờ chưa ăn kịp mồi đáp số) tính là "sai" phép tính đó — cuối ván tự lưu vào Sổ lỗi sai, y hệt cơ chế Đố Vui Tính Nhanh.
+- Thành tựu mới: 🐍 **Trăn Thần** (đạt độ dài 15 ô trong 1 ván).
+
+**Mức độ kiểm thử đã làm** (quan trọng, vì đây là code có logic va chạm — dễ có lỗi nếu không cẩn thận):
+1. Viết riêng 4 hàm logic thuần (tạo game, di chuyển, ăn mồi, va chạm) — test độc lập bằng Node.js với 9 nhóm kiểm tra: di chuyển cơ bản, ăn mồi thường/mồi câu hỏi, va chạm ở cả 4 hướng tường, tự đâm thân, luật "không quay đầu 180°", **5.000 lần thử** xác nhận mồi không bao giờ xuất hiện đè lên thân rắn, và **200 ván mô phỏng chơi ngẫu nhiên** (di chuyển ngẫu nhiên liên tục hàng nghìn lượt) không phát hiện lỗi nào.
+2. **Bắt được 1 lỗi thật** trong lúc làm: khi ghép route `/api/games/snake/submit` vào code, thao tác chỉnh sửa lỡ xoá mất dòng `@app.route(...)` của route `/api/games/stats` (route liệt kê điểm cao nhất) — phát hiện ngay vì bài test tự động báo lỗi 404, sửa lại xong mới báo cáo là "xong".
+3. Sau khi ghép toàn bộ vào `app.py`, **trích lại ĐÚNG đoạn code JS thật đã lưu trong file** (không phải bản nháp) và chạy lại bộ 9 test đó lần nữa để chắc chắn không có sai khác trong lúc gõ — vẫn qua hết.
+4. Kiểm tra cú pháp toàn bộ ~122KB JavaScript của trang chính bằng trình phân tích cú pháp Node.js thật (không chỉ `python3 -m py_compile`, vì lệnh đó CHỈ kiểm tra phần Python bao quanh, không đụng tới nội dung JS bên trong).
+
+## 31. Giữ app "luôn chạy" trên Render (miễn phí) — và 1 CẢNH BÁO quan trọng cho database
+
+Đã kiểm tra thông tin mới nhất từ Render (tháng 8/2026) trước khi trả lời, không dựa vào trí nhớ cũ:
+
+**Vì sao app bị "ngủ"**: gói Free của Render tự động dừng (spin down) web service sau **15 phút không có request nào tới** — lần truy cập tiếp theo sẽ mất khoảng **30-60 giây** để "thức dậy" (cold start). Đây là hành vi CỐ Ý của Render để tiết kiệm tài nguyên gói miễn phí, không phải lỗi của code.
+
+**⚠️ QUAN TRỌNG — ảnh hưởng trực tiếp tới `studymate.db`**: gói Free của Render có **ổ đĩa tạm (ephemeral filesystem)** — nghĩa là MỌI thay đổi trên hệ thống file (bao gồm file `studymate.db`) **sẽ bị XOÁ SẠCH mỗi khi service khởi động lại, deploy lại, hoặc "ngủ rồi thức dậy"**. Điều này ngược hẳn với điều bạn từng hỏi ở mục 27 ("có mất tài khoản khi lên live không") — câu trả lời "không mất" ở mục đó ĐÚNG khi bạn tự quản lý server (VPS, máy riêng...), nhưng **SAI nếu deploy trên gói Free của Render**, vì chính Render sẽ xoá file database, không phải do code của app.
+
+### Cách khắc phục (xếp theo mức độ đáng tin cậy)
+
+1. **Đáng tin cậy nhất — nâng cấp gói trả phí + gắn Persistent Disk**: gói Starter ($7/tháng) giữ service chạy liên tục KHÔNG bị ngủ, nhưng **vẫn cần gắn thêm "Persistent Disk"** (tính phí riêng theo dung lượng, xem giá mới nhất trong Dashboard Render lúc bạn tạo) thì `studymate.db` mới thật sự được giữ lại qua các lần deploy/restart. Thiếu bước gắn Disk thì dù trả phí, database vẫn bị mất khi deploy lại.
+2. **Miễn phí nhưng KHÔNG giải quyết được việc mất database** — dùng dịch vụ ping ngoài để "đánh thức" liên tục: đã thêm route mới **`GET /health`** (trả về `{"status":"ok"}` ngay lập tức, không cần đăng nhập, không đụng tới database) — đăng ký 1 tài khoản miễn phí ở **UptimeRobot** hoặc **cron-job.org**, cấu hình ping vào `https://<tên-app-của-bạn>.onrender.com/health` mỗi 10-14 phút. Cách này giữ app không bị spin-down do hết 15 phút rảnh, nhưng **KHÔNG ngăn được** việc mất dữ liệu nếu bạn chủ động deploy lại code — mỗi lần deploy lại, `studymate.db` vẫn về lại trạng thái rỗng trên gói Free.
+   - Lưu ý thêm: gói Free chỉ có 750 giờ máy chủ miễn phí/tháng — ping liên tục 24/7 gần như dùng hết đúng số giờ đó (1 tháng ~730-744 giờ), nên gần như không còn dư cho service khác cùng workspace.
+3. **Giải pháp lâu dài, đúng bản chất nhất**: chuyển từ SQLite (file) sang **Render PostgreSQL** (có gói miễn phí, nhưng hết hạn sau 30 ngày rồi cần nâng cấp; hoặc gói Postgres trả phí nhỏ) — Postgres là database MẠNG thật, không nằm trên ổ đĩa tạm của web service nên không bị mất khi deploy lại. Đây là thay đổi kiến trúc (SQLite → Postgres), **KHÔNG nằm trong phạm vi đã làm lần này** — cho mình biết nếu bạn muốn triển khai, đây sẽ là 1 việc riêng khá lớn (đổi toàn bộ các câu lệnh `sqlite3`/`? placeholder` sang thư viện Postgres).
+
+**Tóm lại**: nếu bạn định deploy thật lên Render, mình khuyên **ưu tiên tìm hiểu mục 3 (chuyển sang Postgres)** hoặc **mục 1 (Starter + Persistent Disk)** — đừng chỉ dùng cách ping (mục 2) rồi yên tâm là dữ liệu an toàn, vì nó không phải vậy.
 
 ## Chưa làm (nằm ngoài phạm vi yêu cầu lần này)
 Phần đầu prompt gốc của bạn từng có yêu cầu dựng lại toàn bộ thành một sản phẩm Next.js/TypeScript quy mô lớn (nhiều trang, Dashboard, Blog, Pricing...). Bản cập nhật này vẫn giữ nguyên nền tảng Flask hiện có của bạn. Nếu bạn vẫn muốn bản Next.js quy mô lớn, đó sẽ là một dự án tách riêng — cho mình biết nếu bạn muốn triển khai.
