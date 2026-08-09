@@ -115,7 +115,32 @@ App hiện chạy bằng `app.run(...)` — chỉ phù hợp để **test trên 
 6. Quay lại Google Cloud Console, thêm `https://ten-app.onrender.com/auth/google/callback` vào danh sách Redirect URI (bước ở mục 5 phía trên).
 7. (Tuỳ chọn) Gắn domain riêng của bạn trong tab **Settings → Custom Domain** của Render.
 
-⚠️ Lưu ý: gói miễn phí của Render dùng ổ đĩa tạm — file `studymate.db` (SQLite) **có thể bị mất khi server khởi động lại**. Với dự án thật có nhiều người dùng, nên: (a) nâng cấp gói có "Persistent Disk", hoặc (b) chuyển sang PostgreSQL (Render có sẵn dịch vụ Postgres miễn phí, cần sửa lại phần kết nối DB trong `app.py`).
+### 6.1 Giữ dữ liệu (`studymate.db`) không bị mất mỗi lần deploy trên Render
+
+Đây là điều **quan trọng nhất** cần biết khi deploy lên Render: mọi service (kể cả gói trả phí thấp nhất nếu chưa gắn Disk) đều có **ổ đĩa tạm (ephemeral filesystem)** — bất kỳ file nào ghi ra ngoài lúc chạy (bao gồm `studymate.db`) **sẽ bị xoá sạch** mỗi khi service redeploy, restart, hoặc (với gói Free) spin-down rồi spin-up lại. Đây không phải lỗi của app — mọi app dùng SQLite trên Render đều gặp vấn đề này.
+
+`app.py` bản này đã hỗ trợ sẵn biến môi trường **`DB_PATH`** để trỏ file DB ra một nơi không bị xoá:
+
+- **Nếu bạn dùng gói Free**: Free service **không thể gắn Persistent Disk** (giới hạn của Render, không phải giới hạn của app). Lựa chọn thực tế để dữ liệu không mất:
+  1. Chấp nhận dữ liệu sẽ reset mỗi lần deploy (được cho dự án demo/thử nghiệm), hoặc
+  2. Chuyển sang một database **miễn phí vĩnh viễn nằm ngoài Render** như [Neon](https://neon.tech) (Postgres, free tier không hết hạn) hoặc [Turso](https://turso.tech) (SQLite-compatible, free tier không hết hạn) — cần sửa lại phần kết nối DB trong `app.py` để dùng `psycopg2`/`libsql` thay vì `sqlite3` trực tiếp. Lưu ý: Postgres **miễn phí của chính Render** sẽ tự xoá sau 30 ngày, nên không phù hợp để lưu vĩnh viễn.
+- **Nếu bạn nâng cấp lên gói trả phí (Starter trở lên, ~7 USD/tháng)**: gắn **Persistent Disk**:
+  1. Vào service trên Render Dashboard → tab **Disks** → **Add Disk**.
+  2. Đặt **Mount Path**, ví dụ `/var/data`.
+  3. Vào tab **Environment**, thêm biến `DB_PATH=/var/data/studymate.db`.
+  4. Deploy lại. Từ giờ toàn bộ tài khoản, lịch sử chat, log sử dụng... sẽ được giữ nguyên qua mỗi lần deploy/restart.
+
+Nếu không đặt `DB_PATH`, app vẫn chạy bình thường và lưu `studymate.db` cạnh `app.py` như trước (phù hợp khi chạy trên máy cá nhân hoặc VPS có ổ đĩa riêng ở Cách B bên dưới).
+
+### 6.2 Giữ app luôn "thức" (tránh bị Render Free cho ngủ)
+
+Gói Free của Render sẽ tự động cho service "ngủ" (spin down) sau **15 phút không có request nào tới**, và mất khoảng 1 phút để "thức dậy" ở request kế tiếp — đây là hành vi mặc định của Render cho gói Free, không thể tắt hoàn toàn nếu không nâng cấp gói.
+
+- App đã có sẵn route **`/healthz`** (không cần đăng nhập, không đụng tới database) — dùng route này để "ping giữ ấm":
+  1. Đăng ký tài khoản miễn phí ở [UptimeRobot](https://uptimerobot.com) hoặc [cron-job.org](https://cron-job.org).
+  2. Tạo 1 "monitor"/"cron job" gọi `GET https://ten-app-cua-ban.onrender.com/healthz` mỗi 5-10 phút.
+  3. Việc này giữ app không bị ngủ, nhưng vẫn tính vào **750 giờ miễn phí/tháng** mà Render cấp cho mỗi workspace (chạy 24/7 cả tháng dùng khoảng 720-744 giờ, vẫn vừa đủ trong hạn mức cho 1 service).
+- Nếu cần đảm bảo **luôn luôn online, không có độ trễ "thức dậy"** (ví dụ app cho nhiều người dùng thật), nên nâng cấp lên gói **Starter trở lên** — các gói trả phí không bị spin-down.
 
 ### Cách B — Tự chủ hơn: VPS riêng (DigitalOcean, Vultr, AWS Lightsail...)
 
