@@ -2447,6 +2447,17 @@ HTML = r'''
     </div>
   </div>
 
+  <!-- Command Palette (Ctrl/⌘ + K) -->
+  <div id="paletteModal" class="hidden modal-panel bg-white dark:bg-gray-800 rounded-2xl shadow-2xl w-full max-w-lg overflow-hidden" style="align-self: flex-start; margin-top: 10vh;">
+    <div class="flex items-center gap-3 px-4 py-3.5 border-b border-gray-100 dark:border-gray-700">
+      <i class="fas fa-magnifying-glass text-gray-400"></i>
+      <input id="paletteInput" type="text" placeholder="Hỏi AI hoặc tìm lệnh... (vd: tạo quiz, cài đặt, sổ lỗi sai)"
+        class="flex-1 bg-transparent border-0 focus:outline-none focus:ring-0 text-sm dark:text-white" autocomplete="off">
+      <kbd class="text-[10px] px-1.5 py-0.5 rounded bg-gray-100 dark:bg-gray-700 text-gray-400">ESC</kbd>
+    </div>
+    <div id="paletteList" class="max-h-[50vh] overflow-y-auto p-2"></div>
+  </div>
+
   <!-- Trợ giúp -->
   <div id="helpModal" class="hidden modal-panel bg-white dark:bg-gray-800 rounded-2xl shadow-2xl w-full max-w-md max-h-[85vh] overflow-y-auto">
     <div class="flex items-center justify-between px-5 py-4 border-b border-gray-100 dark:border-gray-700">
@@ -2459,7 +2470,7 @@ HTML = r'''
         <div class="space-y-1.5">
           <div class="flex justify-between"><span class="text-gray-500">Gửi câu hỏi</span><kbd class="px-2 py-0.5 bg-gray-100 dark:bg-gray-700 rounded text-xs font-mono">Enter</kbd></div>
           <div class="flex justify-between"><span class="text-gray-500">Xuống dòng</span><kbd class="px-2 py-0.5 bg-gray-100 dark:bg-gray-700 rounded text-xs font-mono">Shift + Enter</kbd></div>
-          <div class="flex justify-between"><span class="text-gray-500">Đoạn chat mới</span><kbd class="px-2 py-0.5 bg-gray-100 dark:bg-gray-700 rounded text-xs font-mono">Ctrl/⌘ + K</kbd></div>
+          <div class="flex justify-between"><span class="text-gray-500">Bảng lệnh nhanh (đổi tên đăng nhập, tạo quiz...)</span><kbd class="px-2 py-0.5 bg-gray-100 dark:bg-gray-700 rounded text-xs font-mono">Ctrl/⌘ + K</kbd></div>
           <div class="flex justify-between"><span class="text-gray-500">Mở trợ giúp</span><kbd class="px-2 py-0.5 bg-gray-100 dark:bg-gray-700 rounded text-xs font-mono">Ctrl/⌘ + /</kbd></div>
         </div>
       </div>
@@ -2642,6 +2653,7 @@ const ACHIEVEMENTS_META_JS = {{ achievements_meta|tojson }};
 const AVATAR_EMOJI_JS = {{ avatar_emoji|tojson }};
 const AVATAR_COLOR_JS = {{ avatar_color|tojson }};
 const IS_GUEST_JS = {{ is_guest|tojson }};
+const IS_DEVELOPER_JS = {{ is_developer|tojson }};
 let uploadedFileContext = "";
 let uploadedFileName = "";
 let uploadedImageDataUrl = "";
@@ -3133,9 +3145,118 @@ function dismissBanner() {
 // ---------- Phím tắt bàn phím ----------
 document.addEventListener('keydown', (e) => {
   const ctrlOrCmd = e.ctrlKey || e.metaKey;
-  if (ctrlOrCmd && e.key.toLowerCase() === 'k') { e.preventDefault(); newChat(); }
+  if (ctrlOrCmd && e.key.toLowerCase() === 'k') { e.preventDefault(); openPalette(); }
   else if (ctrlOrCmd && e.key === '/') { e.preventDefault(); openModal('helpModal'); }
   else if (e.key === 'Escape') { closeAllModals(); }
+});
+
+// ---------- Command Palette (Ctrl/⌘+K) ----------
+// Bảng lệnh nhanh kiểu Raycast/Linear — gõ để lọc lệnh, hoặc gõ thẳng câu hỏi rồi Enter để
+// hỏi AI ngay (mở đoạn chat mới). Đây là phần "Web Quick Launcher" — phiên bản trong trình
+// duyệt, KHÔNG phải phím tắt toàn hệ điều hành (xem README mục 25 để biết vì sao và giới hạn
+// thật sự của trình duyệt trong việc này).
+function getPaletteCommands() {
+  const cmds = [
+    { icon: 'fa-plus', label: 'Đoạn chat mới', action: () => { closeAllModals(); newChat(); } },
+    { icon: 'fa-wand-magic-sparkles', label: 'Tạo Quiz bằng AI', action: () => { closeAllModals(); openFlashcards(); switchFcTab('quiz'); setTimeout(openQuizForm, 150); } },
+    { icon: 'fa-layer-group', label: 'Tạo bộ thẻ ghi nhớ bằng AI', action: () => { closeAllModals(); openFlashcards(); switchFcTab('decks'); setTimeout(openAiDeckForm, 150); } },
+    { icon: 'fa-calendar-check', label: 'Tạo kế hoạch ôn tập', action: () => { closeAllModals(); openFlashcards(); switchFcTab('plans'); setTimeout(openPlanForm, 150); } },
+    { icon: 'fa-book', label: 'Mở Sổ lỗi sai', action: () => { closeAllModals(); openFlashcards(); switchFcTab('mistakes'); } },
+    { icon: 'fa-layer-group', label: 'Mở Thẻ ghi nhớ', action: () => { closeAllModals(); openFlashcards(); switchFcTab('decks'); } },
+    { icon: 'fa-gear', label: 'Cài đặt', action: () => openModal('settingsModal') },
+    { icon: 'fa-bolt', label: 'Nâng cấp gói', action: () => openModal('upgradeModal') },
+    { icon: 'fa-circle-question', label: 'Trợ giúp & phím tắt', action: () => openModal('helpModal') },
+  ];
+  if (IS_DEVELOPER_JS) {
+    cmds.push({ icon: 'fa-screwdriver-wrench', label: 'Trang Developer', action: () => { window.location.href = '/developer'; } });
+  }
+  cmds.push({ icon: 'fa-right-from-bracket', label: 'Đăng xuất', action: () => { window.location.href = '/logout'; } });
+  return cmds;
+}
+
+let paletteSelectedIndex = 0;
+let paletteFiltered = [];
+
+function openPalette() {
+  closeAllModals();
+  const backdrop = document.getElementById('modalBackdrop');
+  document.querySelectorAll('.modal-panel').forEach(m => m.classList.add('hidden'));
+  document.getElementById('paletteModal').classList.remove('hidden');
+  backdrop.classList.remove('hidden');
+  backdrop.classList.add('flex');
+  const input = document.getElementById('paletteInput');
+  input.value = '';
+  renderPaletteList('');
+  setTimeout(() => input.focus(), 30);
+}
+
+function renderPaletteList(query) {
+  const q = query.trim().toLowerCase();
+  const all = getPaletteCommands();
+  paletteFiltered = q ? all.filter(c => c.label.toLowerCase().includes(q)) : all;
+  paletteSelectedIndex = 0;
+
+  const list = document.getElementById('paletteList');
+  list.innerHTML = '';
+
+  if (q) {
+    const askItem = document.createElement('button');
+    askItem.type = 'button';
+    askItem.className = 'palette-item w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-left text-sm hover:bg-gray-100 dark:hover:bg-gray-700';
+    askItem.innerHTML = `<i class="fas fa-sparkles text-indigo-500 w-4"></i> <span>Hỏi AI: <strong>"${escapeHtml(query)}"</strong></span>`;
+    askItem.addEventListener('click', () => askPaletteQuery(query));
+    list.appendChild(askItem);
+  }
+
+  paletteFiltered.forEach((cmd, i) => {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'palette-item w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-left text-sm hover:bg-gray-100 dark:hover:bg-gray-700';
+    btn.dataset.idx = i;
+    btn.innerHTML = `<i class="fas ${cmd.icon} text-gray-400 w-4"></i> <span>${escapeHtml(cmd.label)}</span>`;
+    btn.addEventListener('click', () => { closeAllModals(); cmd.action(); });
+    list.appendChild(btn);
+  });
+
+  if (!q && !paletteFiltered.length) {
+    list.innerHTML = '<p class="text-sm text-gray-400 text-center py-6">Không có lệnh nào.</p>';
+  } else if (q && !paletteFiltered.length) {
+    // chỉ còn mục "Hỏi AI" ở trên — không cần thêm thông báo trống
+  }
+  updatePaletteHighlight();
+}
+
+function updatePaletteHighlight() {
+  const items = document.querySelectorAll('#paletteList .palette-item');
+  items.forEach((el, i) => el.classList.toggle('bg-gray-100', i === paletteSelectedIndex));
+  items.forEach((el, i) => el.classList.toggle('dark:bg-gray-700', i === paletteSelectedIndex));
+}
+
+function askPaletteQuery(query) {
+  closeAllModals();
+  newChat();
+  document.getElementById('messageInput').value = query;
+  sendMessage();
+}
+
+document.getElementById('paletteInput').addEventListener('input', (e) => renderPaletteList(e.target.value));
+document.getElementById('paletteInput').addEventListener('keydown', (e) => {
+  const items = document.querySelectorAll('#paletteList .palette-item');
+  if (e.key === 'ArrowDown') {
+    e.preventDefault();
+    paletteSelectedIndex = Math.min(items.length - 1, paletteSelectedIndex + 1);
+    updatePaletteHighlight();
+  } else if (e.key === 'ArrowUp') {
+    e.preventDefault();
+    paletteSelectedIndex = Math.max(0, paletteSelectedIndex - 1);
+    updatePaletteHighlight();
+  } else if (e.key === 'Enter') {
+    e.preventDefault();
+    const query = e.target.value.trim();
+    const items2 = document.querySelectorAll('#paletteList .palette-item');
+    if (items2.length) { items2[paletteSelectedIndex].click(); }
+    else if (query) { askPaletteQuery(query); }
+  }
 });
 
 function escapeHtml(str) {
