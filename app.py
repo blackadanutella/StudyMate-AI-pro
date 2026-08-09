@@ -6730,6 +6730,15 @@ def logout():
 # ==========================================
 # 5. ĐỊNH TUYẾN CHÍNH (Trang chủ gia sư AI)
 # ==========================================
+@app.route('/health')
+def health_check():
+    """Endpoint 'sống hay chết' — CỐ TÌNH cực nhẹ (không đăng nhập, không đụng database),
+    dùng cho 2 việc: (1) health check tự động của nền tảng deploy (Render/Railway/...), và
+    (2) để 1 dịch vụ ping bên ngoài (UptimeRobot, cron-job.org...) gọi định kỳ giữ server
+    free tier không bị 'ngủ' — xem README mục 'Deploy' để biết cách dùng đúng."""
+    return jsonify({"status": "ok", "time": now_iso()})
+
+
 @app.route('/manifest.json')
 def pwa_manifest():
     """PWA manifest — cho phép 'Cài đặt' StudyMate AI như 1 app (Add to Home Screen) trên
