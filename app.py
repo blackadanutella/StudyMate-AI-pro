@@ -131,6 +131,26 @@ if not GOOGLE_OAUTH_ENABLED:
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'studymate.db')
 
 
+def ensure_columns(conn, table, columns):
+    """Tự thêm các cột còn THIẾU vào 1 bảng đã tồn tại — an toàn để gọi lại nhiều lần (chỉ
+    ALTER TABLE nếu cột chưa có). `columns`: dict {tên_cột: định_nghĩa_SQL}.
+
+    Lý do cần hàm này: `CREATE TABLE IF NOT EXISTS` là no-op nếu bảng đã tồn tại — nếu sau
+    này code thêm cột mới vào câu CREATE nhưng người dùng đang chạy 1 database SQLite được
+    tạo từ TRƯỚC lúc thêm cột đó, bảng cũ sẽ KHÔNG tự có cột mới, gây lỗi
+    "sqlite3.OperationalError: no such column: ..." ngay khi code cố đọc/ghi cột đó (đã xảy
+    ra thực tế với issue_reports.resolved_by). Gọi ensure_columns() cho MỌI bảng ngay sau
+    CREATE TABLE để tự "vá" schema cũ, không cần người dùng xoá database đi tạo lại."""
+    existing = {r[1] for r in conn.execute(f'PRAGMA table_info({table})').fetchall()}
+    changed = False
+    for col_name, col_def in columns.items():
+        if col_name not in existing:
+            conn.execute(f'ALTER TABLE {table} ADD COLUMN {col_name} {col_def}')
+            changed = True
+    if changed:
+        conn.commit()
+
+
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     conn.execute('''
@@ -278,6 +298,7 @@ def init_db():
             FOREIGN KEY (owner_id) REFERENCES users (id)
         )
     ''')
+    conn.commit()
     # API Key cho developer trở lên — chỉ lưu bản băm (hash), không bao giờ lưu key gốc.
     conn.execute('''
         CREATE TABLE IF NOT EXISTS api_keys (
@@ -292,6 +313,7 @@ def init_db():
             FOREIGN KEY (user_id) REFERENCES users (id)
         )
     ''')
+    conn.commit()
     # Nhật ký thao tác nhạy cảm (đổi vai trò, khoá tài khoản, xoá tài khoản, cấu hình hệ thống...)
     # — chỉ Super Admin xem được, phục vụ truy vết trách nhiệm (audit trail).
     conn.execute('''
@@ -305,6 +327,7 @@ def init_db():
             created_at TEXT NOT NULL
         )
     ''')
+    conn.commit()
     # Nhật ký từng lượt tải file/ảnh lên — dùng để tính giới hạn "X file/ảnh mỗi 24h" theo
     # gói (Free/Premium/Max). Đếm theo cửa sổ trượt 24h kể từ thời điểm hỏi (rolling window),
     # KHÔNG reset cứng theo nửa đêm — đúng như yêu cầu "thời gian reset 24h".
@@ -318,6 +341,7 @@ def init_db():
             FOREIGN KEY (user_id) REFERENCES users (id)
         )
     ''')
+    conn.commit()
     # Đơn nâng cấp gói (thanh toán). "method" = 'vnpay' (ATM/Visa/Mastercard/JCB qua cổng
     # VNPAY) hoặc 'bank_transfer' (chuyển khoản quét mã VietQR, xác nhận thủ công bởi Admin).
     # "order_code" vừa là mã tra cứu, vừa dùng làm vnp_TxnRef / nội dung chuyển khoản.
@@ -339,6 +363,7 @@ def init_db():
             FOREIGN KEY (user_id) REFERENCES users (id)
         )
     ''')
+    conn.commit()
     payment_cols = [r[1] for r in conn.execute('PRAGMA table_info(payment_orders)').fetchall()]
     if 'base_amount' not in payment_cols:
         conn.execute("ALTER TABLE payment_orders ADD COLUMN base_amount INTEGER NOT NULL DEFAULT 0")
@@ -359,6 +384,7 @@ def init_db():
             FOREIGN KEY (user_id) REFERENCES users (id)
         )
     ''')
+    conn.commit()
     # Báo lỗi câu trả lời từ học sinh — gắn với 1 đoạn chat cụ thể (nếu có) để Admin xem lại.
     conn.execute('''
         CREATE TABLE IF NOT EXISTS issue_reports (
@@ -374,6 +400,13 @@ def init_db():
             FOREIGN KEY (user_id) REFERENCES users (id)
         )
     ''')
+    conn.commit()
+    # Bảng issue_reports từng được tạo TRƯỚC KHI có cột resolved_by (đã gây lỗi thực tế:
+    # "no such column: resolved_by" khi Admin bấm Đánh dấu đã xử lý) — vá lại schema cũ.
+    ensure_columns(conn, 'issue_reports', {
+        'resolved_at': 'TEXT',
+        'resolved_by': 'TEXT',
+    })
     # Gamification nhẹ: XP + streak (số ngày học liên tiếp) theo tài khoản.
     conn.execute('''
         CREATE TABLE IF NOT EXISTS user_stats (
@@ -385,6 +418,7 @@ def init_db():
             FOREIGN KEY (user_id) REFERENCES users (id)
         )
     ''')
+    conn.commit()
     conn.execute('''
         CREATE TABLE IF NOT EXISTS achievements (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -395,6 +429,7 @@ def init_db():
             FOREIGN KEY (user_id) REFERENCES users (id)
         )
     ''')
+    conn.commit()
     # "Thẻ ghi nhớ" (flashcards) — bộ thẻ do học sinh tự tạo hoặc AI tạo giúp từ 1 chủ đề /
     # đoạn chat. box_level dùng kiểu Leitner đơn giản (1-5, đúng thì tăng, sai thì về 1) để
     # ưu tiên cho học sinh ôn lại thẻ còn yếu trước.
@@ -410,6 +445,7 @@ def init_db():
             FOREIGN KEY (user_id) REFERENCES users (id)
         )
     ''')
+    conn.commit()
     conn.execute('''
         CREATE TABLE IF NOT EXISTS flashcards (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -422,6 +458,139 @@ def init_db():
             last_reviewed_at TEXT,
             created_at TEXT NOT NULL,
             FOREIGN KEY (deck_id) REFERENCES flashcard_decks (id)
+        )
+    ''')
+    conn.commit()
+    # "Sổ lỗi sai" (Mistake Book) — học sinh (hoặc chính học sinh tự đánh giá sau khi đọc lời
+    # sửa của AI ở chế độ "Kiểm tra bài làm") lưu lại 1 dạng lỗi hay mắc. Lỗi lặp lại (cùng
+    # môn + cùng mô tả, sau khi chuẩn hoá) chỉ tăng occurrence_count chứ không tạo dòng mới,
+    # để ra đúng kiểu "Chuyển vế sai dấu ×3" như trong Sổ lỗi sai thật.
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS mistakes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            subject TEXT NOT NULL DEFAULT '',
+            description TEXT NOT NULL,
+            occurrence_count INTEGER NOT NULL DEFAULT 1,
+            conversation_id INTEGER,
+            resolved INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            last_occurred_at TEXT NOT NULL,
+            FOREIGN KEY (user_id) REFERENCES users (id)
+        )
+    ''')
+    conn.commit()
+
+    # ---- "Vá" toàn diện: đảm bảo MỌI bảng có ĐỦ MỌI cột mà code hiện tại mong đợi, bất kể
+    # database đang chạy được tạo từ phiên bản nào trong quá khứ. Đây là lớp phòng thủ cuối
+    # cùng, tự sửa các trường hợp "no such column" còn sót lại ở TẤT CẢ các bảng (không chỉ
+    # issue_reports) — kể cả những bảng hiện tại chưa phát hiện thiếu cột nào, khai đầy đủ
+    # ở đây vẫn AN TOÀN vì ensure_columns() chỉ ALTER những cột thật sự còn thiếu.
+    ensure_columns(conn, 'users', {
+        'role': "TEXT NOT NULL DEFAULT 'user'", 'email': 'TEXT', 'oauth_provider': 'TEXT',
+        'oauth_id': 'TEXT', 'preferences': "TEXT DEFAULT '{}'", 'is_locked': 'INTEGER NOT NULL DEFAULT 0',
+        'lock_reason': "TEXT DEFAULT ''", 'session_version': 'INTEGER NOT NULL DEFAULT 0',
+        'plan': "TEXT NOT NULL DEFAULT 'free'", 'plan_expires_at': 'TEXT',
+        'avatar_emoji': 'TEXT', 'avatar_color': 'TEXT', 'is_guest': 'INTEGER NOT NULL DEFAULT 0',
+    })
+    ensure_columns(conn, 'conversations', {
+        'pinned': 'INTEGER NOT NULL DEFAULT 0', 'project_id': 'INTEGER',
+    })
+    ensure_columns(conn, 'payment_orders', {
+        'base_amount': 'INTEGER NOT NULL DEFAULT 0', 'is_discounted': 'INTEGER NOT NULL DEFAULT 0',
+    })
+    ensure_columns(conn, 'memories', {
+        'category': "TEXT NOT NULL DEFAULT 'general'", 'source': "TEXT NOT NULL DEFAULT 'auto'",
+    })
+    ensure_columns(conn, 'mistakes', {
+        'occurrence_count': 'INTEGER NOT NULL DEFAULT 1', 'conversation_id': 'INTEGER',
+        'resolved': 'INTEGER NOT NULL DEFAULT 0',
+    })
+    ensure_columns(conn, 'flashcard_decks', {
+        'subject': "TEXT DEFAULT ''", 'source': "TEXT NOT NULL DEFAULT 'manual'",
+    })
+    ensure_columns(conn, 'flashcards', {
+        'box_level': 'INTEGER NOT NULL DEFAULT 1', 'times_reviewed': 'INTEGER NOT NULL DEFAULT 0',
+        'times_correct': 'INTEGER NOT NULL DEFAULT 0', 'last_reviewed_at': 'TEXT',
+    })
+    ensure_columns(conn, 'api_keys', {'last_used_at': 'TEXT', 'revoked': 'INTEGER NOT NULL DEFAULT 0'})
+
+    # "Quiz Generator" (Phase 1) — AI tạo bộ câu hỏi từ 1 chủ đề (hoặc từ nội dung 1 đoạn
+    # chat có sẵn). Chỉ hỗ trợ các dạng câu hỏi CHẤM ĐƯỢC TỰ ĐỘNG, CHÍNH XÁC, KHÔNG cần thêm
+    # lượt gọi AI nào lúc chấm (trắc nghiệm, đúng/sai, điền khuyết) — dạng tự luận/ghép nối
+    # cần AI chấm chủ quan nên chưa hỗ trợ ở bản này (xem README).
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS quizzes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            title TEXT NOT NULL,
+            subject TEXT DEFAULT '',
+            difficulty TEXT NOT NULL DEFAULT 'medium',
+            source TEXT NOT NULL DEFAULT 'topic',
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (user_id) REFERENCES users (id)
+        )
+    ''')
+    conn.commit()
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS quiz_questions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            quiz_id INTEGER NOT NULL,
+            q_type TEXT NOT NULL,
+            question TEXT NOT NULL,
+            options TEXT,
+            correct_answer TEXT NOT NULL,
+            explanation TEXT DEFAULT '',
+            topic TEXT DEFAULT '',
+            order_index INTEGER NOT NULL DEFAULT 0,
+            FOREIGN KEY (quiz_id) REFERENCES quizzes (id)
+        )
+    ''')
+    conn.commit()
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS quiz_attempts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            quiz_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            score INTEGER NOT NULL DEFAULT 0,
+            total INTEGER NOT NULL DEFAULT 0,
+            duration_seconds INTEGER DEFAULT 0,
+            answers TEXT,
+            weak_topics TEXT DEFAULT '',
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (quiz_id) REFERENCES quizzes (id),
+            FOREIGN KEY (user_id) REFERENCES users (id)
+        )
+    ''')
+    conn.commit()
+
+    # "Study Plan" (Phase 1) — AI chia 1 mục tiêu ôn tập thành kế hoạch theo từng ngày.
+    # "Sắp xếp lại" (reorganize) khi học sinh bị trễ tiến độ = gọi lại AI phân bổ các việc
+    # CÒN LẠI (chưa Hoàn thành) vào số ngày CÒN LẠI — không phải thuật toán lịch phức tạp,
+    # nhưng vẫn là "tự điều chỉnh kế hoạch theo tiến độ" đúng như yêu cầu.
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS study_plans (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            title TEXT NOT NULL,
+            subject TEXT DEFAULT '',
+            total_days INTEGER NOT NULL,
+            start_date TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (user_id) REFERENCES users (id)
+        )
+    ''')
+    conn.commit()
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS study_tasks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            plan_id INTEGER NOT NULL,
+            day_number INTEGER NOT NULL,
+            title TEXT NOT NULL,
+            description TEXT DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'pending',
+            completed_at TEXT,
+            FOREIGN KEY (plan_id) REFERENCES study_plans (id)
         )
     ''')
     conn.commit()
@@ -990,6 +1159,11 @@ ACHIEVEMENTS_META = {
     'questions_100': {'icon': '📚', 'label': '100 câu hỏi', 'desc': 'Đã hỏi AI 100 lượt.'},
     'first_deck':    {'icon': '🗂️', 'label': 'Bộ thẻ đầu tiên', 'desc': 'Tạo bộ thẻ ghi nhớ đầu tiên.'},
     'game_player':   {'icon': '🎮', 'label': 'Người chơi mới', 'desc': 'Hoàn thành 1 trò chơi luyện tập.'},
+    'first_mistake': {'icon': '📕', 'label': 'Tự nhận ra lỗi', 'desc': 'Ghi lại lỗi sai đầu tiên vào Sổ lỗi sai.'},
+    'first_quiz':    {'icon': '📝', 'label': 'Quiz đầu tiên', 'desc': 'Hoàn thành 1 bài quiz.'},
+    'perfect_quiz':  {'icon': '💯', 'label': 'Điểm tuyệt đối', 'desc': 'Đạt 100% điểm 1 bài quiz.'},
+    'first_plan':    {'icon': '🎯', 'label': 'Kế hoạch đầu tiên', 'desc': 'Tạo kế hoạch ôn tập đầu tiên.'},
+    'plan_finisher':  {'icon': '🏆', 'label': 'Về đích', 'desc': 'Hoàn thành trọn vẹn 1 kế hoạch ôn tập.'},
 }
 
 
@@ -1296,6 +1470,12 @@ def google_login_effective_enabled():
     return GOOGLE_OAUTH_ENABLED
 
 
+def guest_login_effective_enabled():
+    """Cho phép 'Dùng thử ngay, không cần đăng ký' — MẶC ĐỊNH BẬT (khác Google, không cần
+    cấu hình .env gì để dùng được). Developer có thể tắt từ /developer nếu không muốn nữa."""
+    return get_setting('guest_login_override', 'on') != 'off'
+
+
 # ==========================================
 # 0.4. TUỲ CHỈNH CÁ NHÂN (preferences theo tài khoản)
 # ==========================================
@@ -1502,6 +1682,21 @@ AUTH_HTML = r'''
           Đã có tài khoản? <a href="{{ url_for('login_page') }}" class="text-indigo-600 font-semibold hover:underline">Đăng nhập</a>
         {% endif %}
       </p>
+
+      {% if guest_enabled %}
+      <div class="flex items-center gap-3 my-5">
+        <div class="flex-1 h-px bg-gray-200"></div>
+        <span class="text-xs text-gray-400 font-medium">hoặc</span>
+        <div class="flex-1 h-px bg-gray-200"></div>
+      </div>
+      <form method="POST" action="{{ url_for('guest_login') }}">
+        <button type="submit"
+                class="w-full flex items-center justify-center gap-2 px-4 py-3 rounded-xl border border-dashed border-gray-300 hover:bg-gray-50 font-medium text-sm text-gray-600">
+          <i class="fas fa-bolt text-amber-500"></i> Dùng thử ngay, không cần đăng ký
+        </button>
+      </form>
+      <p class="text-center text-[11px] text-gray-400 mt-2">Dữ liệu dùng thử có thể mất nếu xoá cookie trình duyệt — tạo tài khoản bất cứ lúc nào để lưu lại.</p>
+      {% endif %}
     </div>
 
     <p class="text-center text-xs text-indigo-200/60 mt-6">© {{ 2026 }} StudyMate AI — Dữ liệu đăng nhập được mã hoá, không chia sẻ cho bên thứ ba.</p>
@@ -1637,6 +1832,30 @@ HTML = r'''
     .gamify-xp-track { background: #e5e7eb; border-radius: 999px; height: 6px; overflow: hidden; }
     .dark .gamify-xp-track { background: #374151; }
     .gamify-xp-fill { background: linear-gradient(90deg, #f59e0b, #f97316); height: 100%; border-radius: 999px; transition: width 0.4s; }
+
+    /* Hiệu ứng ngọn lửa giữa màn hình khi đạt mốc streak (3, 10, 30, 100, 200, 300, 500, 1000
+       ngày...) — ngọn lửa càng đậm/nhiều lớp hơn ở mốc càng cao, xem STREAK_TIER_STYLE trong JS. */
+    #streakFireOverlay { transition: none; }
+    #streakFireOverlay.showing #streakFireGlow { animation: streakGlowPulse 2.7s ease forwards; }
+    #streakFireOverlay.showing #streakFireContent { animation: streakPop 2.7s cubic-bezier(.34,1.56,.64,1) forwards; }
+    @keyframes streakGlowPulse {
+      0% { opacity: 0; }
+      15% { opacity: 1; }
+      75% { opacity: 1; }
+      100% { opacity: 0; }
+    }
+    @keyframes streakPop {
+      0% { transform: scale(0.3) translateY(24px); opacity: 0; }
+      15% { transform: scale(1.18) translateY(0); opacity: 1; }
+      25% { transform: scale(1); }
+      82% { transform: scale(1); opacity: 1; }
+      100% { transform: scale(0.92) translateY(-14px); opacity: 0; }
+    }
+    @keyframes streakEmojiFlicker {
+      0%, 100% { transform: scale(1) rotate(-2deg); }
+      50% { transform: scale(1.06) rotate(2deg); }
+    }
+    #streakFireEmoji { animation: streakEmojiFlicker 0.5s ease-in-out infinite; filter: drop-shadow(0 0 18px currentColor); }
 
     #sidebar { transition: transform 0.2s ease; }
     @media (max-width: 1023px) { #sidebar { transform: translateX(-100%); } #sidebar.open { transform: translateX(0); } }
@@ -1872,7 +2091,136 @@ HTML = r'''
     <button onclick="closeFlashcards()" class="w-9 h-9 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-800 flex items-center justify-center flex-shrink-0"><i class="fas fa-xmark"></i></button>
   </div>
 
+  <div id="fcTabBar" class="flex items-center gap-1 px-4 lg:px-6 pt-3 border-b border-gray-200 dark:border-gray-800 flex-shrink-0 overflow-x-auto">
+    <button id="fcTabDecks" onclick="switchFcTab('decks')" class="px-3.5 py-2 text-sm font-medium border-b-2 border-blue-600 text-blue-600 dark:text-blue-400 flex items-center gap-1.5 whitespace-nowrap">
+      <i class="fas fa-layer-group"></i> Thẻ ghi nhớ
+    </button>
+    <button id="fcTabMistakes" onclick="switchFcTab('mistakes')" class="px-3.5 py-2 text-sm font-medium border-b-2 border-transparent text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 flex items-center gap-1.5 whitespace-nowrap">
+      <i class="fas fa-book"></i> Sổ lỗi sai
+    </button>
+    <button id="fcTabQuiz" onclick="switchFcTab('quiz')" class="px-3.5 py-2 text-sm font-medium border-b-2 border-transparent text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 flex items-center gap-1.5 whitespace-nowrap">
+      <i class="fas fa-list-check"></i> Quiz
+    </button>
+    <button id="fcTabPlans" onclick="switchFcTab('plans')" class="px-3.5 py-2 text-sm font-medium border-b-2 border-transparent text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 flex items-center gap-1.5 whitespace-nowrap">
+      <i class="fas fa-calendar-check"></i> Kế hoạch ôn tập
+    </button>
+  </div>
+
   <div class="flex-1 overflow-y-auto">
+    <!-- ============ Quiz ============ -->
+    <div id="fcQuizListView" class="hidden max-w-4xl mx-auto p-4 lg:p-6">
+      <button onclick="openQuizForm()" class="px-4 py-2.5 rounded-xl bg-gradient-to-r from-blue-600 to-indigo-600 hover:opacity-90 text-white text-sm font-semibold flex items-center gap-2 mb-5">
+        <i class="fas fa-wand-magic-sparkles"></i> Tạo quiz bằng AI ✨
+      </button>
+
+      <div id="quizForm" class="hidden mb-5 p-4 rounded-2xl border border-blue-200 dark:border-blue-900 bg-blue-50 dark:bg-blue-900/10 space-y-2.5">
+        <input id="quizTopic" type="text" maxlength="200" placeholder="Chủ đề, vd: Phương trình bậc 2"
+          class="w-full px-3 py-2.5 rounded-xl bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 dark:text-white">
+        <div class="flex flex-wrap gap-2">
+          <input id="quizSubject" type="text" maxlength="60" placeholder="Môn học (tuỳ chọn)"
+            class="flex-1 min-w-[120px] px-3 py-2 rounded-xl bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 dark:text-white">
+          <select id="quizDifficulty" class="px-3 py-2 rounded-xl bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 dark:text-white">
+            <option value="easy">Dễ</option>
+            <option value="medium" selected>Trung bình</option>
+            <option value="hard">Khó</option>
+            <option value="expert">Nâng cao</option>
+          </select>
+          <select id="quizCount" class="px-3 py-2 rounded-xl bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 dark:text-white">
+            <option value="3">3 câu</option>
+            <option value="5" selected>5 câu</option>
+            <option value="10">10 câu</option>
+          </select>
+        </div>
+        <div class="flex gap-2">
+          <button id="quizSubmitBtn" onclick="submitQuizGeneration()" class="px-4 py-2 rounded-xl bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white text-sm font-semibold"><span id="quizSubmitLabel">Tạo quiz</span></button>
+          <button onclick="document.getElementById('quizForm').classList.add('hidden')" class="px-4 py-2 rounded-xl bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 text-sm">Huỷ</button>
+        </div>
+        <p id="quizFormError" class="hidden text-xs text-red-500"></p>
+      </div>
+
+      <div id="quizGrid" class="grid sm:grid-cols-2 lg:grid-cols-3 gap-3"></div>
+      <p id="quizEmptyState" class="hidden text-center text-sm text-gray-400 py-16">Chưa có quiz nào — tạo bài đầu tiên ở trên nhé! 📝</p>
+    </div>
+
+    <!-- ============ Làm quiz ============ -->
+    <div id="fcQuizTakeView" class="hidden max-w-2xl mx-auto p-4 lg:p-6">
+      <div class="flex items-center justify-between mb-4">
+        <p id="quizTakeProgress" class="text-xs text-gray-400"></p>
+        <p id="quizTakeTimer" class="text-xs text-gray-400"><i class="fas fa-clock mr-1"></i><span>0</span>s</p>
+      </div>
+      <div id="quizQuestionCard" class="rounded-2xl border border-gray-200 dark:border-gray-700 p-5">
+        <p id="quizQuestionTopic" class="text-xs text-blue-500 font-semibold uppercase mb-1"></p>
+        <p id="quizQuestionText" class="font-semibold text-lg mb-4"></p>
+        <div id="quizAnswerArea" class="space-y-2"></div>
+      </div>
+      <div class="flex justify-between mt-4">
+        <button onclick="showFcView('list'); switchFcTab('quiz')" class="text-sm text-gray-400 hover:text-gray-600 dark:hover:text-gray-300">Thoát</button>
+        <button id="quizNextBtn" onclick="submitQuizAnswerAndNext()" class="px-5 py-2.5 rounded-xl bg-blue-600 hover:bg-blue-700 text-white text-sm font-semibold">Tiếp theo <i class="fas fa-arrow-right ml-1"></i></button>
+      </div>
+    </div>
+
+    <!-- ============ Kết quả quiz ============ -->
+    <div id="fcQuizResultView" class="hidden max-w-2xl mx-auto p-4 lg:p-6 text-center">
+      <p class="text-3xl mb-1" id="quizResultEmoji">🎉</p>
+      <p class="font-bold text-2xl" id="quizResultScore"></p>
+      <p class="text-sm text-gray-400 mt-1" id="quizResultXp"></p>
+      <div id="quizWeakTopics" class="hidden mt-4 text-left mx-auto max-w-sm bg-amber-50 dark:bg-amber-900/10 border border-amber-200 dark:border-amber-900/50 rounded-xl p-4">
+        <p class="text-sm font-semibold text-amber-700 dark:text-amber-400 mb-1"><i class="fas fa-triangle-exclamation mr-1"></i>Chủ đề cần ôn lại:</p>
+        <p id="quizWeakTopicsList" class="text-sm text-amber-700 dark:text-amber-400"></p>
+      </div>
+      <div id="quizReviewList" class="mt-5 text-left space-y-2 max-w-lg mx-auto"></div>
+      <button onclick="showFcView('list'); switchFcTab('quiz')" class="mt-6 px-5 py-2.5 rounded-xl bg-blue-600 hover:bg-blue-700 text-white text-sm font-semibold">Xong</button>
+    </div>
+
+    <!-- ============ Kế hoạch ôn tập ============ -->
+    <div id="fcPlansListView" class="hidden max-w-4xl mx-auto p-4 lg:p-6">
+      <button onclick="openPlanForm()" class="px-4 py-2.5 rounded-xl bg-gradient-to-r from-emerald-600 to-teal-600 hover:opacity-90 text-white text-sm font-semibold flex items-center gap-2 mb-5">
+        <i class="fas fa-wand-magic-sparkles"></i> Tạo kế hoạch bằng AI ✨
+      </button>
+
+      <div id="planForm" class="hidden mb-5 p-4 rounded-2xl border border-emerald-200 dark:border-emerald-900 bg-emerald-50 dark:bg-emerald-900/10 space-y-2.5">
+        <input id="planGoal" type="text" maxlength="300" placeholder="Mục tiêu, vd: Ôn thi học kỳ Toán 8"
+          class="w-full px-3 py-2.5 rounded-xl bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 text-sm focus:outline-none focus:ring-2 focus:ring-emerald-500 dark:text-white">
+        <div class="flex flex-wrap gap-2">
+          <input id="planSubject" type="text" maxlength="60" placeholder="Môn học (tuỳ chọn)"
+            class="flex-1 min-w-[120px] px-3 py-2 rounded-xl bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 text-sm focus:outline-none focus:ring-2 focus:ring-emerald-500 dark:text-white">
+          <input id="planDays" type="number" min="3" max="60" value="14" placeholder="Số ngày"
+            class="w-28 px-3 py-2 rounded-xl bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 text-sm focus:outline-none focus:ring-2 focus:ring-emerald-500 dark:text-white">
+        </div>
+        <div class="flex gap-2">
+          <button id="planSubmitBtn" onclick="submitPlanGeneration()" class="px-4 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 text-white text-sm font-semibold"><span id="planSubmitLabel">Tạo kế hoạch</span></button>
+          <button onclick="document.getElementById('planForm').classList.add('hidden')" class="px-4 py-2 rounded-xl bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 text-sm">Huỷ</button>
+        </div>
+        <p id="planFormError" class="hidden text-xs text-red-500"></p>
+      </div>
+
+      <div id="planGrid" class="grid sm:grid-cols-2 gap-3"></div>
+      <p id="planEmptyState" class="hidden text-center text-sm text-gray-400 py-16">Chưa có kế hoạch nào — tạo kế hoạch đầu tiên ở trên nhé! 🎯</p>
+    </div>
+
+    <!-- ============ Chi tiết kế hoạch ============ -->
+    <div id="fcPlanDetailView" class="hidden max-w-2xl mx-auto p-4 lg:p-6">
+      <div class="flex flex-wrap items-center justify-between gap-2 mb-2">
+        <div>
+          <h3 id="planDetailTitle" class="font-bold text-lg"></h3>
+          <p id="planDetailMeta" class="text-xs text-gray-400"></p>
+        </div>
+        <div class="flex gap-2">
+          <button id="planReorganizeBtn" onclick="reorganizeCurrentPlan()" class="hidden px-3 py-2 rounded-xl bg-amber-50 dark:bg-amber-900/20 text-amber-600 dark:text-amber-400 text-xs font-semibold hover:bg-amber-100 dark:hover:bg-amber-900/40"><i class="fas fa-arrows-rotate mr-1"></i>Sắp xếp lại</button>
+          <button onclick="deleteCurrentPlan()" class="px-3 py-2 rounded-xl bg-red-50 dark:bg-red-900/20 text-red-600 dark:text-red-400 text-sm hover:bg-red-100 dark:hover:bg-red-900/40"><i class="fas fa-trash-can"></i></button>
+        </div>
+      </div>
+      <div class="gamify-xp-track mb-4"><div id="planProgressBar" class="gamify-xp-fill" style="width:0%;"></div></div>
+      <div id="planTaskList" class="space-y-2"></div>
+    </div>
+
+    <!-- ============ Sổ lỗi sai ============ -->
+    <div id="fcMistakesView" class="hidden max-w-3xl mx-auto p-4 lg:p-6">
+      <p class="text-xs text-gray-400 mb-4">Lỗi hay lặp lại nhiều lần được xếp lên đầu — bấm "Ôn lại ngay" để StudyMate ra bài luyện đúng chỗ em còn yếu.</p>
+      <div id="mistakeGroups" class="space-y-5"></div>
+      <p id="mistakeEmptyState" class="hidden text-center text-sm text-gray-400 py-16">Chưa có lỗi nào được ghi lại — đó là điều tốt! 🎉<br>Bấm "Lưu vào Sổ lỗi sai" dưới câu trả lời AI khi em phát hiện mình mắc lỗi nhé.</p>
+    </div>
+
     <!-- ============ Danh sách bộ thẻ ============ -->
     <div id="fcDeckListView" class="max-w-4xl mx-auto p-4 lg:p-6">
       <div class="flex flex-wrap gap-2 mb-5">
@@ -1972,6 +2320,14 @@ HTML = r'''
   </div>
 </div>
 
+<div id="streakFireOverlay" class="hidden fixed inset-0 z-[80] flex items-center justify-center pointer-events-none">
+  <div id="streakFireGlow" class="absolute inset-0"></div>
+  <div id="streakFireContent" class="relative text-center">
+    <div id="streakFireEmoji" class="leading-none select-none"></div>
+    <p id="streakFireText" class="mt-3 font-extrabold text-white text-xl drop-shadow-[0_2px_8px_rgba(0,0,0,0.6)]"></p>
+  </div>
+</div>
+
 <div id="modalBackdrop" class="hidden fixed inset-0 bg-black/50 z-[60] flex items-center justify-center p-4" onclick="if(event.target===this) closeAllModals()">
 
   <!-- Cài đặt -->
@@ -1981,6 +2337,45 @@ HTML = r'''
       <button onclick="closeAllModals()" class="w-8 h-8 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 flex items-center justify-center"><i class="fas fa-xmark"></i></button>
     </div>
     <div class="p-5 space-y-5">
+      <!-- Tài khoản: avatar + (khách -> tạo tài khoản chính thức | đã có mật khẩu -> đổi mật khẩu) -->
+      <div class="rounded-xl border border-gray-200 dark:border-gray-700 p-3.5 space-y-3">
+        <label class="text-sm font-semibold block">Avatar</label>
+        <div id="avatarGrid" class="grid grid-cols-8 gap-1.5">
+          {% for a in avatar_presets %}
+          <button type="button" class="avatar-opt-btn w-8 h-8 rounded-full bg-gradient-to-br {{ a.color }} flex items-center justify-center text-base hover:scale-110 transition-transform {{ 'ring-2 ring-offset-2 ring-blue-500 dark:ring-offset-gray-800' if a.emoji == avatar_emoji else '' }}" data-emoji="{{ a.emoji }}" data-color="{{ a.color }}">{{ a.emoji }}</button>
+          {% endfor %}
+        </div>
+
+        {% if is_guest %}
+        <div class="pt-3 border-t border-gray-100 dark:border-gray-700">
+          <p class="text-xs font-semibold text-amber-600 dark:text-amber-400 mb-1"><i class="fas fa-bolt mr-1"></i>Bạn đang dùng thử (tài khoản khách)</p>
+          <p class="text-xs text-gray-400 mb-2.5">Tạo tài khoản chính thức để không mất dữ liệu khi xoá cookie trình duyệt — toàn bộ lịch sử chat, XP, thẻ ghi nhớ... sẽ được giữ nguyên.</p>
+          <input id="guestUsername" type="text" maxlength="32" placeholder="Tên đăng nhập mới"
+            class="w-full px-3 py-2 rounded-lg bg-gray-100 dark:bg-gray-900 border-0 focus:outline-none focus:ring-2 focus:ring-blue-500 text-sm dark:text-white mb-2">
+          <input id="guestPassword" type="password" minlength="6" placeholder="Mật khẩu (tối thiểu 6 ký tự)"
+            class="w-full px-3 py-2 rounded-lg bg-gray-100 dark:bg-gray-900 border-0 focus:outline-none focus:ring-2 focus:ring-blue-500 text-sm dark:text-white mb-2">
+          <input id="guestConfirm" type="password" minlength="6" placeholder="Nhập lại mật khẩu"
+            class="w-full px-3 py-2 rounded-lg bg-gray-100 dark:bg-gray-900 border-0 focus:outline-none focus:ring-2 focus:ring-blue-500 text-sm dark:text-white mb-2">
+          <button id="guestUpgradeBtn" onclick="submitGuestUpgrade()" class="w-full bg-amber-500 hover:bg-amber-600 text-white font-semibold py-2 rounded-lg text-sm">Tạo tài khoản chính thức</button>
+          <p id="guestUpgradeStatus" class="hidden text-xs mt-1.5"></p>
+        </div>
+        {% elif has_password %}
+        <div class="pt-3 border-t border-gray-100 dark:border-gray-700">
+          <p class="text-sm font-semibold mb-2">Đổi mật khẩu</p>
+          <input id="curPassword" type="password" placeholder="Mật khẩu hiện tại"
+            class="w-full px-3 py-2 rounded-lg bg-gray-100 dark:bg-gray-900 border-0 focus:outline-none focus:ring-2 focus:ring-blue-500 text-sm dark:text-white mb-2">
+          <input id="newPassword" type="password" minlength="6" placeholder="Mật khẩu mới (tối thiểu 6 ký tự)"
+            class="w-full px-3 py-2 rounded-lg bg-gray-100 dark:bg-gray-900 border-0 focus:outline-none focus:ring-2 focus:ring-blue-500 text-sm dark:text-white mb-2">
+          <input id="newPasswordConfirm" type="password" minlength="6" placeholder="Nhập lại mật khẩu mới"
+            class="w-full px-3 py-2 rounded-lg bg-gray-100 dark:bg-gray-900 border-0 focus:outline-none focus:ring-2 focus:ring-blue-500 text-sm dark:text-white mb-2">
+          <button onclick="submitPasswordChange()" class="w-full bg-gray-800 dark:bg-gray-700 hover:bg-gray-900 text-white font-semibold py-2 rounded-lg text-sm">Đổi mật khẩu</button>
+          <p id="passwordChangeStatus" class="hidden text-xs mt-1.5"></p>
+        </div>
+        {% else %}
+        <p class="text-xs text-gray-400 pt-3 border-t border-gray-100 dark:border-gray-700">Tài khoản đăng nhập bằng Google — không cần mật khẩu ở đây.</p>
+        {% endif %}
+      </div>
+
       <div class="rounded-xl border border-gray-200 dark:border-gray-700 p-3.5 flex items-center gap-3">
         <div class="flex-1 min-w-0">
           <div class="flex items-center gap-1.5">
@@ -2218,6 +2613,22 @@ HTML = r'''
       <p id="reportIssueStatus" class="hidden text-xs text-emerald-600 dark:text-emerald-400 flex items-center gap-1"><i class="fas fa-check"></i> Đã gửi báo cáo, cảm ơn em! ✓</p>
     </div>
   </div>
+
+  <div id="mistakeModal" class="hidden modal-panel bg-white dark:bg-gray-800 rounded-2xl shadow-2xl w-full max-w-md max-h-[85vh] overflow-y-auto">
+    <div class="flex items-center justify-between px-5 py-4 border-b border-gray-100 dark:border-gray-700">
+      <h3 class="font-bold text-lg flex items-center gap-2"><i class="fas fa-book text-amber-500"></i> Lưu vào Sổ lỗi sai</h3>
+      <button onclick="closeAllModals()" class="w-8 h-8 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 flex items-center justify-center"><i class="fas fa-xmark"></i></button>
+    </div>
+    <div class="p-5 space-y-3 text-sm">
+      <p class="text-xs text-gray-400">Em vừa mắc lỗi gì ở câu trả lời này? Ghi lại để StudyMate nhắc em ôn lại đúng chỗ còn yếu nhé.</p>
+      <input id="mistakeSubject" type="text" maxlength="60" placeholder="Môn học (vd: Toán)"
+        class="w-full px-3 py-2.5 rounded-xl bg-gray-100 dark:bg-gray-800 border-0 focus:outline-none focus:ring-2 focus:ring-amber-500 dark:text-white">
+      <textarea id="mistakeDescription" rows="3" maxlength="300" placeholder="Mô tả ngắn gọn lỗi sai, vd: Chuyển vế quên đổi dấu"
+        class="w-full px-3 py-2.5 rounded-xl bg-gray-100 dark:bg-gray-800 border-0 focus:outline-none focus:ring-2 focus:ring-amber-500 dark:text-white resize-none"></textarea>
+      <button id="mistakeSubmitBtn" onclick="submitMistake()" class="w-full px-4 py-2.5 rounded-xl bg-amber-500 hover:bg-amber-600 disabled:opacity-50 text-white text-sm font-semibold">Lưu lại</button>
+      <p id="mistakeStatus" class="hidden text-xs text-emerald-600 dark:text-emerald-400 flex items-center gap-1"><i class="fas fa-check"></i></p>
+    </div>
+  </div>
 </div>
 
 <script>
@@ -2228,6 +2639,9 @@ const PLAN_META_JS = {{ plan_meta|tojson }};
 const DISCOUNT_AMOUNTS_JS = {{ discount_amounts|tojson }};
 const IS_DISCOUNT_ELIGIBLE_JS = {{ is_discount_eligible|tojson }};
 const ACHIEVEMENTS_META_JS = {{ achievements_meta|tojson }};
+const AVATAR_EMOJI_JS = {{ avatar_emoji|tojson }};
+const AVATAR_COLOR_JS = {{ avatar_color|tojson }};
+const IS_GUEST_JS = {{ is_guest|tojson }};
 let uploadedFileContext = "";
 let uploadedFileName = "";
 let uploadedImageDataUrl = "";
@@ -2254,10 +2668,150 @@ function renderMathIn(el) {
       });
     } catch (e) { /* bỏ qua, không làm hỏng luồng chat */ }
   }
+  // Lưới an toàn: nếu vì lý do gì đó (công thức lệch dấu ngoặc, KaTeX chưa kịp tải...)
+  // KaTeX KHÔNG render được, học sinh tuyệt đối không được thấy ký tự thô kiểu
+  // "\( \sqrt{a} \)" — tự thay bằng ký hiệu Unicode dễ đọc thay thế (√, ×, ÷, ≤...).
+  fallbackReadableMath(el);
+}
+
+const MATH_FALLBACK_PATTERN = /\\\(|\\\)|\\\[|\\\]|\$\$|\\sqrt|\\frac|\\times|\\div|\\le\b|\\ge\b|\\ne\b|\\pi\b|\\cdot|\\pm/;
+
+function fallbackReadableMath(el) {
+  let walker;
+  try {
+    walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT, {
+      acceptNode: (n) => (n.parentElement && n.parentElement.closest('.katex')) ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT
+    });
+  } catch (e) { return; }
+
+  const nodes = [];
+  let n;
+  while ((n = walker.nextNode())) {
+    if (MATH_FALLBACK_PATTERN.test(n.nodeValue)) nodes.push(n);
+  }
+  nodes.forEach(node => {
+    let t = node.nodeValue;
+    // Xử lý dần từ cấu trúc có tham số (sqrt/frac) tới ký hiệu đơn — tránh sqrt{...} còn
+    // sót dấu \ nếu thay ký hiệu đơn trước.
+    t = t.replace(/\\sqrt\{([^{}]*)\}/g, '√($1)')
+         .replace(/\\frac\{([^{}]*)\}\{([^{}]*)\}/g, '($1)/($2)')
+         .replace(/\\times/g, '×').replace(/\\div/g, '÷')
+         .replace(/\\le\b/g, '≤').replace(/\\ge\b/g, '≥').replace(/\\ne\b/g, '≠')
+         .replace(/\\pi\b/g, 'π').replace(/\\cdot\b/g, '·').replace(/\\pm\b/g, '±')
+         .replace(/\^\{([^{}]*)\}/g, '^($1)').replace(/_\{([^{}]*)\}/g, '_($1)')
+         .replace(/\\\(|\\\)|\\\[|\\\]|\$\$/g, '')
+         .replace(/[ \t]{2,}/g, ' ');
+    if (t !== node.nodeValue) node.nodeValue = t;
+  });
 }
 
 document.getElementById('userNameLabel').textContent = CURRENT_USERNAME;
-document.getElementById('userAvatar').textContent = (CURRENT_USERNAME || '?').trim().charAt(0).toUpperCase();
+applyAvatarToElement(document.getElementById('userAvatar'), AVATAR_EMOJI_JS, AVATAR_COLOR_JS, CURRENT_USERNAME);
+if (IS_GUEST_JS) {
+  const guestBadge = document.createElement('span');
+  guestBadge.className = 'text-[9px] font-semibold px-1.5 py-0.5 rounded-full bg-amber-100 dark:bg-amber-900 text-amber-600 dark:text-amber-300 flex-shrink-0';
+  guestBadge.textContent = 'KHÁCH';
+  document.getElementById('userNameLabel').after(guestBadge);
+}
+
+// Đặt avatar cho 1 phần tử: dùng emoji đã chọn (nếu có) trên nền gradient tương ứng, hoặc
+// mặc định về chữ cái đầu tên trên nền xanh indigo (giữ đúng hành vi cũ khi chưa chọn avatar).
+// Theo dõi các class nền đã thêm qua dataset để gỡ sạch trước khi đổi, tránh chồng gradient
+// cũ/mới nếu người dùng đổi avatar nhiều lần liên tiếp mà không tải lại trang.
+function applyAvatarToElement(el, emoji, color, username) {
+  if (!el) return;
+  el.classList.remove('bg-indigo-600');
+  if (el.dataset.avatarClasses) {
+    el.classList.remove(...el.dataset.avatarClasses.split(' '));
+  }
+  let newClasses;
+  if (emoji && color) {
+    el.textContent = emoji;
+    newClasses = ['bg-gradient-to-br', ...color.split(' ')];
+  } else {
+    el.textContent = (username || '?').trim().charAt(0).toUpperCase();
+    newClasses = ['bg-indigo-600'];
+  }
+  el.classList.add(...newClasses);
+  el.dataset.avatarClasses = newClasses.join(' ');
+}
+
+document.querySelectorAll('.avatar-opt-btn').forEach(btn => {
+  btn.addEventListener('click', async () => {
+    const emoji = btn.dataset.emoji, color = btn.dataset.color;
+    document.querySelectorAll('.avatar-opt-btn').forEach(b => b.classList.remove('ring-2', 'ring-offset-2', 'ring-blue-500', 'dark:ring-offset-gray-800'));
+    btn.classList.add('ring-2', 'ring-offset-2', 'ring-blue-500', 'dark:ring-offset-gray-800');
+    applyAvatarToElement(document.getElementById('userAvatar'), emoji, color, CURRENT_USERNAME);
+    try {
+      await fetch('/api/account/avatar', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ emoji })
+      });
+    } catch (e) { /* im lặng bỏ qua lỗi mạng, avatar vẫn hiện đúng phía client */ }
+  });
+});
+
+async function submitPasswordChange() {
+  const currentPassword = document.getElementById('curPassword').value;
+  const newPassword = document.getElementById('newPassword').value;
+  const confirm = document.getElementById('newPasswordConfirm').value;
+  const statusEl = document.getElementById('passwordChangeStatus');
+  statusEl.classList.add('hidden');
+  try {
+    const res = await fetch('/api/account/password', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ currentPassword, newPassword, confirm })
+    });
+    const data = await res.json();
+    statusEl.classList.remove('hidden');
+    if (res.ok) {
+      statusEl.className = 'text-xs mt-1.5 text-emerald-600 dark:text-emerald-400';
+      statusEl.textContent = 'Đã đổi mật khẩu thành công! ✓';
+      document.getElementById('curPassword').value = '';
+      document.getElementById('newPassword').value = '';
+      document.getElementById('newPasswordConfirm').value = '';
+    } else {
+      statusEl.className = 'text-xs mt-1.5 text-red-500';
+      statusEl.textContent = data.error || 'Không đổi được mật khẩu.';
+    }
+  } catch (e) {
+    statusEl.classList.remove('hidden');
+    statusEl.className = 'text-xs mt-1.5 text-red-500';
+    statusEl.textContent = 'Lỗi mạng, em thử lại nhé.';
+  }
+}
+
+async function submitGuestUpgrade() {
+  const username = document.getElementById('guestUsername').value.trim();
+  const password = document.getElementById('guestPassword').value;
+  const confirm = document.getElementById('guestConfirm').value;
+  const statusEl = document.getElementById('guestUpgradeStatus');
+  const btn = document.getElementById('guestUpgradeBtn');
+  statusEl.classList.add('hidden');
+  btn.disabled = true;
+  try {
+    const res = await fetch('/guest/upgrade', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username, password, confirm })
+    });
+    const data = await res.json();
+    statusEl.classList.remove('hidden');
+    if (res.ok) {
+      statusEl.className = 'text-xs mt-1.5 text-emerald-600 dark:text-emerald-400';
+      statusEl.textContent = 'Đã tạo tài khoản chính thức! Đang tải lại trang...';
+      setTimeout(() => window.location.reload(), 1200);
+    } else {
+      statusEl.className = 'text-xs mt-1.5 text-red-500';
+      statusEl.textContent = data.error || 'Không tạo được tài khoản.';
+    }
+  } catch (e) {
+    statusEl.classList.remove('hidden');
+    statusEl.className = 'text-xs mt-1.5 text-red-500';
+    statusEl.textContent = 'Lỗi mạng, em thử lại nhé.';
+  } finally {
+    btn.disabled = false;
+  }
+}
 
 function toggleTheme() {
   // Nút bật/tắt nhanh trên thanh trên — chuyển thẳng sáng/tối và lưu lại vào Cài đặt
@@ -2658,15 +3212,64 @@ function updateAiStreamBubble(bubble, text, showCursor) {
 function addMessageActions(wrapper, conversationId, getText) {
   const bar = document.createElement('div');
   bar.className = 'msg-actions flex items-center gap-1 mt-1 ml-11';
-  const btn = document.createElement('button');
-  btn.type = 'button';
-  btn.className = 'text-xs text-gray-400 hover:text-red-500 px-2 py-1 -ml-2 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-800 flex items-center gap-1.5';
-  btn.title = 'Báo lỗi câu trả lời này';
-  btn.innerHTML = '<i class="fas fa-flag"></i> <span>Báo lỗi</span>';
-  btn.addEventListener('click', () => openReportModal(conversationId, getText()));
-  bar.appendChild(btn);
+
+  const reportBtn = document.createElement('button');
+  reportBtn.type = 'button';
+  reportBtn.className = 'text-xs text-gray-400 hover:text-red-500 px-2 py-1 -ml-2 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-800 flex items-center gap-1.5';
+  reportBtn.title = 'Báo lỗi câu trả lời này';
+  reportBtn.innerHTML = '<i class="fas fa-flag"></i> <span>Báo lỗi</span>';
+  reportBtn.addEventListener('click', () => openReportModal(conversationId, getText()));
+  bar.appendChild(reportBtn);
+
+  const mistakeBtn = document.createElement('button');
+  mistakeBtn.type = 'button';
+  mistakeBtn.className = 'text-xs text-gray-400 hover:text-amber-600 dark:hover:text-amber-400 px-2 py-1 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-800 flex items-center gap-1.5';
+  mistakeBtn.title = 'Lưu lỗi sai này vào Sổ lỗi sai để ôn lại sau';
+  mistakeBtn.innerHTML = '<i class="fas fa-book"></i> <span>Lưu vào Sổ lỗi sai</span>';
+  mistakeBtn.addEventListener('click', () => openMistakeModal(conversationId));
+  bar.appendChild(mistakeBtn);
+
   wrapper.after(bar);
   return bar;
+}
+
+let mistakeContext = { conversationId: null };
+function openMistakeModal(conversationId) {
+  mistakeContext = { conversationId: conversationId || null };
+  const subjSel = document.getElementById('subject');
+  document.getElementById('mistakeSubject').value = subjSel ? subjSel.value : '';
+  document.getElementById('mistakeDescription').value = '';
+  document.getElementById('mistakeStatus').classList.add('hidden');
+  openModal('mistakeModal');
+  setTimeout(() => document.getElementById('mistakeDescription').focus(), 50);
+}
+
+async function submitMistake() {
+  const subject = document.getElementById('mistakeSubject').value.trim();
+  const description = document.getElementById('mistakeDescription').value.trim();
+  const statusEl = document.getElementById('mistakeStatus');
+  const btn = document.getElementById('mistakeSubmitBtn');
+  if (!description) { document.getElementById('mistakeDescription').focus(); return; }
+  btn.disabled = true;
+  try {
+    const res = await fetch('/api/mistakes', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ subject, description, conversationId: mistakeContext.conversationId })
+    });
+    const data = await res.json();
+    if (res.ok) {
+      statusEl.textContent = data.isNew ? 'Đã lưu vào Sổ lỗi sai! 📕' : 'Đã ghi nhận — em lặp lại lỗi này rồi đó, cố lên nhé!';
+      statusEl.classList.remove('hidden');
+      if (data.gamify) handleGamifyEvent(data.gamify);
+      setTimeout(closeAllModals, 1400);
+    } else {
+      alert(data.error || 'Không lưu được, em thử lại nhé.');
+    }
+  } catch (e) {
+    alert('Lỗi mạng, em thử lại nhé.');
+  } finally {
+    btn.disabled = false;
+  }
 }
 
 let reportContext = { conversationId: null, messageExcerpt: '' };
@@ -2724,7 +3327,9 @@ async function loadGamification() {
   try {
     const res = await fetch('/api/gamification');
     if (!res.ok) return;
-    renderGamification(await res.json());
+    const data = await res.json();
+    renderGamification(data);
+    lastKnownStreak = data.streak_days;  // chỉ ghi nhận mốc ban đầu, KHÔNG bắn hiệu ứng lửa lúc tải trang
   } catch (e) { /* im lặng bỏ qua lỗi mạng */ }
 }
 
@@ -2747,11 +3352,61 @@ function showGamifyToast(html) {
   setTimeout(() => toast.remove(), 4200);
 }
 
+// Mốc streak bắn hiệu ứng ngọn lửa giữa màn hình — ngọn lửa càng ĐẬM (nhiều lớp, glow mạnh
+// hơn, ngả dần sang đỏ/tím) khi mốc càng cao, đúng như yêu cầu "ngọn lửa ngày càng đậm".
+const STREAK_TIER_STYLE = {
+  3:    { emoji: '🔥',       size: '5rem',   color: '#fbbf24', glow: 'rgba(251,191,36,0.35)', label: 'Chuỗi 3 ngày! 🔥' },
+  10:   { emoji: '🔥',       size: '6rem',   color: '#f97316', glow: 'rgba(249,115,22,0.40)', label: 'Chuỗi 10 ngày!' },
+  30:   { emoji: '🔥🔥',     size: '6.5rem', color: '#f97316', glow: 'rgba(249,115,22,0.45)', label: 'Chuỗi 30 ngày!' },
+  100:  { emoji: '🔥🔥',     size: '7rem',   color: '#ef4444', glow: 'rgba(239,68,68,0.50)',  label: 'Chuỗi 100 ngày! Đỉnh!' },
+  200:  { emoji: '🔥🔥🔥',   size: '7.5rem', color: '#ef4444', glow: 'rgba(239,68,68,0.55)',  label: 'Chuỗi 200 ngày!' },
+  300:  { emoji: '🔥🔥🔥',   size: '8rem',   color: '#dc2626', glow: 'rgba(220,38,38,0.60)',  label: 'Chuỗi 300 ngày!' },
+  500:  { emoji: '🔥🔥🔥🔥', size: '8.5rem', color: '#a21caf', glow: 'rgba(162,28,175,0.60)', label: 'Chuỗi 500 ngày! Huyền thoại! 👑' },
+  1000: { emoji: '🔥🔥🔥🔥🔥', size: '9rem', color: '#7c3aed', glow: 'rgba(124,58,237,0.65)', label: 'Chuỗi 1000 ngày! Không tưởng! 👑' },
+};
+const STREAK_MILESTONES = Object.keys(STREAK_TIER_STYLE).map(Number).sort((a, b) => a - b);
+
+let lastKnownStreak = 0;
+
+function maybeShowStreakFire(newStreak) {
+  if (newStreak > lastKnownStreak && STREAK_MILESTONES.includes(newStreak)) {
+    showStreakFireEffect(newStreak);
+  }
+  lastKnownStreak = newStreak;
+}
+
+function showStreakFireEffect(days) {
+  const style = STREAK_TIER_STYLE[days];
+  if (!style) return;
+  const overlay = document.getElementById('streakFireOverlay');
+  const glow = document.getElementById('streakFireGlow');
+  const emojiEl = document.getElementById('streakFireEmoji');
+  const textEl = document.getElementById('streakFireText');
+
+  glow.style.background = `radial-gradient(circle, ${style.glow} 0%, transparent 70%)`;
+  emojiEl.style.fontSize = style.size;
+  emojiEl.style.color = style.color;
+  emojiEl.textContent = style.emoji;
+  textEl.textContent = style.label;
+
+  overlay.classList.remove('hidden');
+  overlay.classList.remove('showing');
+  void overlay.offsetWidth;  // ép reflow để animation chạy lại được nếu bắn liên tiếp 2 mốc gần nhau
+  overlay.classList.add('showing');
+
+  clearTimeout(overlay._hideTimer);
+  overlay._hideTimer = setTimeout(() => {
+    overlay.classList.add('hidden');
+    overlay.classList.remove('showing');
+  }, 2700);
+}
+
 function handleGamifyEvent(g) {
   renderGamification({
     streak_days: g.streak_days, level: g.level,
     xp_into_level: g.xp % 100, xp_per_level: 100,
   });
+  maybeShowStreakFire(g.streak_days);
   if (g.leveled_up) {
     showGamifyToast(`<i class="fas fa-arrow-up"></i> Lên cấp ${g.level}! 🎉`);
   }
@@ -3006,8 +3661,7 @@ let gameState = null;
 
 function openFlashcards() {
   document.getElementById('flashcardsOverlay').classList.remove('hidden');
-  showFcView('list');
-  loadDecks();
+  switchFcTab('decks');
 }
 function closeFlashcards() {
   document.getElementById('flashcardsOverlay').classList.add('hidden');
@@ -3015,25 +3669,146 @@ function closeFlashcards() {
 }
 document.getElementById('openFlashcardsBtn').addEventListener('click', openFlashcards);
 
+const FC_TABS = ['decks', 'mistakes', 'quiz', 'plans'];
+function switchFcTab(tab) {
+  FC_TABS.forEach(t => {
+    const btn = document.getElementById('fcTab' + t.charAt(0).toUpperCase() + t.slice(1));
+    const active = t === tab;
+    btn.classList.toggle('border-blue-600', active);
+    btn.classList.toggle('text-blue-600', active);
+    btn.classList.toggle('dark:text-blue-400', active);
+    btn.classList.toggle('border-transparent', !active);
+    btn.classList.toggle('text-gray-400', !active);
+  });
+
+  if (tab === 'decks') { showFcView('list'); loadDecks(); }
+  else if (tab === 'mistakes') { showFcView('mistakes'); loadMistakes(); }
+  else if (tab === 'quiz') { showFcView('quizList'); loadQuizzes(); }
+  else if (tab === 'plans') { showFcView('plansList'); loadStudyPlans(); }
+}
+
+const FC_VIEWS = {
+  list: 'fcDeckListView', mistakes: 'fcMistakesView', detail: 'fcDeckDetailView',
+  study: 'fcStudyView', game: 'fcGameView',
+  quizList: 'fcQuizListView', quizTake: 'fcQuizTakeView', quizResult: 'fcQuizResultView',
+  plansList: 'fcPlansListView', planDetail: 'fcPlanDetailView',
+};
+const FC_TOP_LEVEL_VIEWS = ['list', 'mistakes', 'quizList', 'plansList'];
+
 function showFcView(view) {
-  const views = { list: 'fcDeckListView', detail: 'fcDeckDetailView', study: 'fcStudyView', game: 'fcGameView' };
-  Object.values(views).forEach(id => document.getElementById(id).classList.add('hidden'));
-  document.getElementById(views[view]).classList.remove('hidden');
+  Object.values(FC_VIEWS).forEach(id => document.getElementById(id).classList.add('hidden'));
+  document.getElementById(FC_VIEWS[view]).classList.remove('hidden');
   const backBtn = document.getElementById('fcBackBtn');
   const title = document.getElementById('fcHeaderTitle');
-  if (view === 'list') {
+  const tabBar = document.getElementById('fcTabBar');
+
+  if (FC_TOP_LEVEL_VIEWS.includes(view)) {
     backBtn.classList.add('hidden');
+    tabBar.classList.remove('hidden');
     title.textContent = 'Thẻ ghi nhớ & Trò chơi';
     backBtn.onclick = null;
-  } else if (view === 'detail') {
-    backBtn.classList.remove('hidden');
+    return;
+  }
+
+  tabBar.classList.add('hidden');
+  backBtn.classList.remove('hidden');
+  if (view === 'detail') {
     title.textContent = 'Chi tiết bộ thẻ';
-    backBtn.onclick = () => { loadDecks(); showFcView('list'); };
-  } else {
-    backBtn.classList.remove('hidden');
+    backBtn.onclick = () => switchFcTab('decks');
+  } else if (view === 'study' || view === 'game') {
     title.textContent = view === 'study' ? 'Chế độ Học' : 'Lật thẻ ghi nhớ';
     backBtn.onclick = () => { stopGameTimer(); showDeckDetail(currentDeckId); };
+  } else if (view === 'quizTake' || view === 'quizResult') {
+    title.textContent = view === 'quizTake' ? 'Đang làm quiz' : 'Kết quả quiz';
+    backBtn.onclick = () => switchFcTab('quiz');
+  } else if (view === 'planDetail') {
+    title.textContent = 'Chi tiết kế hoạch';
+    backBtn.onclick = () => switchFcTab('plans');
+
   }
+}
+
+async function loadMistakes() {
+  try {
+    const res = await fetch('/api/mistakes');
+    if (!res.ok) return;
+    renderMistakeGroups(await res.json());
+  } catch (e) { /* im lặng bỏ qua lỗi mạng */ }
+}
+
+function renderMistakeGroups(mistakes) {
+  const container = document.getElementById('mistakeGroups');
+  const empty = document.getElementById('mistakeEmptyState');
+  container.innerHTML = '';
+  empty.classList.toggle('hidden', mistakes.length > 0);
+
+  const bySubject = {};
+  mistakes.forEach(m => {
+    const key = m.subject || 'Khác';
+    (bySubject[key] = bySubject[key] || []).push(m);
+  });
+
+  Object.keys(bySubject).forEach(subject => {
+    const group = document.createElement('div');
+    const items = bySubject[subject].map(m => `
+      <div class="flex items-center justify-between gap-2 py-2 border-b border-gray-50 dark:border-gray-900 last:border-0 ${m.resolved ? 'opacity-40' : ''}">
+        <div class="min-w-0 flex-1">
+          <p class="text-sm truncate">${escapeHtml(m.description)} ${m.occurrence_count > 1 ? `<span class="text-amber-500 font-semibold">×${m.occurrence_count}</span>` : ''}</p>
+        </div>
+        <div class="flex items-center gap-1 flex-shrink-0">
+          ${!m.resolved ? `<button class="mistake-practice-btn text-xs px-2.5 py-1.5 rounded-lg bg-blue-50 dark:bg-blue-900/30 text-blue-600 dark:text-blue-400 hover:bg-blue-100 dark:hover:bg-blue-900/50 font-medium" data-id="${m.id}">Ôn lại ngay</button>` : ''}
+          <button class="mistake-resolve-btn text-xs px-2 py-1.5 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-800 text-gray-400" data-id="${m.id}" data-resolved="${m.resolved}" title="${m.resolved ? 'Mở lại' : 'Đánh dấu đã khắc phục'}"><i class="fas ${m.resolved ? 'fa-rotate-left' : 'fa-check'}"></i></button>
+          <button class="mistake-delete-btn text-xs px-2 py-1.5 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-800 text-gray-400 hover:text-red-500" data-id="${m.id}"><i class="fas fa-trash-can"></i></button>
+        </div>
+      </div>`).join('');
+    group.innerHTML = `<p class="text-xs font-semibold text-gray-400 uppercase mb-1.5">${escapeHtml(subject)}</p>${items}`;
+    container.appendChild(group);
+  });
+
+  // Tra cứu lại subject/description gốc (KHÔNG chưa qua) từ id thay vì nhúng thẳng chuỗi
+  // vào thuộc tính HTML — escapeHtml() không escape dấu " nên nhúng trực tiếp vào
+  // data-attribute có thể làm vỡ HTML nếu mô tả lỗi chứa dấu ngoặc kép.
+  const byId = {};
+  mistakes.forEach(m => { byId[m.id] = m; });
+
+  container.querySelectorAll('.mistake-practice-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const m = byId[btn.dataset.id];
+      if (m) practiceMistake(m.subject, m.description);
+    });
+  });
+  container.querySelectorAll('.mistake-resolve-btn').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      const resolved = btn.dataset.resolved !== 'true';
+      await fetch(`/api/mistakes/${btn.dataset.id}`, {
+        method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ resolved })
+      });
+      loadMistakes();
+    });
+  });
+  container.querySelectorAll('.mistake-delete-btn').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      if (!confirm('Xoá lỗi này khỏi Sổ lỗi sai?')) return;
+      await fetch(`/api/mistakes/${btn.dataset.id}`, { method: 'DELETE' });
+      loadMistakes();
+    });
+  });
+}
+
+function practiceMistake(subject, description) {
+  closeFlashcards();
+  newChat();
+  const subjSel = document.getElementById('subject');
+  if (subjSel) {
+    for (const opt of subjSel.options) {
+      if (opt.value === subject || opt.text.includes(subject)) { subjSel.value = opt.value; break; }
+    }
+  }
+  const modeSel = document.getElementById('modeSelect');
+  if (modeSel) modeSel.value = 'Luyện tập';
+  document.getElementById('messageInput').value =
+    `Em hay bị lỗi: "${description}". Thầy/cô cho em 3 bài tập để luyện lại đúng chỗ này với ạ.`;
+  sendMessage();
 }
 
 async function loadDecks() {
@@ -3369,6 +4144,383 @@ async function finishMemoryGame() {
   } catch (e) { /* im lặng bỏ qua lỗi mạng */ }
 }
 
+// ==================================================================
+// QUIZ GENERATOR
+// ==================================================================
+let currentQuizQuestions = [];
+let currentQuizIndex = 0;
+let currentQuizAnswers = [];
+let currentQuizSelected = null;
+let quizStartTime = 0;
+let quizTimerHandle = null;
+
+async function loadQuizzes() {
+  try {
+    const res = await fetch('/api/quizzes');
+    if (!res.ok) return;
+    renderQuizGrid(await res.json());
+  } catch (e) { /* im lặng bỏ qua lỗi mạng */ }
+}
+
+function renderQuizGrid(quizzes) {
+  const grid = document.getElementById('quizGrid');
+  const empty = document.getElementById('quizEmptyState');
+  grid.innerHTML = '';
+  empty.classList.toggle('hidden', quizzes.length > 0);
+  const diffLabel = { easy: 'Dễ', medium: 'Trung bình', hard: 'Khó', expert: 'Nâng cao' };
+  quizzes.forEach(q => {
+    const card = document.createElement('div');
+    card.className = 'rounded-2xl border border-gray-200 dark:border-gray-800 p-4 hover:border-blue-400 dark:hover:border-blue-600 transition-colors';
+    card.innerHTML = `
+      <p class="font-semibold truncate">${escapeHtml(q.title)}</p>
+      <p class="text-xs text-gray-400 mt-0.5">${escapeHtml(q.subject || 'Chung')} · ${diffLabel[q.difficulty] || q.difficulty} · ${q.question_count} câu</p>
+      ${q.last_score !== null ? `<p class="text-xs text-emerald-500 mt-1.5"><i class="fas fa-check-circle mr-1"></i>Lần gần nhất: ${q.last_score}/${q.last_total}</p>` : ''}
+      <div class="flex gap-2 mt-3">
+        <button class="quiz-take-btn flex-1 px-3 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-700 text-white text-xs font-semibold" data-id="${q.id}">Làm bài</button>
+        <button class="quiz-delete-btn px-2.5 py-1.5 rounded-lg bg-gray-100 dark:bg-gray-800 text-gray-400 hover:text-red-500 text-xs" data-id="${q.id}"><i class="fas fa-trash-can"></i></button>
+      </div>`;
+    card.querySelector('.quiz-take-btn').addEventListener('click', () => startQuiz(q.id));
+    card.querySelector('.quiz-delete-btn').addEventListener('click', async (e) => {
+      e.stopPropagation();
+      if (!confirm('Xoá quiz này?')) return;
+      await fetch(`/api/quizzes/${q.id}`, { method: 'DELETE' });
+      loadQuizzes();
+    });
+    grid.appendChild(card);
+  });
+}
+
+function openQuizForm() {
+  const form = document.getElementById('quizForm');
+  form.classList.toggle('hidden');
+  if (!form.classList.contains('hidden')) document.getElementById('quizTopic').focus();
+}
+
+async function submitQuizGeneration() {
+  const topic = document.getElementById('quizTopic').value.trim();
+  const subject = document.getElementById('quizSubject').value.trim();
+  const difficulty = document.getElementById('quizDifficulty').value;
+  const count = document.getElementById('quizCount').value;
+  const errEl = document.getElementById('quizFormError');
+  const btn = document.getElementById('quizSubmitBtn');
+  const label = document.getElementById('quizSubmitLabel');
+  errEl.classList.add('hidden');
+  if (!topic) { document.getElementById('quizTopic').focus(); return; }
+
+  btn.disabled = true;
+  label.innerHTML = '<i class="fas fa-spinner fa-spin"></i> AI đang ra đề...';
+  try {
+    const res = await fetch('/api/quizzes/generate', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ topic, subject, difficulty, count: parseInt(count, 10) })
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      errEl.textContent = data.error || 'AI chưa ra đề được, em thử lại nhé.';
+      errEl.classList.remove('hidden');
+    } else {
+      document.getElementById('quizForm').classList.add('hidden');
+      document.getElementById('quizTopic').value = '';
+      startQuiz(data.quizId);
+    }
+  } catch (e) {
+    errEl.textContent = 'Lỗi mạng, em thử lại nhé.';
+    errEl.classList.remove('hidden');
+  } finally {
+    btn.disabled = false;
+    label.textContent = 'Tạo quiz';
+  }
+}
+
+async function startQuiz(quizId) {
+  try {
+    const res = await fetch(`/api/quizzes/${quizId}`);
+    if (!res.ok) return;
+    const data = await res.json();
+    currentQuizId = quizId;
+    currentQuizQuestions = data.questions;
+    currentQuizIndex = 0;
+    currentQuizAnswers = [];
+    quizStartTime = Date.now();
+    showFcView('quizTake');
+    renderQuizQuestion();
+  } catch (e) {
+    alert('Không tải được quiz này.');
+  }
+}
+let currentQuizId = null;
+
+function renderQuizQuestion() {
+  const q = currentQuizQuestions[currentQuizIndex];
+  document.getElementById('quizTakeProgress').textContent = `Câu ${currentQuizIndex + 1}/${currentQuizQuestions.length}`;
+  document.getElementById('quizQuestionTopic').textContent = q.topic || '';
+  document.getElementById('quizQuestionText').textContent = q.question;
+  currentQuizSelected = null;
+
+  const area = document.getElementById('quizAnswerArea');
+  area.innerHTML = '';
+  if (q.q_type === 'mcq') {
+    q.options.forEach(opt => {
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'quiz-opt-btn w-full text-left px-4 py-2.5 rounded-xl border border-gray-200 dark:border-gray-700 hover:border-blue-400 text-sm';
+      btn.textContent = opt;
+      btn.addEventListener('click', () => selectQuizOption(btn, opt));
+      area.appendChild(btn);
+    });
+  } else if (q.q_type === 'true_false') {
+    ['Đúng', 'Sai'].forEach(opt => {
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'quiz-opt-btn w-full text-left px-4 py-2.5 rounded-xl border border-gray-200 dark:border-gray-700 hover:border-blue-400 text-sm';
+      btn.textContent = opt;
+      btn.addEventListener('click', () => selectQuizOption(btn, opt));
+      area.appendChild(btn);
+    });
+  } else {
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.id = 'quizFillBlankInput';
+    input.placeholder = 'Nhập đáp án...';
+    input.className = 'w-full px-4 py-2.5 rounded-xl bg-gray-100 dark:bg-gray-800 border-0 focus:outline-none focus:ring-2 focus:ring-blue-500 text-sm dark:text-white';
+    input.addEventListener('input', () => { currentQuizSelected = input.value; });
+    area.appendChild(input);
+    setTimeout(() => input.focus(), 50);
+  }
+}
+
+function selectQuizOption(btn, value) {
+  document.querySelectorAll('.quiz-opt-btn').forEach(b => {
+    b.classList.remove('border-blue-500', 'bg-blue-50', 'dark:bg-blue-900/20');
+  });
+  btn.classList.add('border-blue-500', 'bg-blue-50', 'dark:bg-blue-900/20');
+  currentQuizSelected = value;
+}
+
+function submitQuizAnswerAndNext() {
+  const q = currentQuizQuestions[currentQuizIndex];
+  currentQuizAnswers.push({ questionId: q.id, given: currentQuizSelected || '' });
+  currentQuizIndex++;
+  if (currentQuizIndex < currentQuizQuestions.length) {
+    renderQuizQuestion();
+  } else {
+    finishQuiz();
+  }
+}
+
+async function finishQuiz() {
+  const durationSeconds = Math.round((Date.now() - quizStartTime) / 1000);
+  try {
+    const res = await fetch(`/api/quizzes/${currentQuizId}/submit`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ answers: currentQuizAnswers, durationSeconds, saveMistakes: true })
+    });
+    const data = await res.json();
+    showFcView('quizResult');
+    const pct = data.total ? Math.round((data.score / data.total) * 100) : 0;
+    document.getElementById('quizResultEmoji').textContent = pct === 100 ? '💯' : pct >= 70 ? '🎉' : pct >= 40 ? '👍' : '💪';
+    document.getElementById('quizResultScore').textContent = `${data.score}/${data.total} câu đúng (${pct}%)`;
+
+    const weakBox = document.getElementById('quizWeakTopics');
+    if (data.weakTopics && data.weakTopics.length) {
+      weakBox.classList.remove('hidden');
+      document.getElementById('quizWeakTopicsList').textContent = data.weakTopics.join(', ');
+    } else {
+      weakBox.classList.add('hidden');
+    }
+
+    const reviewList = document.getElementById('quizReviewList');
+    reviewList.innerHTML = '';
+    (data.graded || []).forEach((g, i) => {
+      const q = currentQuizQuestions[i];
+      const row = document.createElement('div');
+      row.className = `rounded-xl border p-3 text-sm ${g.correct ? 'border-emerald-200 dark:border-emerald-900 bg-emerald-50 dark:bg-emerald-900/10' : 'border-red-200 dark:border-red-900 bg-red-50 dark:bg-red-900/10'}`;
+      row.innerHTML = `
+        <p class="font-medium">${escapeHtml(q ? q.question : '')}</p>
+        <p class="text-xs mt-1 ${g.correct ? 'text-emerald-600 dark:text-emerald-400' : 'text-red-600 dark:text-red-400'}">
+          ${g.correct ? '<i class="fas fa-check"></i> Đúng' : `<i class="fas fa-xmark"></i> Sai — đáp án đúng: ${escapeHtml(g.correctAnswer)}`}
+        </p>
+        ${g.explanation ? `<p class="text-xs text-gray-400 mt-1">${escapeHtml(g.explanation)}</p>` : ''}`;
+      reviewList.appendChild(row);
+    });
+
+    if (data.gamify) {
+      document.getElementById('quizResultXp').textContent = `+${Math.min(40, 10 + data.score * 3)} XP`;
+      handleGamifyEvent(data.gamify);
+    }
+    loadQuizzes();
+  } catch (e) {
+    alert('Không nộp được bài, em thử lại nhé.');
+  }
+}
+
+// ==================================================================
+// STUDY PLAN (Kế hoạch ôn tập)
+// ==================================================================
+let currentPlanId = null;
+
+async function loadStudyPlans() {
+  try {
+    const res = await fetch('/api/study-plans');
+    if (!res.ok) return;
+    renderPlanGrid(await res.json());
+  } catch (e) { /* im lặng bỏ qua lỗi mạng */ }
+}
+
+function renderPlanGrid(plans) {
+  const grid = document.getElementById('planGrid');
+  const empty = document.getElementById('planEmptyState');
+  grid.innerHTML = '';
+  empty.classList.toggle('hidden', plans.length > 0);
+  plans.forEach(p => {
+    const pct = p.task_count ? Math.round((p.done_count / p.task_count) * 100) : 0;
+    const card = document.createElement('div');
+    card.className = 'rounded-2xl border border-gray-200 dark:border-gray-800 p-4 hover:border-emerald-400 dark:hover:border-emerald-600 cursor-pointer transition-colors';
+    card.innerHTML = `
+      <p class="font-semibold truncate">${escapeHtml(p.title)}</p>
+      <p class="text-xs text-gray-400 mt-0.5">${escapeHtml(p.subject || 'Chung')} · ${p.total_days} ngày</p>
+      <div class="gamify-xp-track mt-2.5"><div class="gamify-xp-fill" style="width:${pct}%; background: linear-gradient(90deg,#10b981,#14b8a6);"></div></div>
+      <p class="text-xs text-gray-400 mt-1">${p.done_count}/${p.task_count} việc đã xong (${pct}%)</p>`;
+    card.addEventListener('click', () => showPlanDetail(p.id));
+    grid.appendChild(card);
+  });
+}
+
+function openPlanForm() {
+  const form = document.getElementById('planForm');
+  form.classList.toggle('hidden');
+  if (!form.classList.contains('hidden')) document.getElementById('planGoal').focus();
+}
+
+async function submitPlanGeneration() {
+  const goal = document.getElementById('planGoal').value.trim();
+  const subject = document.getElementById('planSubject').value.trim();
+  const days = document.getElementById('planDays').value;
+  const errEl = document.getElementById('planFormError');
+  const btn = document.getElementById('planSubmitBtn');
+  const label = document.getElementById('planSubmitLabel');
+  errEl.classList.add('hidden');
+  if (!goal) { document.getElementById('planGoal').focus(); return; }
+
+  btn.disabled = true;
+  label.innerHTML = '<i class="fas fa-spinner fa-spin"></i> AI đang lập kế hoạch...';
+  try {
+    const res = await fetch('/api/study-plans/generate', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ goal, subject, days: parseInt(days, 10) || 14 })
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      errEl.textContent = data.error || 'AI chưa lập được kế hoạch, em thử lại nhé.';
+      errEl.classList.remove('hidden');
+    } else {
+      document.getElementById('planForm').classList.add('hidden');
+      document.getElementById('planGoal').value = '';
+      if (data.gamify) handleGamifyEvent(data.gamify);
+      showPlanDetail(data.planId);
+    }
+  } catch (e) {
+    errEl.textContent = 'Lỗi mạng, em thử lại nhé.';
+    errEl.classList.remove('hidden');
+  } finally {
+    btn.disabled = false;
+    label.textContent = 'Tạo kế hoạch';
+  }
+}
+
+async function showPlanDetail(planId) {
+  try {
+    const res = await fetch(`/api/study-plans/${planId}`);
+    if (!res.ok) return;
+    const data = await res.json();
+    currentPlanId = planId;
+    document.getElementById('planDetailTitle').textContent = data.plan.title;
+    document.getElementById('planDetailMeta').textContent = `${data.plan.subject || 'Chung'} · ${data.plan.total_days} ngày`;
+
+    const doneCount = data.tasks.filter(t => t.status === 'done').length;
+    const pct = data.tasks.length ? Math.round((doneCount / data.tasks.length) * 100) : 0;
+    document.getElementById('planProgressBar').style.width = pct + '%';
+
+    // Chỉ hiện nút "Sắp xếp lại" nếu học sinh có vẻ đang bị TRỄ tiến độ: còn việc pending ở
+    // những ngày đã qua (so với hôm nay tính từ ngày bắt đầu kế hoạch).
+    const startDate = new Date(data.plan.start_date);
+    const daysSinceStart = Math.floor((Date.now() - startDate.getTime()) / 86400000) + 1;
+    const behindSchedule = data.tasks.some(t => t.day_number < daysSinceStart && t.status === 'pending');
+    document.getElementById('planReorganizeBtn').classList.toggle('hidden', !behindSchedule);
+
+    renderPlanTasks(data.tasks);
+    showFcView('planDetail');
+  } catch (e) {
+    alert('Không tải được kế hoạch này.');
+  }
+}
+
+function renderPlanTasks(tasks) {
+  const list = document.getElementById('planTaskList');
+  list.innerHTML = '';
+  tasks.forEach(t => {
+    const row = document.createElement('div');
+    row.className = `flex items-start gap-3 rounded-xl border p-3 text-sm ${t.status === 'done' ? 'border-emerald-200 dark:border-emerald-900 bg-emerald-50 dark:bg-emerald-900/10 opacity-70' : t.status === 'skipped' ? 'border-gray-200 dark:border-gray-800 opacity-50' : 'border-gray-200 dark:border-gray-800'}`;
+    row.innerHTML = `
+      <button class="task-toggle-btn w-6 h-6 rounded-full border-2 flex-shrink-0 mt-0.5 flex items-center justify-center ${t.status === 'done' ? 'bg-emerald-500 border-emerald-500 text-white' : 'border-gray-300 dark:border-gray-600'}" data-id="${t.id}">
+        ${t.status === 'done' ? '<i class="fas fa-check text-xs"></i>' : ''}
+      </button>
+      <div class="min-w-0 flex-1">
+        <p class="text-xs text-gray-400">Ngày ${t.day_number}</p>
+        <p class="font-medium ${t.status === 'done' ? 'line-through' : ''}">${escapeHtml(t.title)}</p>
+        ${t.description ? `<p class="text-xs text-gray-400 mt-0.5">${escapeHtml(t.description)}</p>` : ''}
+      </div>
+      <div class="flex gap-1 flex-shrink-0">
+        <button class="task-ask-btn w-7 h-7 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-800 text-gray-400" data-title="${t.id}" title="Hỏi AI về việc này"><i class="fas fa-comment-dots text-xs"></i></button>
+        ${t.status !== 'skipped' && t.status !== 'done' ? `<button class="task-skip-btn w-7 h-7 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-800 text-gray-400" data-id="${t.id}" title="Bỏ qua"><i class="fas fa-forward text-xs"></i></button>` : ''}
+      </div>`;
+    row.querySelector('.task-toggle-btn').addEventListener('click', () => toggleStudyTask(t.id, t.status === 'done' ? 'pending' : 'done'));
+    const askBtn = row.querySelector('.task-ask-btn');
+    if (askBtn) askBtn.addEventListener('click', () => askAiAboutTask(t.title));
+    const skipBtn = row.querySelector('.task-skip-btn');
+    if (skipBtn) skipBtn.addEventListener('click', () => toggleStudyTask(t.id, 'skipped'));
+    list.appendChild(row);
+  });
+}
+
+async function toggleStudyTask(taskId, status) {
+  try {
+    const res = await fetch(`/api/study-tasks/${taskId}`, {
+      method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ status })
+    });
+    const data = await res.json();
+    if (data.gamify) handleGamifyEvent(data.gamify);
+    showPlanDetail(currentPlanId);
+  } catch (e) { alert('Lỗi mạng.'); }
+}
+
+function askAiAboutTask(title) {
+  closeFlashcards();
+  newChat();
+  document.getElementById('messageInput').value = `Em muốn học về: "${title}". Thầy/cô giải thích giúp em với ạ.`;
+  sendMessage();
+}
+
+async function reorganizeCurrentPlan() {
+  if (!confirm('Sắp xếp lại các việc còn thiếu vào số ngày còn lại? Các việc đã hoàn thành sẽ được giữ nguyên.')) return;
+  try {
+    const res = await fetch(`/api/study-plans/${currentPlanId}/reorganize`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({})
+    });
+    const data = await res.json();
+    if (!res.ok) { alert(data.error || 'Không sắp xếp lại được.'); return; }
+    showPlanDetail(currentPlanId);
+  } catch (e) { alert('Lỗi mạng.'); }
+}
+
+async function deleteCurrentPlan() {
+  if (!confirm('Xoá kế hoạch này? Hành động này không thể hoàn tác.')) return;
+  try {
+    await fetch(`/api/study-plans/${currentPlanId}`, { method: 'DELETE' });
+    switchFcTab('plans');
+  } catch (e) { alert('Lỗi mạng.'); }
+}
+
 // ---------- Gửi tin nhắn (streaming) ----------
 async function sendMessage() {
   const input = document.getElementById('messageInput');
@@ -3633,6 +4785,15 @@ window.onload = () => {
   loadBanner();
   loadPlanInfo();
   loadGamification();
+
+  // Xem trước hiệu ứng ngọn lửa streak từ Công cụ kiểm thử (Developer Sandbox) — chỉ hiển
+  // thị hiệu ứng, KHÔNG đụng gì tới dữ liệu XP/streak thật của tài khoản đang đăng nhập.
+  const previewStreak = new URLSearchParams(location.search).get('preview_streak');
+  if (previewStreak && STREAK_TIER_STYLE[previewStreak]) {
+    setTimeout(() => showStreakFireEffect(parseInt(previewStreak, 10)), 500);
+    const cleanUrl = location.pathname;
+    history.replaceState({}, '', cleanUrl);  // xoá query khỏi URL để tải lại trang không bắn lại
+  }
 };
 </script>
 </body>
@@ -4133,7 +5294,7 @@ DEV_STATS_HTML = r'''
     </div>
 
     <!-- Quản lý hệ thống -->
-    <div class="grid lg:grid-cols-2 gap-6">
+    <div class="grid lg:grid-cols-3 gap-6">
       <div class="bg-white dark:bg-[#1c1c1c] rounded-2xl border border-gray-100 dark:border-gray-800 p-5 shadow-sm">
         <h2 class="font-bold mb-1 flex items-center gap-2"><i class="fas fa-bullhorn text-amber-500"></i> Thông báo hệ thống</h2>
         <p class="text-xs text-gray-400 mb-3">Hiển thị dạng banner cho tất cả người dùng ngay khi vào trang chat. Để trống rồi bấm Lưu để xoá thông báo.</p>
@@ -4155,6 +5316,62 @@ DEV_STATS_HTML = r'''
           <button name="value" value="on" type="submit" {{ 'disabled' if not google_configured else '' }} class="px-3 py-2 rounded-xl text-sm font-semibold disabled:opacity-40 {{ 'bg-emerald-600 text-white' if google_override == 'on' else 'bg-gray-100 dark:bg-gray-800 text-gray-500' }}">Bật</button>
           <button name="value" value="off" type="submit" class="px-3 py-2 rounded-xl text-sm font-semibold {{ 'bg-red-600 text-white' if google_override == 'off' else 'bg-gray-100 dark:bg-gray-800 text-gray-500' }}">Tắt</button>
         </form>
+      </div>
+
+      <div class="bg-white dark:bg-[#1c1c1c] rounded-2xl border border-gray-100 dark:border-gray-800 p-5 shadow-sm">
+        <h2 class="font-bold mb-1 flex items-center gap-2"><i class="fas fa-user-secret text-purple-500"></i> Đăng nhập khách</h2>
+        <p class="text-xs text-gray-400 mb-3">
+          "Dùng thử ngay, không cần đăng ký" ở trang đăng nhập. Mặc định BẬT, không cần cấu hình gì thêm.
+        </p>
+        <form method="POST" action="{{ url_for('developer_toggle_guest_login') }}" class="flex flex-wrap gap-2">
+          <button name="value" value="on" type="submit" class="px-3 py-2 rounded-xl text-sm font-semibold {{ 'bg-emerald-600 text-white' if guest_login_on else 'bg-gray-100 dark:bg-gray-800 text-gray-500' }}">Bật</button>
+          <button name="value" value="off" type="submit" class="px-3 py-2 rounded-xl text-sm font-semibold {{ 'bg-red-600 text-white' if not guest_login_on else 'bg-gray-100 dark:bg-gray-800 text-gray-500' }}">Tắt</button>
+        </form>
+      </div>
+    </div>
+
+    <!-- Công cụ kiểm thử (Sandbox) -->
+    <div class="bg-white dark:bg-[#1c1c1c] rounded-2xl border border-gray-100 dark:border-gray-800 p-5 shadow-sm">
+      <h2 class="font-bold mb-1 flex items-center gap-2"><i class="fas fa-flask text-pink-500"></i> Công cụ kiểm thử (Sandbox)</h2>
+      <p class="text-xs text-gray-400 mb-4">Chỉnh trực tiếp XP/streak của 1 tài khoản để test giao diện (không cần đợi dùng thật nhiều ngày), và xem trước hiệu ứng ngọn lửa streak ở từng mốc.</p>
+
+      <div class="grid md:grid-cols-2 gap-6">
+        <div>
+          <p class="text-xs font-semibold text-gray-400 uppercase mb-2">Chỉnh dữ liệu XP / Streak</p>
+          <form method="POST" action="{{ url_for('developer_sandbox_user_stats') }}" class="space-y-2.5">
+            <select name="user_id" class="w-full px-3 py-2 rounded-xl bg-gray-100 dark:bg-gray-800 border-0 text-sm focus:outline-none focus:ring-2 focus:ring-pink-500 dark:text-white">
+              {% for u in all_users %}
+              <option value="{{ u.id }}" {{ 'selected' if u.id == current_user_id_val else '' }}>{{ u.username }}{{ ' (tôi)' if u.id == current_user_id_val else '' }}</option>
+              {% endfor %}
+            </select>
+            <div class="grid grid-cols-3 gap-2">
+              <div>
+                <label class="text-[10px] text-gray-400">XP</label>
+                <input type="number" name="xp" min="0" value="0" class="w-full px-2.5 py-2 rounded-lg bg-gray-100 dark:bg-gray-800 border-0 text-sm focus:outline-none focus:ring-2 focus:ring-pink-500 dark:text-white">
+              </div>
+              <div>
+                <label class="text-[10px] text-gray-400">Streak hiện tại</label>
+                <input type="number" name="streak_days" min="0" value="0" class="w-full px-2.5 py-2 rounded-lg bg-gray-100 dark:bg-gray-800 border-0 text-sm focus:outline-none focus:ring-2 focus:ring-pink-500 dark:text-white">
+              </div>
+              <div>
+                <label class="text-[10px] text-gray-400">Streak dài nhất</label>
+                <input type="number" name="longest_streak" min="0" value="0" class="w-full px-2.5 py-2 rounded-lg bg-gray-100 dark:bg-gray-800 border-0 text-sm focus:outline-none focus:ring-2 focus:ring-pink-500 dark:text-white">
+              </div>
+            </div>
+            <button type="submit" class="w-full px-4 py-2 rounded-xl bg-pink-600 hover:bg-pink-700 text-white text-sm font-semibold">Áp dụng</button>
+          </form>
+        </div>
+
+        <div>
+          <p class="text-xs font-semibold text-gray-400 uppercase mb-2">Xem trước hiệu ứng ngọn lửa (chỉ hiển thị, không lưu dữ liệu)</p>
+          <div class="flex flex-wrap gap-2">
+            {% for milestone in [3, 10, 30, 100, 200, 300, 500, 1000] %}
+            <a href="{{ url_for('home') }}?preview_streak={{ milestone }}" target="_blank" rel="noopener"
+              class="px-3 py-2 rounded-xl bg-gray-100 dark:bg-gray-800 hover:bg-gray-200 dark:hover:bg-gray-700 text-sm font-medium">🔥 {{ milestone }}</a>
+            {% endfor %}
+          </div>
+          <p class="text-xs text-gray-400 mt-2">Mở trang chat ở tab mới và tự bắn hiệu ứng ngay khi tải trang xong.</p>
+        </div>
       </div>
     </div>
 
@@ -4465,6 +5682,96 @@ def _login_session_for(user):
     session['session_version'] = user['session_version'] if 'session_version' in user.keys() else 0
 
 
+AVATAR_PRESETS = [
+    {'emoji': '🦊', 'color': 'from-orange-400 to-amber-500'},
+    {'emoji': '🐱', 'color': 'from-slate-400 to-slate-600'},
+    {'emoji': '🐼', 'color': 'from-gray-700 to-gray-900'},
+    {'emoji': '🦁', 'color': 'from-yellow-400 to-orange-500'},
+    {'emoji': '🐸', 'color': 'from-emerald-400 to-green-600'},
+    {'emoji': '🐧', 'color': 'from-sky-500 to-blue-700'},
+    {'emoji': '🦉', 'color': 'from-amber-600 to-yellow-800'},
+    {'emoji': '🐢', 'color': 'from-teal-400 to-emerald-600'},
+    {'emoji': '🐬', 'color': 'from-cyan-400 to-blue-500'},
+    {'emoji': '🦄', 'color': 'from-pink-400 to-purple-500'},
+    {'emoji': '🐙', 'color': 'from-purple-500 to-fuchsia-600'},
+    {'emoji': '🦋', 'color': 'from-indigo-400 to-purple-500'},
+    {'emoji': '🐨', 'color': 'from-gray-400 to-gray-600'},
+    {'emoji': '🐯', 'color': 'from-orange-500 to-red-600'},
+    {'emoji': '🐰', 'color': 'from-pink-300 to-rose-500'},
+    {'emoji': '🐳', 'color': 'from-blue-400 to-indigo-600'},
+]
+AVATAR_EMOJI_SET = {a['emoji'] for a in AVATAR_PRESETS}
+
+
+def generate_guest_username():
+    """Tên tài khoản khách — ngẫu nhiên, không đoán được, không trùng tài khoản có sẵn."""
+    db = get_db()
+    for _ in range(10):
+        candidate = 'khach_' + secrets.token_hex(4)
+        if not db.execute('SELECT id FROM users WHERE username = ?', (candidate,)).fetchone():
+            return candidate
+    return 'khach_' + secrets.token_hex(8)  # cực hiếm khi tới đây
+
+
+@app.route('/guest-login', methods=['POST'])
+def guest_login():
+    """'Dùng thử ngay, không cần đăng ký' — tạo 1 tài khoản khách THẬT trong DB (dùng lại
+    toàn bộ hạ tầng sẵn có: chat, gamification, flashcards...) nhưng không có mật khẩu nên
+    không đăng nhập lại được nếu mất cookie — có nút 'Tạo tài khoản chính thức' để nâng cấp
+    tại chỗ, giữ nguyên toàn bộ dữ liệu đã có (xem guest_upgrade())."""
+    if current_user_id():
+        return redirect(url_for('home'))
+    if not guest_login_effective_enabled():
+        flash('Chế độ dùng thử khách hiện đang tắt.')
+        return redirect(url_for('login_page'))
+
+    username = generate_guest_username()
+    db = get_db()
+    cur = db.execute(
+        'INSERT INTO users (username, password_hash, role, is_guest, created_at) VALUES (?, ?, ?, 1, ?)',
+        (username, '', 'user', now_iso())
+    )
+    db.commit()
+    new_user = db.execute('SELECT * FROM users WHERE id = ?', (cur.lastrowid,)).fetchone()
+    _login_session_for(new_user)
+    return redirect(url_for('home'))
+
+
+@app.route('/guest/upgrade', methods=['POST'])
+@login_required
+def guest_upgrade():
+    """Tài khoản khách tự nâng cấp thành tài khoản chính thức (đặt username + mật khẩu) —
+    CẬP NHẬT NGAY TRÊN DÒNG DỮ LIỆU HIỆN TẠI (không tạo tài khoản mới) để giữ nguyên toàn bộ
+    lịch sử chat, XP, thẻ ghi nhớ, sổ lỗi sai... đã có trong lúc dùng thử."""
+    user = current_user()
+    if not user or not user['is_guest']:
+        return jsonify({"error": "Tài khoản này không phải tài khoản khách."}), 400
+
+    data = request.get_json(silent=True) or {}
+    username = (data.get('username') or '').strip()
+    password = data.get('password') or ''
+    confirm = data.get('confirm') or ''
+
+    if not USERNAME_RE.match(username):
+        return jsonify({"error": "Tên đăng nhập phải từ 3-32 ký tự, chỉ gồm chữ cái, số hoặc dấu gạch dưới."}), 400
+    if len(password) < 6:
+        return jsonify({"error": "Mật khẩu phải có ít nhất 6 ký tự."}), 400
+    if password != confirm:
+        return jsonify({"error": "Mật khẩu nhập lại không khớp."}), 400
+
+    db = get_db()
+    existing = db.execute('SELECT id FROM users WHERE username = ? AND id != ?', (username, user['id'])).fetchone()
+    if existing:
+        return jsonify({"error": "Tên đăng nhập này đã được sử dụng."}), 400
+
+    pw_hash = generate_password_hash(password)
+    db.execute('UPDATE users SET username = ?, password_hash = ?, is_guest = 0 WHERE id = ?',
+               (username, pw_hash, user['id']))
+    db.commit()
+    session['username'] = username
+    return jsonify({"success": True})
+
+
 @app.route('/auth/<provider>')
 def oauth_start(provider):
     if provider != 'google' or not oauth or not hasattr(oauth, provider) or not google_login_effective_enabled():
@@ -4514,7 +5821,7 @@ def oauth_callback(provider):
 # 4. ĐỊNH TUYẾN TÀI KHOẢN (Đăng ký / Đăng nhập / Đăng xuất)
 # ==========================================
 def _auth_ctx(**extra):
-    ctx = {'google_enabled': google_login_effective_enabled()}
+    ctx = {'google_enabled': google_login_effective_enabled(), 'guest_enabled': guest_login_effective_enabled()}
     ctx.update(extra)
     return ctx
 
@@ -4653,6 +5960,11 @@ def home():
         bank_transfer_enabled=BANK_TRANSFER_ENABLED,
         payment_methods_enabled=PAYMENT_METHODS_ENABLED,
         achievements_meta=ACHIEVEMENTS_META,
+        avatar_presets=AVATAR_PRESETS,
+        avatar_emoji=(user['avatar_emoji'] if user and user['avatar_emoji'] else '') or '',
+        avatar_color=(user['avatar_color'] if user and user['avatar_color'] else '') or '',
+        is_guest=bool(user and user['is_guest']),
+        has_password=bool(user and user['password_hash']),
     )
 
 
@@ -4812,6 +6124,7 @@ def developer_stats():
         banner_message=get_setting('banner_message', '') or '',
         google_configured=bool(GOOGLE_OAUTH_ENABLED),
         google_override=get_setting('google_login_override', ''),
+        guest_login_on=guest_login_effective_enabled(),
         maintenance_mode=(get_setting('maintenance_mode', 'off') == 'on'),
         ai_model_override=get_setting('ai_model_override', '') or '',
         ai_temperature_override=get_setting('ai_temperature_override', '') or '',
@@ -5098,6 +6411,57 @@ def developer_toggle_google_login():
     return redirect(url_for('developer_stats'))
 
 
+@app.route('/developer/guest-login', methods=['POST'])
+@admin_required
+def developer_toggle_guest_login():
+    value = (request.form.get('value') or '').strip()
+    if value not in ('on', 'off'):
+        value = 'on'
+    set_setting('guest_login_override', value)
+    write_audit('toggle_guest_login', detail=value)
+    flash('Đã cập nhật trạng thái đăng nhập khách.')
+    return redirect(url_for('developer_stats'))
+
+
+@app.route('/developer/sandbox/user-stats', methods=['POST'])
+@admin_required
+def developer_sandbox_user_stats():
+    """Công cụ kiểm thử: gán thẳng XP/streak cho 1 tài khoản để xem giao diện phản ứng ra
+    sao (mở khoá thành tựu, hiệu ứng ngọn lửa...) mà không cần đợi dùng thật nhiều ngày.
+    Không dùng open_write_db() vì route này KHÔNG chạy trong generator streaming — route
+    admin/form POST bình thường, get_db() (gắn với `g`) là đủ và đúng chuẩn."""
+    user_id = request.form.get('user_id', type=int)
+    xp = max(0, request.form.get('xp', type=int) or 0)
+    streak = max(0, request.form.get('streak_days', type=int) or 0)
+    longest = max(streak, request.form.get('longest_streak', type=int) or 0)
+
+    if not user_id:
+        flash('Thiếu tài khoản mục tiêu.')
+        return redirect(url_for('developer_stats'))
+
+    db = get_db()
+    target = db.execute('SELECT id, username FROM users WHERE id = ?', (user_id,)).fetchone()
+    if not target:
+        flash('Không tìm thấy tài khoản.')
+        return redirect(url_for('developer_stats'))
+
+    existing = db.execute('SELECT user_id FROM user_stats WHERE user_id = ?', (user_id,)).fetchone()
+    today = datetime.now(timezone(timedelta(hours=7))).strftime('%Y-%m-%d')
+    if existing:
+        db.execute('UPDATE user_stats SET xp = ?, streak_days = ?, longest_streak = ? WHERE user_id = ?',
+                   (xp, streak, longest, user_id))
+    else:
+        db.execute(
+            'INSERT INTO user_stats (user_id, xp, streak_days, longest_streak, last_active_date) VALUES (?, ?, ?, ?, ?)',
+            (user_id, xp, streak, longest, today)
+        )
+    db.commit()
+    write_audit('sandbox_override_user_stats', target=target['username'],
+                detail=f"xp={xp} streak={streak} longest_streak={longest}")
+    flash(f"Đã cập nhật dữ liệu kiểm thử cho '{target['username']}'.")
+    return redirect(url_for('developer_stats'))
+
+
 @app.route('/developer/export.csv')
 @admin_required
 def developer_export_csv():
@@ -5291,6 +6655,146 @@ def generate_flashcards_via_ai(topic, subject, count=8):
         if front and back:
             cards.append((front, back))
     return cards[:count]
+
+
+# ==========================================
+# 8.9 "QUIZ GENERATOR" (Phase 1) — sinh đề bằng AI, chấm tự động
+# ==========================================
+QUIZ_TYPE_LABELS = {'mcq': 'Trắc nghiệm', 'true_false': 'Đúng/Sai', 'fill_blank': 'Điền khuyết'}
+QUIZ_DIFFICULTIES = ('easy', 'medium', 'hard', 'expert')
+QUIZ_MIN_COUNT, QUIZ_MAX_COUNT = 3, 15
+
+
+def generate_quiz_via_ai(topic, subject, difficulty, count=5, source_text=None):
+    """Gọi AI 1 LẦN để sinh đề quiz — CHỈ 3 dạng chấm được tự động, chính xác, không tốn
+    thêm lượt gọi AI lúc chấm: trắc nghiệm (mcq), đúng/sai (true_false), điền khuyết
+    (fill_blank). Mỗi câu có "topic" riêng để sau này thống kê điểm mạnh/yếu theo chủ đề con.
+    Trả về list[dict]. Ném lỗi nếu AI trả JSON không hợp lệ — caller xử lý."""
+    count = max(QUIZ_MIN_COUNT, min(int(count or 5), QUIZ_MAX_COUNT))
+    subject_line = f" (môn {subject})" if subject else ""
+    diff_label = {'easy': 'Dễ', 'medium': 'Trung bình', 'hard': 'Khó', 'expert': 'Nâng cao'}.get(difficulty, 'Trung bình')
+
+    context_block = ""
+    if source_text:
+        context_block = f"""
+    Dựa trên nội dung sau đây (trích từ đoạn hội thoại đã học):
+    ---
+    {source_text[:4000]}
+    ---
+    """
+
+    system_prompt = f"""
+    Bạn là công cụ tạo đề kiểm tra cho học sinh THCS{subject_line}. Độ khó: {diff_label}.
+    {context_block}
+    Hãy tạo đúng {count} câu hỏi cho chủ đề học sinh đưa ra, CHỈ dùng 3 dạng sau (trộn hợp lý):
+    - "mcq": trắc nghiệm 4 lựa chọn, field "options" là mảng 4 chuỗi, "correct_answer" là
+      NGUYÊN VĂN 1 trong 4 lựa chọn đó (không phải số thứ tự).
+    - "true_false": đúng/sai, "correct_answer" là "Đúng" hoặc "Sai", không cần "options".
+    - "fill_blank": điền khuyết (dùng "___" trong câu hỏi để chỉ chỗ trống), "correct_answer"
+      là đáp án ngắn gọn (1-3 từ), không cần "options".
+    Mỗi câu đều cần "explanation" (giải thích ngắn gọn đáp án) và "topic" (chủ đề con của câu
+    hỏi đó, vd "Hằng đẳng thức", để sau này biết học sinh yếu phần nào).
+    CHỈ trả lời bằng JSON hợp lệ đúng định dạng mảng dưới đây — KHÔNG thêm ```markdown```,
+    KHÔNG thêm lời giải thích nào khác ngoài JSON:
+    [{{"q_type": "mcq", "question": "...", "options": ["...","...","...","..."], "correct_answer": "...", "explanation": "...", "topic": "..."}}, ...]
+    """
+    raw = ''.join(stream_consolex_ai(system_prompt, f"Chủ đề: {topic}", max_tokens=2400))
+    text = raw.strip()
+    if text.startswith('```'):
+        text = re.sub(r'^```[a-zA-Z]*\n?', '', text)
+        text = re.sub(r'```\s*$', '', text).strip()
+
+    data = json.loads(text)
+    if not isinstance(data, list):
+        raise ValueError("AI không trả về danh sách câu hỏi hợp lệ.")
+
+    questions = []
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        q_type = str(item.get('q_type', '')).strip()
+        if q_type not in QUIZ_TYPE_LABELS:
+            continue
+        question = str(item.get('question', '')).strip()[:500]
+        correct = str(item.get('correct_answer', '')).strip()[:200]
+        if not question or not correct:
+            continue
+        options = item.get('options') if q_type == 'mcq' else None
+        if q_type == 'mcq':
+            if not isinstance(options, list) or len(options) < 2:
+                continue
+            options = [str(o).strip()[:200] for o in options][:6]
+        questions.append({
+            'q_type': q_type, 'question': question, 'options': options,
+            'correct_answer': correct, 'explanation': str(item.get('explanation', '')).strip()[:400],
+            'topic': str(item.get('topic', '')).strip()[:60] or (subject or 'Chung'),
+        })
+    return questions[:count]
+
+
+def grade_quiz_answer(q_type, correct_answer, given_answer):
+    """So khớp đáp án — chuẩn hoá (bỏ dấu cách thừa, không phân biệt hoa/thường) để chấm công
+    bằng hơn, không cần gọi AI chấm (giữ việc chấm bài NHANH và MIỄN PHÍ)."""
+    a = (correct_answer or '').strip().lower()
+    b = (given_answer or '').strip().lower()
+    a = re.sub(r'\s+', ' ', a)
+    b = re.sub(r'\s+', ' ', b)
+    return a == b
+
+
+# ==========================================
+# 8.10 "STUDY PLAN" (Phase 1) — AI chia mục tiêu ôn tập thành kế hoạch theo ngày
+# ==========================================
+STUDY_PLAN_MIN_DAYS, STUDY_PLAN_MAX_DAYS = 3, 60
+
+
+def generate_study_plan_via_ai(goal, subject, days, remaining_topics=None):
+    """Gọi AI 1 LẦN để chia 1 mục tiêu ôn tập thành các việc theo từng ngày. Nếu
+    `remaining_topics` được truyền vào (trường hợp "Sắp xếp lại kế hoạch" khi học sinh bị
+    trễ tiến độ), AI sẽ phân bổ LẠI đúng các việc còn thiếu đó vào số ngày còn lại, thay vì
+    bịa ra kế hoạch hoàn toàn mới. Trả về list[(title, description)] theo đúng thứ tự ngày."""
+    days = max(STUDY_PLAN_MIN_DAYS, min(int(days or 14), STUDY_PLAN_MAX_DAYS))
+    subject_line = f" (môn {subject})" if subject else ""
+
+    if remaining_topics:
+        topics_block = "\n".join(f"- {t}" for t in remaining_topics)
+        user_content = (
+            f"Mục tiêu: {goal}\nSố ngày còn lại: {days}\n"
+            f"Các việc CHƯA hoàn thành cần phân bổ lại vào đúng {days} ngày còn lại "
+            f"(có thể gộp/rút gọn nếu không đủ ngày, ưu tiên phần quan trọng trước):\n{topics_block}"
+        )
+    else:
+        user_content = f"Mục tiêu: {goal}\nSố ngày: {days}"
+
+    system_prompt = f"""
+    Bạn là công cụ lập kế hoạch ôn tập cho học sinh THCS{subject_line}.
+    Hãy chia mục tiêu học sinh đưa ra thành đúng {days} việc, mỗi việc cho 1 ngày (DAY 1 tới
+    DAY {days}), sắp xếp từ nền tảng tới nâng cao, ngày cuối nên là ôn tập tổng hợp/kiểm tra thử.
+    Mỗi việc gồm "title" (chủ đề ngắn gọn, dưới 8 từ) và "description" (1 câu mô tả việc cần
+    làm hôm đó, dưới 30 từ).
+    CHỈ trả lời bằng JSON hợp lệ đúng định dạng mảng dưới đây, ĐÚNG {days} phần tử theo thứ tự
+    ngày — KHÔNG thêm ```markdown```, KHÔNG thêm lời giải thích nào khác ngoài JSON:
+    [{{"title": "...", "description": "..."}}, ...]
+    """
+    raw = ''.join(stream_consolex_ai(system_prompt, user_content, max_tokens=2200))
+    text = raw.strip()
+    if text.startswith('```'):
+        text = re.sub(r'^```[a-zA-Z]*\n?', '', text)
+        text = re.sub(r'```\s*$', '', text).strip()
+
+    data = json.loads(text)
+    if not isinstance(data, list):
+        raise ValueError("AI không trả về kế hoạch hợp lệ.")
+
+    tasks = []
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        title = str(item.get('title', '')).strip()[:120]
+        description = str(item.get('description', '')).strip()[:300]
+        if title:
+            tasks.append((title, description))
+    return tasks[:days]
 
 
 # 8. UPLOAD FILE / ẢNH
@@ -5748,6 +7252,475 @@ def api_game_complete():
     return jsonify({"success": True, "xpAwarded": bonus_xp, "gamify": gamify})
 
 
+# ==========================================
+# 8.9 API "QUIZ GENERATOR"
+# ==========================================
+def _get_owned_quiz(quiz_id, user_id):
+    db = get_db()
+    return db.execute('SELECT * FROM quizzes WHERE id = ? AND user_id = ?', (quiz_id, user_id)).fetchone()
+
+
+@app.route('/api/quizzes', methods=['GET'])
+@login_required
+def api_list_quizzes():
+    db = get_db()
+    rows = db.execute('''
+        SELECT q.id, q.title, q.subject, q.difficulty, q.created_at,
+               COUNT(qq.id) AS question_count,
+               (SELECT score FROM quiz_attempts a WHERE a.quiz_id = q.id ORDER BY a.created_at DESC LIMIT 1) AS last_score,
+               (SELECT total FROM quiz_attempts a WHERE a.quiz_id = q.id ORDER BY a.created_at DESC LIMIT 1) AS last_total
+        FROM quizzes q
+        LEFT JOIN quiz_questions qq ON qq.quiz_id = q.id
+        WHERE q.user_id = ?
+        GROUP BY q.id
+        ORDER BY q.created_at DESC
+    ''', (current_user_id(),)).fetchall()
+    return jsonify([dict(r) for r in rows])
+
+
+@app.route('/api/quizzes/generate', methods=['POST'])
+@login_required
+def api_generate_quiz():
+    data = request.get_json(silent=True) or {}
+    topic = (data.get('topic') or '').strip()
+    subject = (data.get('subject') or '').strip()[:60]
+    difficulty = (data.get('difficulty') or 'medium').strip()
+    count = data.get('count', 5)
+    raw_conv_id = data.get('conversationId')
+
+    if not topic:
+        return jsonify({"error": "Em nhập chủ đề muốn làm quiz nhé."}), 400
+    if len(topic) > 200:
+        return jsonify({"error": "Chủ đề hơi dài, em rút gọn lại nhé."}), 400
+    if difficulty not in QUIZ_DIFFICULTIES:
+        difficulty = 'medium'
+
+    source_text = None
+    source = 'topic'
+    if raw_conv_id is not None:
+        try:
+            conv_id = int(raw_conv_id)
+        except (TypeError, ValueError):
+            conv_id = None
+        if conv_id is not None:
+            db = get_db()
+            conv = db.execute('SELECT id FROM conversations WHERE id = ? AND user_id = ?',
+                               (conv_id, current_user_id())).fetchone()
+            if conv:
+                msgs = db.execute(
+                    'SELECT role, content FROM messages WHERE conversation_id = ? ORDER BY id ASC', (conv_id,)
+                ).fetchall()
+                source_text = "\n".join(f"{m['role']}: {m['content']}" for m in msgs)[:4000]
+                source = 'conversation'
+
+    try:
+        questions = generate_quiz_via_ai(topic, subject, difficulty, count, source_text=source_text)
+    except RuntimeError as e:
+        return jsonify({"error": str(e)}), 502
+    except Exception:
+        return jsonify({"error": "AI tạo đề chưa đúng định dạng, em thử lại nhé!"}), 502
+
+    if not questions:
+        return jsonify({"error": "AI chưa tạo được câu hỏi nào, em thử đổi chủ đề hoặc thử lại nhé."}), 502
+
+    user_id = current_user_id()
+    db = get_db()
+    cur = db.execute(
+        'INSERT INTO quizzes (user_id, title, subject, difficulty, source, created_at) VALUES (?, ?, ?, ?, ?, ?)',
+        (user_id, topic[:120], subject, difficulty, source, now_iso())
+    )
+    quiz_id = cur.lastrowid
+    for i, q in enumerate(questions):
+        db.execute(
+            '''INSERT INTO quiz_questions (quiz_id, q_type, question, options, correct_answer,
+               explanation, topic, order_index) VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
+            (quiz_id, q['q_type'], q['question'], json.dumps(q['options']) if q['options'] else None,
+             q['correct_answer'], q['explanation'], q['topic'], i)
+        )
+    db.commit()
+    return jsonify({"quizId": quiz_id, "questionCount": len(questions)})
+
+
+@app.route('/api/quizzes/<int:quiz_id>', methods=['GET'])
+@login_required
+def api_get_quiz(quiz_id):
+    quiz = _get_owned_quiz(quiz_id, current_user_id())
+    if not quiz:
+        return jsonify({"error": "Không tìm thấy quiz này."}), 404
+    db = get_db()
+    rows = db.execute(
+        'SELECT * FROM quiz_questions WHERE quiz_id = ? ORDER BY order_index ASC', (quiz_id,)
+    ).fetchall()
+    questions = []
+    for r in rows:
+        d = dict(r)
+        d['options'] = json.loads(d['options']) if d['options'] else None
+        questions.append(d)
+    return jsonify({"quiz": dict(quiz), "questions": questions})
+
+
+@app.route('/api/quizzes/<int:quiz_id>', methods=['DELETE'])
+@login_required
+def api_delete_quiz(quiz_id):
+    quiz = _get_owned_quiz(quiz_id, current_user_id())
+    if not quiz:
+        return jsonify({"error": "Không tìm thấy quiz này."}), 404
+    db = get_db()
+    db.execute('DELETE FROM quiz_attempts WHERE quiz_id = ?', (quiz_id,))
+    db.execute('DELETE FROM quiz_questions WHERE quiz_id = ?', (quiz_id,))
+    db.execute('DELETE FROM quizzes WHERE id = ?', (quiz_id,))
+    db.commit()
+    return jsonify({"success": True})
+
+
+@app.route('/api/quizzes/<int:quiz_id>/submit', methods=['POST'])
+@login_required
+def api_submit_quiz(quiz_id):
+    """Chấm bài NGAY, KHÔNG gọi thêm AI nào (so khớp đáp án đã chuẩn hoá — xem
+    grade_quiz_answer()). Tự lưu câu sai vào Sổ lỗi sai (nếu học sinh đồng ý, mặc định có)
+    để nối liền 2 hệ thống, và cộng XP + kiểm tra thành tựu 'Điểm tuyệt đối'."""
+    quiz = _get_owned_quiz(quiz_id, current_user_id())
+    if not quiz:
+        return jsonify({"error": "Không tìm thấy quiz này."}), 404
+
+    data = request.get_json(silent=True) or {}
+    answers = data.get('answers') or []
+    duration = data.get('durationSeconds', 0)
+    save_mistakes = data.get('saveMistakes', True)
+    if not isinstance(answers, list):
+        return jsonify({"error": "Dữ liệu bài làm không hợp lệ."}), 400
+
+    db = get_db()
+    q_rows = db.execute('SELECT * FROM quiz_questions WHERE quiz_id = ?', (quiz_id,)).fetchall()
+    q_by_id = {q['id']: q for q in q_rows}
+
+    graded = []
+    correct_count = 0
+    weak_topic_counter = {}
+    user_id = current_user_id()
+
+    for a in answers:
+        qid = a.get('questionId')
+        given = a.get('given', '')
+        q = q_by_id.get(qid)
+        if not q:
+            continue
+        is_correct = grade_quiz_answer(q['q_type'], q['correct_answer'], given)
+        if is_correct:
+            correct_count += 1
+        else:
+            weak_topic_counter[q['topic']] = weak_topic_counter.get(q['topic'], 0) + 1
+            if save_mistakes:
+                # Dùng lại đúng logic dedup của Sổ lỗi sai (xem api_add_mistake) để lỗi lặp
+                # lại vẫn tăng occurrence_count thay vì tạo dòng mới.
+                desc = f"{q['question']} (đáp án đúng: {q['correct_answer']})"[:300]
+                norm_desc = desc.strip().lower()
+                existing = db.execute(
+                    "SELECT id FROM mistakes WHERE user_id = ? AND subject = ? AND LOWER(TRIM(description)) = ? AND resolved = 0",
+                    (user_id, quiz['subject'] or q['topic'], norm_desc)
+                ).fetchone()
+                if existing:
+                    db.execute('UPDATE mistakes SET occurrence_count = occurrence_count + 1, last_occurred_at = ? WHERE id = ?',
+                               (now_iso(), existing['id']))
+                else:
+                    db.execute(
+                        '''INSERT INTO mistakes (user_id, subject, description, occurrence_count, conversation_id,
+                           resolved, created_at, last_occurred_at) VALUES (?, ?, ?, 1, NULL, 0, ?, ?)''',
+                        (user_id, quiz['subject'] or q['topic'], desc, now_iso(), now_iso())
+                    )
+        graded.append({
+            'questionId': qid, 'given': given, 'correct': is_correct,
+            'correctAnswer': q['correct_answer'], 'explanation': q['explanation'],
+        })
+
+    total = len(q_rows)
+    weak_topics = sorted(weak_topic_counter, key=weak_topic_counter.get, reverse=True)
+
+    db.execute(
+        '''INSERT INTO quiz_attempts (quiz_id, user_id, score, total, duration_seconds, answers, weak_topics, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
+        (quiz_id, user_id, correct_count, total, int(duration or 0), json.dumps(graded),
+         json.dumps(weak_topics), now_iso())
+    )
+    db.commit()
+
+    is_perfect = total > 0 and correct_count == total
+    gamify = award_xp_and_streak(
+        user_id, xp_amount=min(40, 10 + correct_count * 3),
+        extra_achievement_checks={'first_quiz': True, 'perfect_quiz': is_perfect}
+    )
+
+    return jsonify({
+        "score": correct_count, "total": total, "weakTopics": weak_topics,
+        "graded": graded, "gamify": gamify,
+    })
+
+
+# ==========================================
+# 8.10 API "STUDY PLAN"
+# ==========================================
+def _get_owned_plan(plan_id, user_id):
+    db = get_db()
+    return db.execute('SELECT * FROM study_plans WHERE id = ? AND user_id = ?', (plan_id, user_id)).fetchone()
+
+
+@app.route('/api/study-plans', methods=['GET'])
+@login_required
+def api_list_study_plans():
+    db = get_db()
+    rows = db.execute('''
+        SELECT p.id, p.title, p.subject, p.total_days, p.start_date, p.created_at,
+               COUNT(t.id) AS task_count,
+               COALESCE(SUM(CASE WHEN t.status = 'done' THEN 1 ELSE 0 END), 0) AS done_count
+        FROM study_plans p
+        LEFT JOIN study_tasks t ON t.plan_id = p.id
+        WHERE p.user_id = ?
+        GROUP BY p.id
+        ORDER BY p.created_at DESC
+    ''', (current_user_id(),)).fetchall()
+    return jsonify([dict(r) for r in rows])
+
+
+@app.route('/api/study-plans/generate', methods=['POST'])
+@login_required
+def api_generate_study_plan():
+    data = request.get_json(silent=True) or {}
+    goal = (data.get('goal') or '').strip()
+    subject = (data.get('subject') or '').strip()[:60]
+    days = data.get('days', 14)
+
+    if not goal:
+        return jsonify({"error": "Em nhập mục tiêu ôn tập nhé (vd: Ôn thi Toán 8 trong 14 ngày)."}), 400
+    if len(goal) > 300:
+        return jsonify({"error": "Mục tiêu hơi dài, em rút gọn lại nhé."}), 400
+
+    try:
+        tasks = generate_study_plan_via_ai(goal, subject, days)
+    except RuntimeError as e:
+        return jsonify({"error": str(e)}), 502
+    except Exception:
+        return jsonify({"error": "AI tạo kế hoạch chưa đúng định dạng, em thử lại nhé!"}), 502
+
+    if not tasks:
+        return jsonify({"error": "AI chưa tạo được kế hoạch nào, em thử lại nhé."}), 502
+
+    user_id = current_user_id()
+    db = get_db()
+    cur = db.execute(
+        'INSERT INTO study_plans (user_id, title, subject, total_days, start_date, created_at) VALUES (?, ?, ?, ?, ?, ?)',
+        (user_id, goal[:120], subject, len(tasks), now_iso(), now_iso())
+    )
+    plan_id = cur.lastrowid
+    for i, (title, desc) in enumerate(tasks):
+        db.execute(
+            'INSERT INTO study_tasks (plan_id, day_number, title, description, status) VALUES (?, ?, ?, ?, ?)',
+            (plan_id, i + 1, title, desc, 'pending')
+        )
+    db.commit()
+
+    gamify = award_xp_and_streak(user_id, xp_amount=15, extra_achievement_checks={'first_plan': True})
+    return jsonify({"planId": plan_id, "dayCount": len(tasks), "gamify": gamify})
+
+
+@app.route('/api/study-plans/<int:plan_id>', methods=['GET'])
+@login_required
+def api_get_study_plan(plan_id):
+    plan = _get_owned_plan(plan_id, current_user_id())
+    if not plan:
+        return jsonify({"error": "Không tìm thấy kế hoạch này."}), 404
+    db = get_db()
+    tasks = db.execute(
+        'SELECT * FROM study_tasks WHERE plan_id = ? ORDER BY day_number ASC', (plan_id,)
+    ).fetchall()
+    return jsonify({"plan": dict(plan), "tasks": [dict(t) for t in tasks]})
+
+
+@app.route('/api/study-plans/<int:plan_id>', methods=['DELETE'])
+@login_required
+def api_delete_study_plan(plan_id):
+    plan = _get_owned_plan(plan_id, current_user_id())
+    if not plan:
+        return jsonify({"error": "Không tìm thấy kế hoạch này."}), 404
+    db = get_db()
+    db.execute('DELETE FROM study_tasks WHERE plan_id = ?', (plan_id,))
+    db.execute('DELETE FROM study_plans WHERE id = ?', (plan_id,))
+    db.commit()
+    return jsonify({"success": True})
+
+
+@app.route('/api/study-tasks/<int:task_id>', methods=['PATCH'])
+@login_required
+def api_update_study_task(task_id):
+    db = get_db()
+    task = db.execute('''
+        SELECT t.* FROM study_tasks t JOIN study_plans p ON p.id = t.plan_id
+        WHERE t.id = ? AND p.user_id = ?
+    ''', (task_id, current_user_id())).fetchone()
+    if not task:
+        return jsonify({"error": "Không tìm thấy việc này."}), 404
+
+    data = request.get_json(silent=True) or {}
+    status = (data.get('status') or '').strip()
+    if status not in ('pending', 'done', 'skipped'):
+        return jsonify({"error": "Trạng thái không hợp lệ."}), 400
+
+    completed_at = now_iso() if status == 'done' else None
+    db.execute('UPDATE study_tasks SET status = ?, completed_at = ? WHERE id = ?', (status, completed_at, task_id))
+    db.commit()
+
+    gamify = None
+    if status == 'done':
+        # Nếu đây là việc CUỐI CÙNG của kế hoạch được hoàn thành -> thành tựu "Về đích".
+        remaining = db.execute(
+            "SELECT COUNT(*) c FROM study_tasks WHERE plan_id = ? AND status != 'done'", (task['plan_id'],)
+        ).fetchone()['c']
+        gamify = award_xp_and_streak(current_user_id(), xp_amount=8,
+                                      extra_achievement_checks={'plan_finisher': remaining == 0})
+    return jsonify({"success": True, "gamify": gamify})
+
+
+@app.route('/api/study-plans/<int:plan_id>/reorganize', methods=['POST'])
+@login_required
+def api_reorganize_study_plan(plan_id):
+    """Học sinh bị trễ tiến độ -> gọi AI phân bổ lại các việc CÒN LẠI (chưa 'done') vào số
+    ngày còn lại tính từ hôm nay, thay vì giữ nguyên kế hoạch cũ không còn hợp lý."""
+    plan = _get_owned_plan(plan_id, current_user_id())
+    if not plan:
+        return jsonify({"error": "Không tìm thấy kế hoạch này."}), 404
+
+    db = get_db()
+    remaining_tasks = db.execute(
+        "SELECT title FROM study_tasks WHERE plan_id = ? AND status != 'done' ORDER BY day_number ASC", (plan_id,)
+    ).fetchall()
+    if not remaining_tasks:
+        return jsonify({"error": "Kế hoạch đã hoàn thành hết, không còn gì để sắp xếp lại."}), 400
+
+    data = request.get_json(silent=True) or {}
+    new_days = data.get('days', len(remaining_tasks))
+
+    try:
+        new_tasks = generate_study_plan_via_ai(
+            plan['title'], plan['subject'], new_days,
+            remaining_topics=[t['title'] for t in remaining_tasks]
+        )
+    except RuntimeError as e:
+        return jsonify({"error": str(e)}), 502
+    except Exception:
+        return jsonify({"error": "AI sắp xếp lại chưa đúng định dạng, em thử lại nhé!"}), 502
+
+    if not new_tasks:
+        return jsonify({"error": "AI chưa sắp xếp lại được, em thử lại nhé."}), 502
+
+    # Xoá các việc CHƯA hoàn thành cũ, thay bằng kế hoạch mới — giữ nguyên các việc ĐÃ hoàn
+    # thành để không mất tiến độ đã có.
+    done_count = db.execute(
+        "SELECT COUNT(*) c FROM study_tasks WHERE plan_id = ? AND status = 'done'", (plan_id,)
+    ).fetchone()['c']
+    db.execute("DELETE FROM study_tasks WHERE plan_id = ? AND status != 'done'", (plan_id,))
+    for i, (title, desc) in enumerate(new_tasks):
+        db.execute(
+            'INSERT INTO study_tasks (plan_id, day_number, title, description, status) VALUES (?, ?, ?, ?, ?)',
+            (plan_id, done_count + i + 1, title, desc, 'pending')
+        )
+    db.execute('UPDATE study_plans SET total_days = ? WHERE id = ?', (done_count + len(new_tasks), plan_id))
+    db.commit()
+    return jsonify({"success": True, "newTaskCount": len(new_tasks)})
+
+
+# ==========================================
+# 8.8 API "SỔ LỖI SAI" (MISTAKE BOOK)
+# ==========================================
+@app.route('/api/mistakes', methods=['GET'])
+@login_required
+def api_list_mistakes():
+    db = get_db()
+    rows = db.execute(
+        'SELECT * FROM mistakes WHERE user_id = ? ORDER BY resolved ASC, occurrence_count DESC, last_occurred_at DESC',
+        (current_user_id(),)
+    ).fetchall()
+    return jsonify([dict(r) for r in rows])
+
+
+@app.route('/api/mistakes', methods=['POST'])
+@login_required
+def api_add_mistake():
+    """Ghi 1 lỗi sai vào Sổ lỗi sai. Lỗi TRÙNG (cùng môn + mô tả sau khi chuẩn hoá, chưa
+    'Đã khắc phục') chỉ tăng occurrence_count — không tạo dòng mới — để ra đúng kiểu hiển thị
+    "Chuyển vế sai dấu ×3" thay vì liệt kê lặp lại từng dòng riêng."""
+    data = request.get_json(silent=True) or {}
+    subject = (data.get('subject') or '').strip()[:60]
+    description = (data.get('description') or '').strip()[:300]
+    raw_conv_id = data.get('conversationId')
+    if not description:
+        return jsonify({"error": "Em mô tả ngắn gọn lỗi sai của mình nhé."}), 400
+
+    conv_id = None
+    if raw_conv_id is not None:
+        try:
+            conv_id = int(raw_conv_id)
+        except (TypeError, ValueError):
+            conv_id = None
+
+    user_id = current_user_id()
+    db = get_db()
+    norm_desc = description.strip().lower()
+    existing = db.execute(
+        "SELECT id, occurrence_count FROM mistakes WHERE user_id = ? AND subject = ? "
+        "AND LOWER(TRIM(description)) = ? AND resolved = 0",
+        (user_id, subject, norm_desc)
+    ).fetchone()
+
+    if existing:
+        db.execute(
+            'UPDATE mistakes SET occurrence_count = occurrence_count + 1, last_occurred_at = ? WHERE id = ?',
+            (now_iso(), existing['id'])
+        )
+        db.commit()
+        mistake_id = existing['id']
+        is_first = False
+    else:
+        cur = db.execute(
+            '''INSERT INTO mistakes (user_id, subject, description, occurrence_count, conversation_id,
+               resolved, created_at, last_occurred_at) VALUES (?, ?, ?, 1, ?, 0, ?, ?)''',
+            (user_id, subject, description, conv_id, now_iso(), now_iso())
+        )
+        db.commit()
+        mistake_id = cur.lastrowid
+        is_first = True
+
+    total_mistakes = db.execute('SELECT COUNT(*) c FROM mistakes WHERE user_id = ?', (user_id,)).fetchone()['c']
+    gamify = award_xp_and_streak(user_id, xp_amount=5,
+                                  extra_achievement_checks={'first_mistake': total_mistakes >= 1})
+    return jsonify({"success": True, "id": mistake_id, "isNew": is_first, "gamify": gamify})
+
+
+@app.route('/api/mistakes/<int:mistake_id>', methods=['PATCH'])
+@login_required
+def api_update_mistake(mistake_id):
+    db = get_db()
+    row = db.execute('SELECT id FROM mistakes WHERE id = ? AND user_id = ?', (mistake_id, current_user_id())).fetchone()
+    if not row:
+        return jsonify({"error": "Không tìm thấy lỗi này."}), 404
+    data = request.get_json(silent=True) or {}
+    if 'resolved' not in data:
+        return jsonify({"error": "Không có nội dung nào để cập nhật."}), 400
+    db.execute('UPDATE mistakes SET resolved = ? WHERE id = ?', (1 if data.get('resolved') else 0, mistake_id))
+    db.commit()
+    return jsonify({"success": True})
+
+
+@app.route('/api/mistakes/<int:mistake_id>', methods=['DELETE'])
+@login_required
+def api_delete_mistake(mistake_id):
+    db = get_db()
+    row = db.execute('SELECT id FROM mistakes WHERE id = ? AND user_id = ?', (mistake_id, current_user_id())).fetchone()
+    if not row:
+        return jsonify({"error": "Không tìm thấy lỗi này."}), 404
+    db.execute('DELETE FROM mistakes WHERE id = ?', (mistake_id,))
+    db.commit()
+    return jsonify({"success": True})
+
+
 @app.route('/api/memories', methods=['GET'])
 @login_required
 def api_list_memories():
@@ -6126,6 +8099,52 @@ def update_preferences():
     return jsonify(prefs)
 
 
+# ==========================================
+# 8.11 API "QUẢN LÝ TÀI KHOẢN" (avatar, đổi mật khẩu) — dành cho MỌI người dùng
+# ==========================================
+@app.route('/api/account/avatar', methods=['POST'])
+@login_required
+def api_set_avatar():
+    data = request.get_json(silent=True) or {}
+    emoji = (data.get('emoji') or '').strip()
+    preset = next((a for a in AVATAR_PRESETS if a['emoji'] == emoji), None)
+    if not preset:
+        return jsonify({"error": "Avatar không hợp lệ."}), 400
+    db = get_db()
+    db.execute('UPDATE users SET avatar_emoji = ?, avatar_color = ? WHERE id = ?',
+               (preset['emoji'], preset['color'], current_user_id()))
+    db.commit()
+    return jsonify({"success": True, "emoji": preset['emoji'], "color": preset['color']})
+
+
+@app.route('/api/account/password', methods=['POST'])
+@login_required
+def api_change_password():
+    """Đổi mật khẩu — chỉ áp dụng cho tài khoản ĐÃ có mật khẩu (không phải OAuth thuần, không
+    phải tài khoản khách — khách dùng /guest/upgrade để ĐẶT mật khẩu lần đầu thay vì đổi)."""
+    user = current_user()
+    if not user or not user['password_hash']:
+        return jsonify({"error": "Tài khoản này chưa có mật khẩu để đổi (đăng nhập bằng Google, hoặc là tài khoản khách)."}), 400
+
+    data = request.get_json(silent=True) or {}
+    current_pw = data.get('currentPassword') or ''
+    new_pw = data.get('newPassword') or ''
+    confirm = data.get('confirm') or ''
+
+    if not check_password_hash(user['password_hash'], current_pw):
+        return jsonify({"error": "Mật khẩu hiện tại không đúng."}), 400
+    if len(new_pw) < 6:
+        return jsonify({"error": "Mật khẩu mới phải có ít nhất 6 ký tự."}), 400
+    if new_pw != confirm:
+        return jsonify({"error": "Mật khẩu mới nhập lại không khớp."}), 400
+
+    db = get_db()
+    db.execute('UPDATE users SET password_hash = ? WHERE id = ?',
+               (generate_password_hash(new_pw), user['id']))
+    db.commit()
+    return jsonify({"success": True})
+
+
 @app.route('/api/banner', methods=['GET'])
 @login_required
 def get_banner():
@@ -6382,7 +8401,8 @@ def chat():
     {custom_tutor['system_prompt']}
     ---
     Vẫn dùng Markdown để trình bày rõ ràng, dễ đọc.
-    Với công thức/phép toán: đặt trong cú pháp LaTeX chuẩn ("$$...$$" cho dòng riêng, "\\(...\\)" cho công thức ngắn giữa câu).
+    Công thức toán: dùng LaTeX ("$$...$$" cho dòng riêng, "\\(...\\)" cho công thức ngắn
+    giữa câu), đóng đủ dấu ngoặc. Nếu học sinh gõ sai ký hiệu, hiểu ý rồi viết lại cho đúng.
     """
     else:
         system_prompt = f"""
@@ -6397,9 +8417,9 @@ def chat():
        - Kiểm tra: Sửa lỗi, khen ngợi.
        - Luyện tập: Cho 1-2 bài tập.
        - Ôn tập: Tóm tắt trọng tâm.
-    4. Với công thức/phép toán: LUÔN đặt trong cú pháp LaTeX chuẩn — công thức trên
-       dòng riêng thì bọc trong "$$...$$", công thức ngắn giữa câu thì bọc trong
-       "\\(...\\)". Không viết công thức dưới dạng chữ thường lẫn trong đoạn văn.
+    4. Công thức toán: dùng LaTeX — "$$...$$" cho công thức riêng dòng, "\\(...\\)" cho
+       công thức ngắn giữa câu, đóng đủ dấu ngoặc. Nếu học sinh gõ sai ký hiệu, hiểu ý rồi
+       viết lại cho đúng, đừng chép nguyên văn chỗ sai.
     """
 
     # "Chế độ suy nghĩ" (Trợ Lý/Học Giả/Giáo Sư/Thiên Tài) — Học Giả/Giáo Sư mở khoá từ gói
