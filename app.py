@@ -9,6 +9,9 @@ import hmac
 import hashlib
 import requests
 import importlib
+import time
+import threading
+from collections import defaultdict, deque
 from datetime import datetime, timezone, timedelta
 from functools import wraps
 from urllib.parse import urlencode, quote_plus
@@ -145,6 +148,44 @@ else:
 # quán ở cả nơi TỰ ĐỘNG nâng quyền (init_db) lẫn nơi CHẶN nâng quyền cho tài khoản khác
 # (can_manage_role) — xem 2 chỗ dùng bên dưới.
 SUPER_ADMIN_USERNAME = (os.environ.get('SUPER_ADMIN_USERNAME', '') or 'BlackadaNutella').strip()
+
+# ==========================================
+# 0.36. GIỚI HẠN TỐC ĐỘ (Rate Limiting) — chống dò mật khẩu / đăng ký hàng loạt
+# ==========================================
+# Bộ đếm trong bộ nhớ tiến trình — không cần Redis/hạ tầng ngoài, đơn giản, đủ để chặn bot cơ
+# bản. GIỚI HẠN CẦN BIẾT: nếu chạy nhiều worker process (vd `gunicorn -w 4`), MỖI worker có bộ
+# đếm RIÊNG không chia sẻ — giới hạn thực tế sẽ cao hơn số cấu hình (x số worker). Muốn chặn
+# triệt để ở quy mô lớn/nhiều worker cần Redis hoặc thư viện như Flask-Limiter + backend chung.
+#
+# Giới hạn đăng nhập tính theo CẶP (IP, username) chứ không phải riêng IP — để 1 học sinh gõ
+# sai mật khẩu nhiều lần KHÔNG làm khoá luôn cả lớp đang dùng chung WiFi trường (rất thực tế
+# với app này). Có thêm 1 giới hạn tổng theo IP (ngưỡng cao hơn nhiều) chỉ để chặn kiểu bot dò
+# quét nhiều tài khoản khác nhau từ 1 địa chỉ.
+_rate_limit_buckets = defaultdict(deque)
+_rate_limit_lock = threading.Lock()
+
+
+def _rate_limit_check(key, max_attempts, window_seconds):
+    """True = còn được phép (đã tự ghi nhận lượt này luôn). False = đã vượt giới hạn."""
+    now = time.time()
+    with _rate_limit_lock:
+        bucket = _rate_limit_buckets[key]
+        while bucket and now - bucket[0] > window_seconds:
+            bucket.popleft()
+        if len(bucket) >= max_attempts:
+            return False
+        bucket.append(now)
+        return True
+
+
+def _rate_limit_reset(key):
+    with _rate_limit_lock:
+        _rate_limit_buckets.pop(key, None)
+
+
+def client_ip():
+    return (request.headers.get('X-Forwarded-For', '') or request.remote_addr or 'unknown').split(',')[0].strip()
+
 
 
 def ensure_columns(conn, table, columns):
@@ -508,6 +549,7 @@ def init_db():
         'lock_reason': "TEXT DEFAULT ''", 'session_version': 'INTEGER NOT NULL DEFAULT 0',
         'plan': "TEXT NOT NULL DEFAULT 'free'", 'plan_expires_at': 'TEXT',
         'avatar_emoji': 'TEXT', 'avatar_color': 'TEXT', 'is_guest': 'INTEGER NOT NULL DEFAULT 0',
+        'recovery_code_hash': 'TEXT',
     })
     ensure_columns(conn, 'conversations', {
         'pinned': 'INTEGER NOT NULL DEFAULT 0', 'project_id': 'INTEGER',
@@ -1742,6 +1784,105 @@ VNPAY_RETURN_HTML = r'''
 </html>
 '''
 
+RECOVERY_CODE_HTML = r'''
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Lưu mã khôi phục - StudyMate AI</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.6.0/css/all.min.css">
+</head>
+<body class="min-h-screen flex items-center justify-center bg-gradient-to-br from-indigo-600 to-purple-700 p-4">
+  <div class="bg-white rounded-3xl shadow-2xl p-8 max-w-md w-full text-center">
+    <div class="w-16 h-16 rounded-full bg-amber-100 text-amber-600 flex items-center justify-center mx-auto mb-4 text-2xl">
+      <i class="fas fa-key"></i>
+    </div>
+    <h1 class="text-xl font-bold mb-2">
+      {% if context == 'register' %}Lưu lại mã khôi phục của em!{% else %}Mã khôi phục MỚI của em{% endif %}
+    </h1>
+    <p class="text-sm text-gray-500 mb-5">
+      Dùng mã này để lấy lại mật khẩu nếu quên — <strong>chỉ hiện đúng 1 lần này thôi</strong>, StudyMate không lưu lại bản gốc nên sẽ không hiện lại được nữa.
+    </p>
+    <div class="bg-gray-100 rounded-2xl py-4 px-3 mb-5">
+      <p class="font-mono text-2xl font-bold tracking-wider text-indigo-700 select-all">{{ code }}</p>
+    </div>
+    <button onclick="copyCode()" id="copyBtn" class="w-full mb-3 px-4 py-2.5 rounded-xl bg-gray-100 hover:bg-gray-200 text-sm font-semibold text-gray-700">
+      <i class="fas fa-copy mr-1"></i> Chép mã
+    </button>
+    <p class="text-xs text-gray-400 mb-5">Chụp màn hình hoặc chép vào nơi an toàn (không phải chat với bạn bè!) trước khi tiếp tục.</p>
+    <a href="{{ url_for('home') }}" class="block w-full px-4 py-3 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-white text-sm font-semibold">
+      Em đã lưu rồi, tiếp tục →
+    </a>
+  </div>
+  <script>
+    function copyCode() {
+      navigator.clipboard.writeText({{ code|tojson }}).then(() => {
+        const btn = document.getElementById('copyBtn');
+        btn.innerHTML = '<i class="fas fa-check mr-1"></i> Đã chép!';
+        setTimeout(() => { btn.innerHTML = '<i class="fas fa-copy mr-1"></i> Chép mã'; }, 1500);
+      });
+    }
+  </script>
+</body>
+</html>
+'''
+
+
+FORGOT_PASSWORD_HTML = r'''
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Quên mật khẩu - StudyMate AI</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.6.0/css/all.min.css">
+</head>
+<body class="min-h-screen flex items-center justify-center bg-gradient-to-br from-indigo-600 to-purple-700 p-4">
+  <div class="bg-white rounded-3xl shadow-2xl p-8 max-w-md w-full">
+    <div class="text-center mb-5">
+      <div class="w-14 h-14 rounded-full bg-indigo-100 text-indigo-600 flex items-center justify-center mx-auto mb-3 text-xl">
+        <i class="fas fa-unlock-keyhole"></i>
+      </div>
+      <h1 class="text-lg font-bold">Quên mật khẩu?</h1>
+      <p class="text-sm text-gray-500 mt-1">Nhập mã khôi phục đã lưu lúc đăng ký để đặt mật khẩu mới.</p>
+    </div>
+
+    {% with messages = get_flashed_messages() %}
+      {% if messages %}
+        {% for m in messages %}
+        <div class="text-sm text-red-600 bg-red-50 border border-red-100 rounded-xl px-4 py-2.5 mb-4">{{ m }}</div>
+        {% endfor %}
+      {% endif %}
+    {% endwith %}
+
+    <form method="POST" class="space-y-3">
+      <input name="username" value="{{ username }}" placeholder="Tên đăng nhập" required
+        class="w-full px-4 py-3 rounded-xl bg-gray-100 border-0 focus:outline-none focus:ring-2 focus:ring-indigo-500 text-sm">
+      <input name="code" placeholder="Mã khôi phục (XXXX-XXXX-XXXX)" required maxlength="14"
+        class="w-full px-4 py-3 rounded-xl bg-gray-100 border-0 focus:outline-none focus:ring-2 focus:ring-indigo-500 text-sm font-mono tracking-wide uppercase">
+      <input name="new_password" type="password" placeholder="Mật khẩu mới (tối thiểu 6 ký tự)" required minlength="6"
+        class="w-full px-4 py-3 rounded-xl bg-gray-100 border-0 focus:outline-none focus:ring-2 focus:ring-indigo-500 text-sm">
+      <input name="confirm" type="password" placeholder="Nhập lại mật khẩu mới" required minlength="6"
+        class="w-full px-4 py-3 rounded-xl bg-gray-100 border-0 focus:outline-none focus:ring-2 focus:ring-indigo-500 text-sm">
+      <button type="submit" class="w-full px-4 py-3 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-white text-sm font-semibold">Đặt mật khẩu mới</button>
+    </form>
+
+    <p class="text-center text-xs text-gray-400 mt-5">
+      Không còn mã khôi phục (tài khoản tạo trước khi có tính năng này, hoặc làm mất mã)?
+      Liên hệ Admin để được hỗ trợ đặt lại mật khẩu thủ công.
+    </p>
+    <p class="text-center text-sm text-gray-500 mt-3">
+      <a href="{{ url_for('login_page') }}" class="text-indigo-600 font-semibold hover:underline">← Về trang đăng nhập</a>
+    </p>
+  </div>
+</body>
+</html>
+'''
+
+
 AUTH_HTML = r'''
 <!DOCTYPE html>
 <html lang="vi">
@@ -1859,6 +2000,7 @@ AUTH_HTML = r'''
       <p class="text-center text-sm text-gray-500 mt-6">
         {% if mode == 'login' %}
           Chưa có tài khoản? <a href="{{ url_for('register_page') }}" class="text-indigo-600 font-semibold hover:underline">Đăng ký ngay</a>
+          · <a href="{{ url_for('forgot_password_page') }}" class="text-indigo-600 font-semibold hover:underline">Quên mật khẩu?</a>
         {% else %}
           Đã có tài khoản? <a href="{{ url_for('login_page') }}" class="text-indigo-600 font-semibold hover:underline">Đăng nhập</a>
         {% endif %}
@@ -2688,6 +2830,10 @@ HTML = r'''
             class="w-full px-3 py-2 rounded-lg bg-gray-100 dark:bg-gray-900 border-0 focus:outline-none focus:ring-2 focus:ring-blue-500 text-sm dark:text-white mb-2">
           <button onclick="submitPasswordChange()" class="w-full bg-gray-800 dark:bg-gray-700 hover:bg-gray-900 text-white font-semibold py-2 rounded-lg text-sm">Đổi mật khẩu</button>
           <p id="passwordChangeStatus" class="hidden text-xs mt-1.5"></p>
+          <button onclick="regenerateRecoveryCode()" class="w-full mt-2 bg-amber-50 dark:bg-amber-900/20 hover:bg-amber-100 dark:hover:bg-amber-900/40 text-amber-700 dark:text-amber-400 font-medium py-2 rounded-lg text-sm">
+            <i class="fas fa-key mr-1"></i> Tạo mã khôi phục mật khẩu mới
+          </button>
+          <p class="text-[11px] text-gray-400 mt-1">Dùng để lấy lại mật khẩu nếu quên sau này. Tạo mã mới sẽ làm mã cũ (nếu có) hết hiệu lực.</p>
         </div>
         {% else %}
         <p class="text-xs text-gray-400 pt-3 border-t border-gray-100 dark:border-gray-700">Tài khoản đăng nhập bằng Google — không cần mật khẩu ở đây.</p>
@@ -2958,6 +3104,23 @@ HTML = r'''
       <p id="mistakeStatus" class="hidden text-xs text-emerald-600 dark:text-emerald-400 flex items-center gap-1"><i class="fas fa-check"></i></p>
     </div>
   </div>
+
+  <div id="recoveryCodeModal" class="hidden modal-panel bg-white dark:bg-gray-800 rounded-2xl shadow-2xl w-full max-w-sm text-center">
+    <div class="p-6">
+      <div class="w-14 h-14 rounded-full bg-amber-100 dark:bg-amber-900/30 text-amber-600 dark:text-amber-400 flex items-center justify-center mx-auto mb-3 text-xl">
+        <i class="fas fa-key"></i>
+      </div>
+      <h3 class="font-bold mb-1">Mã khôi phục mới của em</h3>
+      <p class="text-xs text-gray-400 mb-4">Chỉ hiện đúng 1 lần này — lưu lại ngay, mã cũ (nếu có) đã hết hiệu lực.</p>
+      <div class="bg-gray-100 dark:bg-gray-900 rounded-xl py-3.5 px-3 mb-4">
+        <p id="recoveryCodeText" class="font-mono text-xl font-bold tracking-wider text-indigo-600 dark:text-indigo-400 select-all"></p>
+      </div>
+      <button onclick="copyRecoveryCode()" id="recoveryCodeCopyBtn" class="w-full mb-2 px-4 py-2.5 rounded-xl bg-gray-100 dark:bg-gray-700 hover:bg-gray-200 dark:hover:bg-gray-600 text-sm font-semibold">
+        <i class="fas fa-copy mr-1"></i> Chép mã
+      </button>
+      <button onclick="closeAllModals()" class="w-full px-4 py-2.5 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-white text-sm font-semibold">Em đã lưu rồi</button>
+    </div>
+  </div>
 </div>
 
 <script>
@@ -3109,6 +3272,35 @@ async function submitPasswordChange() {
     statusEl.className = 'text-xs mt-1.5 text-red-500';
     statusEl.textContent = 'Lỗi mạng, em thử lại nhé.';
   }
+}
+
+let _lastRecoveryCode = '';
+async function regenerateRecoveryCode() {
+  if (!confirm('Tạo mã khôi phục mới? Mã cũ (nếu có) sẽ không dùng được nữa.')) return;
+  try {
+    const res = await fetch('/api/account/recovery-code', { method: 'POST' });
+    const data = await res.json();
+    if (res.ok) {
+      _lastRecoveryCode = data.code;
+      document.getElementById('recoveryCodeText').textContent = data.code;
+      closeAllModals();
+      openModal('recoveryCodeModal');
+    } else {
+      alert(data.error || 'Không tạo được mã khôi phục, em thử lại nhé.');
+    }
+  } catch (e) {
+    alert('Lỗi mạng, em thử lại nhé.');
+  }
+}
+
+function copyRecoveryCode() {
+  if (!_lastRecoveryCode) return;
+  navigator.clipboard.writeText(_lastRecoveryCode).then(() => {
+    const btn = document.getElementById('recoveryCodeCopyBtn');
+    const original = btn.innerHTML;
+    btn.innerHTML = '<i class="fas fa-check mr-1"></i> Đã chép!';
+    setTimeout(() => { btn.innerHTML = original; }, 1500);
+  });
 }
 
 async function submitGuestUpgrade() {
@@ -6616,6 +6808,19 @@ def generate_guest_username():
     return 'khach_' + secrets.token_hex(8)  # cực hiếm khi tới đây
 
 
+# Bảng chữ cái dùng cho mã khôi phục — CỐ TÌNH bỏ các ký tự dễ nhầm lẫn khi chép tay/đọc lại:
+# 0/O, 1/I/L — giảm khả năng học sinh chép sai rồi không dùng lại được mã của chính mình.
+RECOVERY_CODE_ALPHABET = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789'
+
+
+def generate_recovery_code():
+    """Mã khôi phục dạng XXXX-XXXX-XXXX (12 ký tự thật, có gạch ngang cho dễ đọc/chép tay).
+    Chỉ hiện đúng 1 LẦN cho học sinh lúc tạo ra (lúc đăng ký, hoặc lúc tự tạo lại) — sau đó
+    CHỈ lưu bản băm (hash), giống hệt cách xử lý mật khẩu, không bao giờ lưu lại bản gốc."""
+    parts = [''.join(secrets.choice(RECOVERY_CODE_ALPHABET) for _ in range(4)) for _ in range(3)]
+    return '-'.join(parts)
+
+
 @app.route('/guest-login', methods=['POST'])
 def guest_login():
     """'Dùng thử ngay, không cần đăng ký' — tạo 1 tài khoản khách THẬT trong DB (dùng lại
@@ -6735,6 +6940,10 @@ def register_page():
         return redirect(url_for('home'))
 
     if request.method == 'POST':
+        if not _rate_limit_check(f"register:{client_ip()}", max_attempts=20, window_seconds=3600):
+            flash('Có quá nhiều lượt đăng ký từ mạng này trong 1 giờ qua. Em thử lại sau nhé.')
+            return render_template_string(AUTH_HTML, mode='register', username='', **_auth_ctx())
+
         username = (request.form.get('username') or '').strip()
         password = request.form.get('password') or ''
         confirm = request.form.get('confirm') or ''
@@ -6752,14 +6961,15 @@ def register_page():
                 flash('Tên đăng nhập này đã được sử dụng.')
             else:
                 pw_hash = generate_password_hash(password)
+                recovery_code = generate_recovery_code()
                 cur = db.execute(
-                    'INSERT INTO users (username, password_hash, created_at) VALUES (?, ?, ?)',
-                    (username, pw_hash, now_iso())
+                    'INSERT INTO users (username, password_hash, recovery_code_hash, created_at) VALUES (?, ?, ?, ?)',
+                    (username, pw_hash, generate_password_hash(recovery_code), now_iso())
                 )
                 db.commit()
                 new_user = db.execute('SELECT * FROM users WHERE id = ?', (cur.lastrowid,)).fetchone()
                 _login_session_for(new_user)
-                return redirect(url_for('home'))
+                return render_template_string(RECOVERY_CODE_HTML, code=recovery_code, context='register')
 
         return render_template_string(AUTH_HTML, mode='register', username=username, **_auth_ctx())
 
@@ -6774,6 +6984,19 @@ def login_page():
     if request.method == 'POST':
         username = (request.form.get('username') or '').strip()
         password = request.form.get('password') or ''
+        ip = client_ip()
+
+        # Giới hạn theo CẶP (IP, username) — 1 học sinh gõ sai mật khẩu nhiều lần không khoá
+        # luôn cả lớp dùng chung WiFi trường. Có thêm giới hạn tổng theo IP (ngưỡng cao hơn
+        # hẳn) chỉ để chặn kiểu bot dò quét nhiều tài khoản khác nhau từ 1 địa chỉ.
+        pair_key = f"login_pair:{ip}:{username.lower()}"
+        ip_key = f"login_ip:{ip}"
+        if not _rate_limit_check(pair_key, max_attempts=8, window_seconds=900):
+            flash('Em đã thử sai quá nhiều lần cho tài khoản này. Vui lòng đợi vài phút rồi thử lại.')
+            return render_template_string(AUTH_HTML, mode='login', username=username, **_auth_ctx())
+        if not _rate_limit_check(ip_key, max_attempts=60, window_seconds=900):
+            flash('Có quá nhiều lượt đăng nhập từ mạng này. Vui lòng đợi vài phút rồi thử lại.')
+            return render_template_string(AUTH_HTML, mode='login', username=username, **_auth_ctx())
 
         db = get_db()
         user = db.execute('SELECT * FROM users WHERE username = ?', (username,)).fetchone()
@@ -6789,6 +7012,7 @@ def login_page():
                 reason = (user['lock_reason'] or '').strip()
                 flash('Tài khoản này đã bị khoá.' + (f' Lý do: {reason}' if reason else ''))
                 return render_template_string(AUTH_HTML, mode='login', username=username, **_auth_ctx())
+            _rate_limit_reset(pair_key)  # đăng nhập đúng -> xoá bộ đếm sai cho cặp này
             _login_session_for(user)
             return redirect(url_for('home'))
 
@@ -6796,6 +7020,53 @@ def login_page():
         return render_template_string(AUTH_HTML, mode='login', username=username, **_auth_ctx())
 
     return render_template_string(AUTH_HTML, mode='login', username='', **_auth_ctx())
+
+
+@app.route('/forgot-password', methods=['GET', 'POST'])
+def forgot_password_page():
+    if current_user_id():
+        return redirect(url_for('home'))
+
+    if request.method == 'POST':
+        if not _rate_limit_check(f"forgot_pw:{client_ip()}", max_attempts=10, window_seconds=900):
+            flash('Có quá nhiều lượt thử từ mạng này. Vui lòng đợi vài phút rồi thử lại.')
+            return render_template_string(FORGOT_PASSWORD_HTML, username='')
+
+        username = (request.form.get('username') or '').strip()
+        code = (request.form.get('code') or '').strip().upper()
+        new_password = request.form.get('new_password') or ''
+        confirm = request.form.get('confirm') or ''
+
+        db = get_db()
+        user = db.execute('SELECT * FROM users WHERE username = ?', (username,)).fetchone()
+
+        # Thông báo LỖI CHUNG CHUNG dù sai username hay sai mã — không để lộ "username này có
+        # tồn tại không" cho người dò (tránh dò được danh sách tài khoản thật trong hệ thống).
+        generic_error = 'Tên đăng nhập hoặc mã khôi phục không đúng.'
+
+        if not user or not user['recovery_code_hash']:
+            flash(generic_error)
+        elif not check_password_hash(user['recovery_code_hash'], code):
+            flash(generic_error)
+        elif len(new_password) < 6:
+            flash('Mật khẩu mới phải có ít nhất 6 ký tự.')
+        elif new_password != confirm:
+            flash('Mật khẩu mới nhập lại không khớp.')
+        else:
+            # Dùng mã khôi phục xong thì ĐỔI LUÔN sang mã mới (không cho dùng lại mã cũ nữa) —
+            # đúng thông lệ bảo mật cho các mã dùng-một-lần dạng này.
+            new_code = generate_recovery_code()
+            db.execute(
+                'UPDATE users SET password_hash = ?, recovery_code_hash = ? WHERE id = ?',
+                (generate_password_hash(new_password), generate_password_hash(new_code), user['id'])
+            )
+            db.commit()
+            write_audit('password_reset_via_recovery_code', target=user['username'])
+            return render_template_string(RECOVERY_CODE_HTML, code=new_code, context='reset')
+
+        return render_template_string(FORGOT_PASSWORD_HTML, username=username)
+
+    return render_template_string(FORGOT_PASSWORD_HTML, username='')
 
 
 @app.route('/logout')
@@ -9697,6 +9968,26 @@ def api_change_password():
                (generate_password_hash(new_pw), user['id']))
     db.commit()
     return jsonify({"success": True})
+
+
+@app.route('/api/account/recovery-code', methods=['POST'])
+@login_required
+def api_regenerate_recovery_code():
+    """Tạo mã khôi phục MỚI cho tài khoản đang đăng nhập — dùng cho: (1) tài khoản tạo TRƯỚC
+    khi có tính năng này nên chưa từng có mã, (2) học sinh làm mất/quên mã cũ, muốn tạo lại.
+    Mã cũ (nếu có) sẽ bị VÔ HIỆU ngay khi tạo mã mới. Không áp dụng cho tài khoản khách/OAuth
+    thuần vì các tài khoản đó không dùng mật khẩu nên khái niệm 'khôi phục mật khẩu' không áp dụng."""
+    user = current_user()
+    if not user or not user['password_hash']:
+        return jsonify({"error": "Tài khoản này không dùng mật khẩu (đăng nhập Google, hoặc tài khoản khách)."}), 400
+
+    new_code = generate_recovery_code()
+    db = get_db()
+    db.execute('UPDATE users SET recovery_code_hash = ? WHERE id = ?',
+               (generate_password_hash(new_code), user['id']))
+    db.commit()
+    write_audit('regenerate_recovery_code', target=user['username'])
+    return jsonify({"success": True, "code": new_code})
 
 
 @app.route('/api/banner', methods=['GET'])
