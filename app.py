@@ -595,6 +595,56 @@ def init_db():
     ''')
     conn.commit()
 
+    # "StudyMate Lab" — Feature Registry + Feature Flags: hạ tầng để đăng ký, thử nghiệm, tăng
+    # dần tỉ lệ rollout, và giám sát tính năng thử nghiệm mà KHÔNG cần sửa code/deploy lại.
+    # status: off | internal | beta | public | archived.
+    # rollout_pct chỉ có ý nghĩa khi status='beta' — phần trăm NGƯỜI DÙNG THƯỜNG được thấy
+    # tính năng (Developer trở lên LUÔN thấy được ở mọi trạng thái khác off/archived, để tự
+    # test được bất cứ lúc nào — xem is_feature_enabled()).
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS feature_flags (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            key TEXT UNIQUE NOT NULL,
+            name TEXT DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'off',
+            category TEXT DEFAULT 'other',
+            description TEXT DEFAULT '',
+            owner_username TEXT DEFAULT '',
+            environment TEXT DEFAULT 'production',
+            version TEXT DEFAULT '1.0.0',
+            rollout_pct INTEGER NOT NULL DEFAULT 0,
+            depends_on TEXT DEFAULT '',
+            expires_at TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+    ''')
+    conn.commit()
+    ensure_columns(conn, 'feature_flags', {
+        'name': "TEXT DEFAULT ''", 'category': "TEXT DEFAULT 'other'", 'owner_username': "TEXT DEFAULT ''",
+        'environment': "TEXT DEFAULT 'production'", 'version': "TEXT DEFAULT '1.0.0'",
+        'rollout_pct': 'INTEGER NOT NULL DEFAULT 0', 'depends_on': "TEXT DEFAULT ''", 'expires_at': 'TEXT',
+    })
+
+    # "Đố Vui Tính Nhanh" (Quick Math) — lưu kết quả từng ván để tính XP/thành tựu + báo cáo
+    # điểm yếu theo TỪNG PHÉP TÍNH (không cần gọi AI — số liệu tự thống kê từ ván chơi).
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS game_sessions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            game TEXT NOT NULL,
+            difficulty TEXT DEFAULT 'medium',
+            score INTEGER NOT NULL DEFAULT 0,
+            correct_count INTEGER NOT NULL DEFAULT 0,
+            total_count INTEGER NOT NULL DEFAULT 0,
+            best_combo INTEGER NOT NULL DEFAULT 0,
+            weak_topics TEXT DEFAULT '',
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (user_id) REFERENCES users (id)
+        )
+    ''')
+    conn.commit()
+
     # ---- Tạo (hoặc nâng cấp) tài khoản developer ----
     # Có thể tuỳ chỉnh qua .env: DEVELOPER_USERNAME / DEVELOPER_PASSWORD.
     # Nếu chưa có tài khoản này, server sẽ tự tạo và in mật khẩu ra console 1 lần duy nhất.
@@ -1164,6 +1214,8 @@ ACHIEVEMENTS_META = {
     'perfect_quiz':  {'icon': '💯', 'label': 'Điểm tuyệt đối', 'desc': 'Đạt 100% điểm 1 bài quiz.'},
     'first_plan':    {'icon': '🎯', 'label': 'Kế hoạch đầu tiên', 'desc': 'Tạo kế hoạch ôn tập đầu tiên.'},
     'plan_finisher':  {'icon': '🏆', 'label': 'Về đích', 'desc': 'Hoàn thành trọn vẹn 1 kế hoạch ôn tập.'},
+    'speed_demon':   {'icon': '⚡', 'label': 'Tia chớp', 'desc': 'Đạt combo 10 câu đúng liên tiếp trong Đố Vui Tính Nhanh.'},
+    'perfect_run':   {'icon': '🎯', 'label': 'Không sai một câu', 'desc': 'Trả lời đúng 100% trong 1 ván (từ 10 câu trở lên).'},
 }
 
 
@@ -1474,6 +1526,72 @@ def guest_login_effective_enabled():
     """Cho phép 'Dùng thử ngay, không cần đăng ký' — MẶC ĐỊNH BẬT (khác Google, không cần
     cấu hình .env gì để dùng được). Developer có thể tắt từ /developer nếu không muốn nữa."""
     return get_setting('guest_login_override', 'on') != 'off'
+
+
+# ==========================================
+# 0.35. "STUDYMATE LAB" — FEATURE REGISTRY + FEATURE FLAGS
+# ==========================================
+# Hạ tầng đăng ký & bật/tắt tính năng thử nghiệm theo cấp độ, KHÔNG cần sửa code/deploy lại —
+# sẵn sàng để các tính năng thử nghiệm sau này cắm vào qua is_feature_enabled(key). Hiện tại
+# CHƯA có tính năng nào trong app thật sự bị gate bởi flag (chưa có gì đang "thử nghiệm dở
+# dang" để cần che giấu người dùng) — đây là hạ tầng chuẩn bị sẵn, Developer/Admin tạo & quản
+# lý ngay trong /developer/lab.
+FEATURE_FLAG_STATUSES = ('off', 'internal', 'beta', 'public', 'archived')
+FEATURE_CATEGORIES = ('games', 'ai', 'ui', 'learning', 'teacher', 'developer', 'other')
+FEATURE_ENVIRONMENTS = ('development', 'sandbox', 'staging', 'production')
+FEATURE_ROLLOUT_STEPS = (1, 5, 10, 25, 50, 75, 100)
+
+
+def _feature_rollout_bucket(key, user_id):
+    """Gán 1 người dùng vào nhóm 0-99 CỐ ĐỊNH cho 1 flag cụ thể — dùng hash ổn định (không
+    phải random() mỗi lần gọi) để CÙNG 1 người dùng luôn nhận CÙNG 1 kết quả cho rollout %,
+    không bị 'nhấp nháy' bật/tắt qua lại giữa các lần tải trang."""
+    digest = hashlib.sha256(f"{key}:{user_id}".encode('utf-8')).hexdigest()
+    return int(digest[:8], 16) % 100
+
+
+def is_feature_enabled(key, user=None):
+    """off/archived: tắt hẳn cho tất cả, kể cả Developer (đóng dứt điểm, không cần xoá flag).
+    internal: chỉ Developer trở lên. beta: Developer trở lên LUÔN thấy (để test); người dùng
+    thường được thấy theo đúng % rollout, gán CỐ ĐỊNH theo tài khoản (xem
+    _feature_rollout_bucket). public: bật cho mọi người. Flag chưa tồn tại -> False (an toàn
+    mặc định). Nếu flag có phụ thuộc (depends_on) mà phụ thuộc đó KHÔNG bật cho chính người
+    dùng này thì flag này cũng không thể bật, dù trạng thái riêng của nó là gì."""
+    db = get_db()
+    row = db.execute('SELECT * FROM feature_flags WHERE key = ?', (key,)).fetchone()
+    if not row:
+        return False
+
+    u = user if user is not None else current_user()
+    is_dev_plus = bool(u) and role_rank(u['role']) >= role_rank('developer')
+
+    status = row['status']
+    if status in ('off', 'archived'):
+        return False
+
+    if status == 'internal':
+        result = is_dev_plus
+    elif status == 'beta':
+        if is_dev_plus:
+            result = True
+        elif not u:
+            result = False
+        else:
+            result = _feature_rollout_bucket(key, u['id']) < max(0, min(100, row['rollout_pct']))
+    elif status == 'public':
+        result = True
+    else:
+        result = False
+
+    if not result:
+        return False
+
+    deps = [d.strip() for d in (row['depends_on'] or '').split(',') if d.strip()]
+    for dep_key in deps:
+        if not is_feature_enabled(dep_key, u):
+            return False
+
+    return True
 
 
 # ==========================================
@@ -1896,7 +2014,7 @@ HTML = r'''
         <i class="fas fa-plus"></i> <span data-i18n="new_chat">Đoạn chat mới</span>
       </button>
       <button id="openFlashcardsBtn" class="w-full flex items-center gap-2 px-3 py-2.5 rounded-xl border border-gray-300 dark:border-gray-700 hover:bg-gray-100 dark:hover:bg-gray-800 font-medium text-sm transition-colors">
-        <i class="fas fa-layer-group text-purple-500"></i> <span>Thẻ ghi nhớ &amp; Trò chơi</span>
+        <i class="fas fa-layer-group text-purple-500"></i> <span data-i18n="flashcards_games_btn">Thẻ ghi nhớ &amp; Trò chơi</span>
       </button>
       <div class="relative">
         <i class="fas fa-magnifying-glass absolute left-3 top-1/2 -translate-y-1/2 text-gray-400 text-xs"></i>
@@ -1933,8 +2051,8 @@ HTML = r'''
     <div id="gamifyWidget" class="hidden px-3 pb-2">
       <div class="rounded-xl bg-gray-50 dark:bg-gray-900 border border-gray-100 dark:border-gray-800 px-3 py-2.5">
         <div class="flex items-center justify-between text-xs mb-1.5">
-          <span class="flex items-center gap-1 font-semibold text-orange-500"><i class="fas fa-fire"></i> <span id="gamifyStreak">0</span> ngày</span>
-          <span class="text-gray-400">Cấp <span id="gamifyLevel" class="font-semibold text-gray-600 dark:text-gray-300">1</span></span>
+          <span class="flex items-center gap-1 font-semibold text-orange-500"><i class="fas fa-fire"></i> <span id="gamifyStreak">0</span> <span data-i18n="streak_days_suffix">ngày</span></span>
+          <span class="text-gray-400"><span data-i18n="level_prefix">Cấp</span> <span id="gamifyLevel" class="font-semibold text-gray-600 dark:text-gray-300">1</span></span>
         </div>
         <div class="gamify-xp-track"><div id="gamifyXpBar" class="gamify-xp-fill" style="width: 0%;"></div></div>
         <p id="gamifyXpText" class="text-[10px] text-gray-400 mt-1 text-right">0/100 XP</p>
@@ -1987,29 +2105,29 @@ HTML = r'''
       </button>
 
       <select id="subject" class="text-sm font-medium bg-gray-100 dark:bg-gray-800 border-0 rounded-full pl-4 pr-8 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500 cursor-pointer dark:text-white">
-        <option value="Toán">📐 Toán Học</option>
-        <option value="Ngữ Văn">📖 Ngữ Văn</option>
-        <option value="Tiếng Anh">🇬🇧 Tiếng Anh</option>
-        <option value="Vật Lý">⚛️ Vật Lý</option>
-        <option value="Hóa Học">🧪 Hóa Học</option>
-        <option value="Sinh Học">🌱 Sinh Học</option>
-        <option value="Lịch sử & Địa lý">🌍 Lịch sử & Địa lý</option>
-        <option value="Tin Học">💻 Tin Học</option>
+        <option value="Toán" data-i18n="subj_toan">📐 Toán Học</option>
+        <option value="Ngữ Văn" data-i18n="subj_van">📖 Ngữ Văn</option>
+        <option value="Tiếng Anh" data-i18n="subj_anh">🇬🇧 Tiếng Anh</option>
+        <option value="Vật Lý" data-i18n="subj_ly">⚛️ Vật Lý</option>
+        <option value="Hóa Học" data-i18n="subj_hoa">🧪 Hóa Học</option>
+        <option value="Sinh Học" data-i18n="subj_sinh">🌱 Sinh Học</option>
+        <option value="Lịch sử & Địa lý" data-i18n="subj_sudia">🌍 Lịch sử & Địa lý</option>
+        <option value="Tin Học" data-i18n="subj_tin">💻 Tin Học</option>
       </select>
 
       <select id="modeSelect" class="text-sm font-medium bg-gray-100 dark:bg-gray-800 border-0 rounded-full pl-4 pr-8 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500 cursor-pointer dark:text-white">
-        <option value="Giải thích">📘 Giải Thích Dễ Hiểu</option>
-        <option value="Gợi ý">💡 Gợi Ý Từng Bước</option>
-        <option value="Kiểm tra bài làm">✅ Kiểm Tra Bài Làm</option>
-        <option value="Luyện tập">📝 Ra Bài Luyện Tập</option>
-        <option value="Ôn tập">🔄 Tổng Hợp Ôn Tập</option>
+        <option value="Giải thích" data-i18n="mode_giaithich">📘 Giải Thích Dễ Hiểu</option>
+        <option value="Gợi ý" data-i18n="mode_goiy">💡 Gợi Ý Từng Bước</option>
+        <option value="Kiểm tra bài làm" data-i18n="mode_kiemtra">✅ Kiểm Tra Bài Làm</option>
+        <option value="Luyện tập" data-i18n="mode_luyentap">📝 Ra Bài Luyện Tập</option>
+        <option value="Ôn tập" data-i18n="mode_ontap">🔄 Tổng Hợp Ôn Tập</option>
       </select>
 
       <div class="relative">
-        <button id="thinkingModeBtn" type="button" title="Chế độ suy nghĩ của AI"
+        <button id="thinkingModeBtn" type="button" data-i18n-title="think_tooltip" title="Chế độ suy nghĩ của AI"
           class="text-sm font-medium bg-gray-100 dark:bg-gray-800 border-0 rounded-full pl-3.5 pr-2.5 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500 cursor-pointer dark:text-white flex items-center gap-1.5">
           <span id="thinkingModeIcon">💬</span>
-          <span id="thinkingModeLabel">Trợ Lý</span>
+          <span id="thinkingModeLabel" data-i18n="think_standard_label">Trợ Lý</span>
           <i class="fas fa-chevron-down text-[10px] text-gray-400"></i>
         </button>
         <div id="thinkingModeMenu" class="hidden absolute left-0 top-full mt-1.5 z-30 w-72 bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-xl shadow-lg overflow-hidden">
@@ -2021,14 +2139,14 @@ HTML = r'''
             <span class="text-base leading-5">{{ tm.icon }}</span>
             <span class="flex-1 min-w-0">
               <span class="font-medium flex items-center gap-1.5 flex-wrap">
-                {{ tm.label }}
+                <span data-i18n="think_{{ key }}_label">{{ tm.label }}</span>
                 {% if not unlocked %}
                 <span class="text-[10px] font-semibold px-1.5 py-0.5 rounded-full {{ plan_meta[tm.min_plan].badge }}">
                   <i class="fas fa-lock text-[9px] mr-0.5"></i>{{ plan_meta[tm.min_plan].label }}
                 </span>
                 {% endif %}
               </span>
-              <span class="block text-xs text-gray-400 mt-0.5 leading-snug">{{ tm.desc }}</span>
+              <span class="block text-xs text-gray-400 mt-0.5 leading-snug" data-i18n="think_{{ key }}_desc">{{ tm.desc }}</span>
             </span>
           </button>
           {% endfor %}
@@ -2037,7 +2155,7 @@ HTML = r'''
 
       <div class="flex-1"></div>
 
-      <button onclick="startVoice()" class="w-9 h-9 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-800 text-gray-600 dark:text-gray-300 flex items-center justify-center" title="Trợ lý giọng nói">
+      <button onclick="startVoice()" data-i18n-title="voice_tooltip" class="w-9 h-9 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-800 text-gray-600 dark:text-gray-300 flex items-center justify-center" title="Trợ lý giọng nói">
         <i class="fas fa-microphone"></i>
       </button>
       <button onclick="toggleTheme()" class="w-9 h-9 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-800 text-gray-600 dark:text-gray-300 flex items-center justify-center" title="Đổi giao diện">
@@ -2068,13 +2186,13 @@ HTML = r'''
           </button>
           <input type="file" id="fileInput" class="hidden" accept="image/*,.pdf,.docx,.txt,.csv">
 
-          <textarea id="messageInput" rows="1" class="flex-1 bg-transparent border-0 focus:outline-none focus:ring-0 resize-none py-2 text-[15px] dark:text-white" placeholder="Nhập câu hỏi... (Enter để gửi, Shift+Enter để xuống dòng)"></textarea>
+          <textarea id="messageInput" rows="1" class="flex-1 bg-transparent border-0 focus:outline-none focus:ring-0 resize-none py-2 text-[15px] dark:text-white" data-i18n-placeholder="message_placeholder" placeholder="Nhập câu hỏi... (Enter để gửi, Shift+Enter để xuống dòng)"></textarea>
 
           <button onclick="sendMessage()" id="sendBtn" class="w-10 h-10 rounded-full bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white flex items-center justify-center flex-shrink-0 transition-colors">
             <i class="fas fa-arrow-up"></i>
           </button>
         </div>
-        <p class="text-center text-xs text-gray-400 dark:text-gray-500 mt-2">StudyMate AI có thể mắc lỗi — em nên kiểm tra lại các thông tin quan trọng nhé.</p>
+        <p class="text-center text-xs text-gray-400 dark:text-gray-500 mt-2" data-i18n="footer_disclaimer">StudyMate AI có thể mắc lỗi — em nên kiểm tra lại các thông tin quan trọng nhé.</p>
       </div>
     </div>
   </div>
@@ -2104,9 +2222,76 @@ HTML = r'''
     <button id="fcTabPlans" onclick="switchFcTab('plans')" class="px-3.5 py-2 text-sm font-medium border-b-2 border-transparent text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 flex items-center gap-1.5 whitespace-nowrap">
       <i class="fas fa-calendar-check"></i> Kế hoạch ôn tập
     </button>
+    <button id="fcTabGames" onclick="switchFcTab('games')" class="px-3.5 py-2 text-sm font-medium border-b-2 border-transparent text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 flex items-center gap-1.5 whitespace-nowrap">
+      <i class="fas fa-gamepad"></i> Trò chơi
+    </button>
   </div>
 
   <div class="flex-1 overflow-y-auto">
+    <!-- ============ Thư viện trò chơi ============ -->
+    <div id="fcGamesListView" class="hidden max-w-3xl mx-auto p-4 lg:p-6">
+      <p class="text-xs text-gray-400 mb-4">Học mà chơi — chơi xong tự động lưu điểm yếu vào Sổ lỗi sai để ôn đúng chỗ.</p>
+      <div class="grid sm:grid-cols-2 gap-4">
+        <div class="rounded-2xl border border-gray-200 dark:border-gray-800 p-5">
+          <p class="text-3xl mb-2">⚡</p>
+          <p class="font-bold">Đố Vui Tính Nhanh</p>
+          <p class="text-xs text-gray-400 mt-1 mb-3">60 giây, trả lời càng nhiều phép tính đúng càng tốt. Kết quả tự phân tích em hay sai phép tính nào.</p>
+          <p class="text-xs text-gray-400 mb-3" id="quickMathBestScore">Điểm cao nhất: —</p>
+          <button onclick="openQuickMathSetup()" class="w-full py-2 rounded-xl bg-amber-500 hover:bg-amber-600 text-white text-sm font-semibold">Chơi ngay</button>
+        </div>
+        <div class="rounded-2xl border border-gray-200 dark:border-gray-800 p-5">
+          <p class="text-3xl mb-2">🧠</p>
+          <p class="font-bold">Lật thẻ ghi nhớ</p>
+          <p class="text-xs text-gray-400 mt-1 mb-3">Tìm cặp thẻ khớp nhau — cần chọn 1 bộ thẻ ghi nhớ có sẵn để chơi.</p>
+          <p class="text-xs text-gray-400 mb-3" id="memoryMatchBestScore">Điểm cao nhất: —</p>
+          <button onclick="switchFcTab('decks')" class="w-full py-2 rounded-xl bg-blue-600 hover:bg-blue-700 text-white text-sm font-semibold">Chọn bộ thẻ để chơi</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- ============ Đố Vui Tính Nhanh: thiết lập ============ -->
+    <div id="fcQuickMathSetupView" class="hidden max-w-md mx-auto p-4 lg:p-6 text-center">
+      <p class="text-4xl mb-3">⚡</p>
+      <p class="font-bold text-lg mb-1">Đố Vui Tính Nhanh</p>
+      <p class="text-sm text-gray-400 mb-5">Trả lời càng nhiều câu đúng càng tốt trong 60 giây!</p>
+      <div class="grid grid-cols-3 gap-2 mb-5">
+        <button class="qm-diff-btn px-3 py-2.5 rounded-xl border-2 border-emerald-500 bg-emerald-50 dark:bg-emerald-900/20 text-sm font-semibold" data-diff="easy">Dễ</button>
+        <button class="qm-diff-btn px-3 py-2.5 rounded-xl border-2 border-gray-200 dark:border-gray-700 text-sm font-semibold" data-diff="medium">Trung bình</button>
+        <button class="qm-diff-btn px-3 py-2.5 rounded-xl border-2 border-gray-200 dark:border-gray-700 text-sm font-semibold" data-diff="hard">Khó</button>
+      </div>
+      <button onclick="startQuickMath()" class="w-full py-3 rounded-xl bg-amber-500 hover:bg-amber-600 text-white font-semibold">Bắt đầu</button>
+    </div>
+
+    <!-- ============ Đố Vui Tính Nhanh: đang chơi ============ -->
+    <div id="fcQuickMathPlayView" class="hidden max-w-md mx-auto p-4 lg:p-6">
+      <div class="flex items-center justify-between mb-4 text-sm">
+        <span>⏱️ <span id="qmTimer">60</span>s</span>
+        <span>⭐ <span id="qmScore">0</span></span>
+        <span>🔥 x<span id="qmCombo">0</span></span>
+      </div>
+      <div class="rounded-2xl border border-gray-200 dark:border-gray-700 p-6 text-center mb-4">
+        <p id="qmQuestion" class="text-3xl font-bold"></p>
+      </div>
+      <div id="qmAnswerGrid" class="grid grid-cols-2 gap-3"></div>
+    </div>
+
+    <!-- ============ Đố Vui Tính Nhanh: kết quả ============ -->
+    <div id="fcQuickMathResultView" class="hidden max-w-md mx-auto p-4 lg:p-6 text-center">
+      <p class="text-4xl mb-2" id="qmResultEmoji">🎉</p>
+      <p class="font-bold text-2xl" id="qmResultScore"></p>
+      <p class="text-sm text-gray-400 mt-1" id="qmResultDetail"></p>
+      <p class="text-sm text-gray-400" id="qmResultXp"></p>
+      <div id="qmWeakTopicsBox" class="hidden mt-4 text-left bg-amber-50 dark:bg-amber-900/10 border border-amber-200 dark:border-amber-900/50 rounded-xl p-4">
+        <p class="text-sm font-semibold text-amber-700 dark:text-amber-400 mb-1"><i class="fas fa-triangle-exclamation mr-1"></i>Hay sai phép tính:</p>
+        <p id="qmWeakTopicsList" class="text-sm text-amber-700 dark:text-amber-400"></p>
+        <p class="text-xs text-amber-600 dark:text-amber-500 mt-1">Đã tự lưu vào Sổ lỗi sai — vào tab "Sổ lỗi sai" để luyện lại nhé!</p>
+      </div>
+      <div class="flex gap-2 justify-center mt-5">
+        <button onclick="openQuickMathSetup()" class="px-4 py-2 rounded-xl bg-amber-500 hover:bg-amber-600 text-white text-sm font-semibold">Chơi lại</button>
+        <button onclick="switchFcTab('games')" class="px-4 py-2 rounded-xl bg-gray-100 dark:bg-gray-800 text-sm font-semibold">Về thư viện</button>
+      </div>
+    </div>
+
     <!-- ============ Quiz ============ -->
     <div id="fcQuizListView" class="hidden max-w-4xl mx-auto p-4 lg:p-6">
       <button onclick="openQuizForm()" class="px-4 py-2.5 rounded-xl bg-gradient-to-r from-blue-600 to-indigo-600 hover:opacity-90 text-white text-sm font-semibold flex items-center gap-2 mb-5">
@@ -2114,6 +2299,7 @@ HTML = r'''
       </button>
 
       <div id="quizForm" class="hidden mb-5 p-4 rounded-2xl border border-blue-200 dark:border-blue-900 bg-blue-50 dark:bg-blue-900/10 space-y-2.5">
+
         <input id="quizTopic" type="text" maxlength="200" placeholder="Chủ đề, vd: Phương trình bậc 2"
           class="w-full px-3 py-2.5 rounded-xl bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 dark:text-white">
         <div class="flex flex-wrap gap-2">
@@ -2393,15 +2579,15 @@ HTML = r'''
         {% endif %}
       </div>
       <div>
-        <label class="text-sm font-semibold block mb-2">Giao diện</label>
+        <label class="text-sm font-semibold block mb-2" data-i18n="settings_appearance">Giao diện</label>
         <div class="grid grid-cols-3 gap-2" id="themeOptions">
-          <button type="button" data-theme="light" class="theme-opt px-3 py-2 rounded-xl border text-sm font-medium">☀️ Sáng</button>
-          <button type="button" data-theme="dark" class="theme-opt px-3 py-2 rounded-xl border text-sm font-medium">🌙 Tối</button>
-          <button type="button" data-theme="system" class="theme-opt px-3 py-2 rounded-xl border text-sm font-medium">💻 Hệ thống</button>
+          <button type="button" data-theme="light" data-i18n="theme_light" class="theme-opt px-3 py-2 rounded-xl border text-sm font-medium">☀️ Sáng</button>
+          <button type="button" data-theme="dark" data-i18n="theme_dark" class="theme-opt px-3 py-2 rounded-xl border text-sm font-medium">🌙 Tối</button>
+          <button type="button" data-theme="system" data-i18n="theme_system" class="theme-opt px-3 py-2 rounded-xl border text-sm font-medium">💻 Hệ thống</button>
         </div>
       </div>
       <div>
-        <label class="text-sm font-semibold block mb-2">Ngôn ngữ / Language</label>
+        <label class="text-sm font-semibold block mb-2" data-i18n="settings_language">Ngôn ngữ / Language</label>
         <select id="languageSelect" class="w-full px-3 py-2.5 rounded-xl bg-gray-100 dark:bg-gray-700 border-0 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 dark:text-white">
           <option value="vi">Tiếng Việt</option>
           <option value="en">English</option>
@@ -2409,39 +2595,39 @@ HTML = r'''
       </div>
       <div class="grid grid-cols-2 gap-3">
         <div>
-          <label class="text-sm font-semibold block mb-2">Môn học mặc định</label>
+          <label class="text-sm font-semibold block mb-2" data-i18n="settings_default_subject">Môn học mặc định</label>
           <select id="defaultSubjectSelect" class="w-full px-3 py-2.5 rounded-xl bg-gray-100 dark:bg-gray-700 border-0 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 dark:text-white">
-            <option value="Toán">Toán Học</option>
-            <option value="Ngữ Văn">Ngữ Văn</option>
-            <option value="Tiếng Anh">Tiếng Anh</option>
-            <option value="Vật Lý">Vật Lý</option>
-            <option value="Hóa Học">Hóa Học</option>
-            <option value="Sinh Học">Sinh Học</option>
-            <option value="Lịch sử & Địa lý">Lịch sử & Địa lý</option>
-            <option value="Tin Học">Tin Học</option>
+            <option value="Toán" data-i18n="subj_toan_plain">Toán Học</option>
+            <option value="Ngữ Văn" data-i18n="subj_van_plain">Ngữ Văn</option>
+            <option value="Tiếng Anh" data-i18n="subj_anh_plain">Tiếng Anh</option>
+            <option value="Vật Lý" data-i18n="subj_ly_plain">Vật Lý</option>
+            <option value="Hóa Học" data-i18n="subj_hoa_plain">Hóa Học</option>
+            <option value="Sinh Học" data-i18n="subj_sinh_plain">Sinh Học</option>
+            <option value="Lịch sử & Địa lý" data-i18n="subj_sudia_plain">Lịch sử & Địa lý</option>
+            <option value="Tin Học" data-i18n="subj_tin_plain">Tin Học</option>
           </select>
         </div>
         <div>
-          <label class="text-sm font-semibold block mb-2">Chế độ mặc định</label>
+          <label class="text-sm font-semibold block mb-2" data-i18n="settings_default_mode">Chế độ mặc định</label>
           <select id="defaultModeSelect" class="w-full px-3 py-2.5 rounded-xl bg-gray-100 dark:bg-gray-700 border-0 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 dark:text-white">
-            <option value="Giải thích">Giải Thích</option>
-            <option value="Gợi ý">Gợi Ý</option>
-            <option value="Kiểm tra bài làm">Kiểm Tra</option>
-            <option value="Luyện tập">Luyện Tập</option>
-            <option value="Ôn tập">Ôn Tập</option>
+            <option value="Giải thích" data-i18n="mode_giaithich_short">Giải Thích</option>
+            <option value="Gợi ý" data-i18n="mode_goiy_short">Gợi Ý</option>
+            <option value="Kiểm tra bài làm" data-i18n="mode_kiemtra_short">Kiểm Tra</option>
+            <option value="Luyện tập" data-i18n="mode_luyentap_short">Luyện Tập</option>
+            <option value="Ôn tập" data-i18n="mode_ontap_short">Ôn Tập</option>
           </select>
         </div>
       </div>
-      <div id="settingsSavedMsg" class="hidden text-sm text-emerald-600 dark:text-emerald-400 flex items-center gap-1"><i class="fas fa-check"></i> Đã lưu</div>
-      <button onclick="savePreferences()" class="w-full bg-blue-600 hover:bg-blue-700 text-white font-semibold py-2.5 rounded-xl transition-colors">Lưu thay đổi</button>
+      <div id="settingsSavedMsg" class="hidden text-sm text-emerald-600 dark:text-emerald-400 flex items-center gap-1"><i class="fas fa-check"></i> <span data-i18n="saved">Đã lưu</span></div>
+      <button onclick="savePreferences()" class="w-full bg-blue-600 hover:bg-blue-700 text-white font-semibold py-2.5 rounded-xl transition-colors" data-i18n="save_changes">Lưu thay đổi</button>
 
       <div class="border-t border-gray-100 dark:border-gray-700 pt-4 space-y-2">
-        <p class="text-xs font-semibold text-red-500 uppercase mb-2">Khu vực nguy hiểm</p>
+        <p class="text-xs font-semibold text-red-500 uppercase mb-2" data-i18n="danger_zone">Khu vực nguy hiểm</p>
         <button onclick="clearAllHistory()" class="w-full bg-red-50 dark:bg-red-900/20 hover:bg-red-100 dark:hover:bg-red-900/40 text-red-600 dark:text-red-400 font-medium py-2.5 rounded-xl text-sm transition-colors">
-          <i class="fas fa-trash mr-1"></i> Xoá toàn bộ lịch sử trò chuyện
+          <i class="fas fa-trash mr-1"></i> <span data-i18n="clear_all_history">Xoá toàn bộ lịch sử trò chuyện</span>
         </button>
         <button onclick="clearMyMemories()" class="w-full bg-purple-50 dark:bg-purple-900/20 hover:bg-purple-100 dark:hover:bg-purple-900/40 text-purple-600 dark:text-purple-400 font-medium py-2.5 rounded-xl text-sm transition-colors">
-          <i class="fas fa-brain mr-1"></i> Xoá bộ nhớ AI của tôi
+          <i class="fas fa-brain mr-1"></i> <span data-i18n="clear_my_memory">Xoá bộ nhớ AI của tôi</span>
         </button>
       </div>
     </div>
@@ -2461,17 +2647,17 @@ HTML = r'''
   <!-- Trợ giúp -->
   <div id="helpModal" class="hidden modal-panel bg-white dark:bg-gray-800 rounded-2xl shadow-2xl w-full max-w-md max-h-[85vh] overflow-y-auto">
     <div class="flex items-center justify-between px-5 py-4 border-b border-gray-100 dark:border-gray-700">
-      <h3 class="font-bold text-lg flex items-center gap-2"><i class="fas fa-circle-question text-gray-400"></i> Trợ giúp &amp; phím tắt</h3>
+      <h3 class="font-bold text-lg flex items-center gap-2"><i class="fas fa-circle-question text-gray-400"></i> <span data-i18n="help_title">Trợ giúp &amp; phím tắt</span></h3>
       <button onclick="closeAllModals()" class="w-8 h-8 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 flex items-center justify-center"><i class="fas fa-xmark"></i></button>
     </div>
     <div class="p-5 space-y-5 text-sm">
       <div>
-        <p class="font-semibold mb-2">Phím tắt</p>
+        <p class="font-semibold mb-2" data-i18n="shortcuts_title">Phím tắt</p>
         <div class="space-y-1.5">
-          <div class="flex justify-between"><span class="text-gray-500">Gửi câu hỏi</span><kbd class="px-2 py-0.5 bg-gray-100 dark:bg-gray-700 rounded text-xs font-mono">Enter</kbd></div>
-          <div class="flex justify-between"><span class="text-gray-500">Xuống dòng</span><kbd class="px-2 py-0.5 bg-gray-100 dark:bg-gray-700 rounded text-xs font-mono">Shift + Enter</kbd></div>
-          <div class="flex justify-between"><span class="text-gray-500">Bảng lệnh nhanh (đổi tên đăng nhập, tạo quiz...)</span><kbd class="px-2 py-0.5 bg-gray-100 dark:bg-gray-700 rounded text-xs font-mono">Ctrl/⌘ + K</kbd></div>
-          <div class="flex justify-between"><span class="text-gray-500">Mở trợ giúp</span><kbd class="px-2 py-0.5 bg-gray-100 dark:bg-gray-700 rounded text-xs font-mono">Ctrl/⌘ + /</kbd></div>
+          <div class="flex justify-between"><span class="text-gray-500" data-i18n="send_question">Gửi câu hỏi</span><kbd class="px-2 py-0.5 bg-gray-100 dark:bg-gray-700 rounded text-xs font-mono">Enter</kbd></div>
+          <div class="flex justify-between"><span class="text-gray-500" data-i18n="new_line">Xuống dòng</span><kbd class="px-2 py-0.5 bg-gray-100 dark:bg-gray-700 rounded text-xs font-mono">Shift + Enter</kbd></div>
+          <div class="flex justify-between"><span class="text-gray-500" data-i18n="command_palette">Bảng lệnh nhanh (đổi tên đăng nhập, tạo quiz...)</span><kbd class="px-2 py-0.5 bg-gray-100 dark:bg-gray-700 rounded text-xs font-mono">Ctrl/⌘ + K</kbd></div>
+          <div class="flex justify-between"><span class="text-gray-500" data-i18n="open_help">Mở trợ giúp</span><kbd class="px-2 py-0.5 bg-gray-100 dark:bg-gray-700 rounded text-xs font-mono">Ctrl/⌘ + /</kbd></div>
         </div>
       </div>
       <div>
@@ -3020,12 +3206,66 @@ const I18N = {
   vi: {
     new_chat: 'Đoạn chat mới', search_placeholder: 'Tìm đoạn chat...', projects: 'Dự án',
     pinned: 'Đã ghim', recents: 'Gần đây', settings: 'Cài đặt', help: 'Trợ giúp & phím tắt',
-    upgrade: 'Nâng cấp gói', logout: 'Đăng xuất'
+    upgrade: 'Nâng cấp gói', logout: 'Đăng xuất',
+    flashcards_games_btn: 'Thẻ ghi nhớ & Trò chơi',
+    no_chats_yet: 'Chưa có đoạn chat nào',
+    streak_days_suffix: 'ngày', level_prefix: 'Cấp',
+    message_placeholder: 'Nhập câu hỏi... (Enter để gửi, Shift+Enter để xuống dòng)',
+    footer_disclaimer: 'StudyMate AI có thể mắc lỗi — em nên kiểm tra lại các thông tin quan trọng nhé.',
+    subj_toan: '📐 Toán Học', subj_van: '📖 Ngữ Văn', subj_anh: '🇬🇧 Tiếng Anh', subj_ly: '⚛️ Vật Lý',
+    subj_hoa: '🧪 Hóa Học', subj_sinh: '🌱 Sinh Học', subj_sudia: '🌍 Lịch sử & Địa lý', subj_tin: '💻 Tin Học',
+    subj_toan_plain: 'Toán Học', subj_van_plain: 'Ngữ Văn', subj_anh_plain: 'Tiếng Anh', subj_ly_plain: 'Vật Lý',
+    subj_hoa_plain: 'Hóa Học', subj_sinh_plain: 'Sinh Học', subj_sudia_plain: 'Lịch sử & Địa lý', subj_tin_plain: 'Tin Học',
+    mode_giaithich: '📘 Giải Thích Dễ Hiểu', mode_goiy: '💡 Gợi Ý Từng Bước', mode_kiemtra: '✅ Kiểm Tra Bài Làm',
+    mode_luyentap: '📝 Ra Bài Luyện Tập', mode_ontap: '🔄 Tổng Hợp Ôn Tập',
+    mode_giaithich_short: 'Giải Thích', mode_goiy_short: 'Gợi Ý', mode_kiemtra_short: 'Kiểm Tra',
+    mode_luyentap_short: 'Luyện Tập', mode_ontap_short: 'Ôn Tập',
+    think_tooltip: 'Chế độ suy nghĩ của AI',
+    think_standard_label: 'Trợ Lý', think_standard_desc: 'Nhanh, cân bằng, phù hợp câu hỏi thường ngày.',
+    think_scholar_label: 'Học Giả', think_scholar_desc: 'Suy luận từng bước kỹ hơn trước khi chốt đáp án.',
+    think_professor_label: 'Giáo Sư', think_professor_desc: 'Giải thích mở rộng — nhiều ví dụ, liên hệ thực tế.',
+    think_genius_label: 'Thiên Tài', think_genius_desc: 'Kết hợp suy luận sâu lẫn giải thích mở rộng — mạnh nhất.',
+    voice_tooltip: 'Trợ lý giọng nói', theme_tooltip: 'Đổi giao diện',
+    settings_appearance: 'Giao diện', theme_light: '☀️ Sáng', theme_dark: '🌙 Tối', theme_system: '💻 Hệ thống',
+    settings_language: 'Ngôn ngữ / Language',
+    settings_default_subject: 'Môn học mặc định', settings_default_mode: 'Chế độ mặc định',
+    save_changes: 'Lưu thay đổi', saved: 'Đã lưu',
+    danger_zone: 'Khu vực nguy hiểm', clear_all_history: 'Xoá toàn bộ lịch sử trò chuyện',
+    clear_my_memory: 'Xoá bộ nhớ AI của tôi',
+    help_title: 'Trợ giúp & phím tắt', shortcuts_title: 'Phím tắt',
+    send_question: 'Gửi câu hỏi', new_line: 'Xuống dòng', command_palette: 'Bảng lệnh nhanh (đổi tên đăng nhập, tạo quiz...)', open_help: 'Mở trợ giúp',
   },
   en: {
     new_chat: 'New chat', search_placeholder: 'Search chats...', projects: 'Projects',
     pinned: 'Pinned', recents: 'Recents', settings: 'Settings', help: 'Help & shortcuts',
-    upgrade: 'Upgrade plan', logout: 'Log out'
+    upgrade: 'Upgrade plan', logout: 'Log out',
+    flashcards_games_btn: 'Memory Cards & Games',
+    no_chats_yet: 'No chat logs yet.',
+    streak_days_suffix: 'day', level_prefix: 'Level',
+    message_placeholder: 'Enter your question... (Press Enter to submit, Shift+Enter for a new line)',
+    footer_disclaimer: 'StudyMate AI may make mistakes — you should double-check important information.',
+    subj_toan: '📐 Mathematics', subj_van: '📖 Literature', subj_anh: '🇬🇧 English', subj_ly: '⚛️ Physics',
+    subj_hoa: '🧪 Chemistry', subj_sinh: '🌱 Biology', subj_sudia: '🌍 History & Geography', subj_tin: '💻 Computer Science',
+    subj_toan_plain: 'Mathematics', subj_van_plain: 'Literature', subj_anh_plain: 'English', subj_ly_plain: 'Physics',
+    subj_hoa_plain: 'Chemistry', subj_sinh_plain: 'Biology', subj_sudia_plain: 'History & Geography', subj_tin_plain: 'Computer Science',
+    mode_giaithich: '📘 Easy-to-Understand Explanation', mode_goiy: '💡 Step-by-Step Hints', mode_kiemtra: '✅ Check My Work',
+    mode_luyentap: '📝 Practice Questions', mode_ontap: '🔄 Review Summary',
+    mode_giaithich_short: 'Explain', mode_goiy_short: 'Hints', mode_kiemtra_short: 'Check',
+    mode_luyentap_short: 'Practice', mode_ontap_short: 'Review',
+    think_tooltip: "AI's thinking mode",
+    think_standard_label: 'Assistant', think_standard_desc: 'Fast and balanced, good for everyday questions.',
+    think_scholar_label: 'Scholar', think_scholar_desc: 'More careful step-by-step reasoning before answering.',
+    think_professor_label: 'Professor', think_professor_desc: 'Extended explanations — more examples, real-world links.',
+    think_genius_label: 'Genius', think_genius_desc: 'Combines deep reasoning and extended explanation — the strongest.',
+    voice_tooltip: 'Voice assistant', theme_tooltip: 'Toggle theme',
+    settings_appearance: 'Appearance', theme_light: '☀️ Light', theme_dark: '🌙 Dark', theme_system: '💻 System',
+    settings_language: 'Ngôn ngữ / Language',
+    settings_default_subject: 'Default subject', settings_default_mode: 'Default mode',
+    save_changes: 'Save changes', saved: 'Saved',
+    danger_zone: 'Danger zone', clear_all_history: 'Clear all chat history',
+    clear_my_memory: 'Clear my AI memory',
+    help_title: 'Help & shortcuts', shortcuts_title: 'Keyboard shortcuts',
+    send_question: 'Send message', new_line: 'New line', command_palette: 'Command palette (rename, create quiz...)', open_help: 'Open help',
   }
 };
 function applyLanguage(lang) {
@@ -3038,6 +3278,15 @@ function applyLanguage(lang) {
     const key = el.getAttribute('data-i18n-placeholder');
     if (dict[key]) el.placeholder = dict[key];
   });
+  document.querySelectorAll('[data-i18n-title]').forEach(el => {
+    const key = el.getAttribute('data-i18n-title');
+    if (dict[key]) el.title = dict[key];
+  });
+  // Nhãn "chế độ suy nghĩ" đang chọn (không có data-i18n cố định vì đổi theo lựa chọn của
+  // học sinh) — dùng biến currentThinkingMode để đổi nhãn hiển thị theo ngôn ngữ mới.
+  if (typeof currentThinkingMode !== 'undefined' && dict[`think_${currentThinkingMode}_label`]) {
+    document.getElementById('thinkingModeLabel').textContent = dict[`think_${currentThinkingMode}_label`];
+  }
 }
 
 // ---------- Giao diện (theme: sáng / tối / theo hệ thống) ----------
@@ -3538,7 +3787,11 @@ function handleGamifyEvent(g) {
 }
 
 function showWelcome() {
-  addMessage('ai', `👋 Chào em! Thầy/Cô là **${APP_NAME}**.\n\nEm chọn **Môn học** và **Chế độ** ở phía trên, gõ câu hỏi rồi bấm Enter (hoặc nút gửi) nhé! Em cũng có thể đính kèm file (PDF/Word/txt/csv) hoặc ảnh bằng nút 📎, hay kéo-thả trực tiếp vào khung chat. 🚀`, true);
+  const lang = (currentPreferences && currentPreferences.language) || 'vi';
+  const msg = lang === 'en'
+    ? `👋 Hi! I'm **${APP_NAME}**.\n\nPick your **Subject** and **Mode** at the top, type your question, then press Enter (or the send button)! You can also attach a file (PDF/Word/txt/csv) or image with the 📎 button, or drag and drop it straight into the chat. 🚀`
+    : `👋 Chào em! Thầy/Cô là **${APP_NAME}**.\n\nEm chọn **Môn học** và **Chế độ** ở phía trên, gõ câu hỏi rồi bấm Enter (hoặc nút gửi) nhé! Em cũng có thể đính kèm file (PDF/Word/txt/csv) hoặc ảnh bằng nút 📎, hay kéo-thả trực tiếp vào khung chat. 🚀`;
+  addMessage('ai', msg, true);
 }
 
 // ---------- Lịch sử hội thoại (theo tài khoản) + Dự án + Ghim + Tìm kiếm ----------
@@ -3627,7 +3880,8 @@ function renderSidebarLists() {
   } else {
     pinnedSection.classList.add('hidden');
   }
-  renderConvGroup('convList', recent, recent.length ? null : 'Chưa có đoạn chat nào');
+  const lang = (currentPreferences && currentPreferences.language) || 'vi';
+  renderConvGroup('convList', recent, recent.length ? null : I18N[lang].no_chats_yet);
 }
 
 function renderConvGroup(containerId, list, emptyText) {
@@ -3790,7 +4044,7 @@ function closeFlashcards() {
 }
 document.getElementById('openFlashcardsBtn').addEventListener('click', openFlashcards);
 
-const FC_TABS = ['decks', 'mistakes', 'quiz', 'plans'];
+const FC_TABS = ['decks', 'mistakes', 'quiz', 'plans', 'games'];
 function switchFcTab(tab) {
   FC_TABS.forEach(t => {
     const btn = document.getElementById('fcTab' + t.charAt(0).toUpperCase() + t.slice(1));
@@ -3806,6 +4060,7 @@ function switchFcTab(tab) {
   else if (tab === 'mistakes') { showFcView('mistakes'); loadMistakes(); }
   else if (tab === 'quiz') { showFcView('quizList'); loadQuizzes(); }
   else if (tab === 'plans') { showFcView('plansList'); loadStudyPlans(); }
+  else if (tab === 'games') { showFcView('gamesList'); loadGameStats(); }
 }
 
 const FC_VIEWS = {
@@ -3813,8 +4068,9 @@ const FC_VIEWS = {
   study: 'fcStudyView', game: 'fcGameView',
   quizList: 'fcQuizListView', quizTake: 'fcQuizTakeView', quizResult: 'fcQuizResultView',
   plansList: 'fcPlansListView', planDetail: 'fcPlanDetailView',
+  gamesList: 'fcGamesListView', qmSetup: 'fcQuickMathSetupView', qmPlay: 'fcQuickMathPlayView', qmResult: 'fcQuickMathResultView',
 };
-const FC_TOP_LEVEL_VIEWS = ['list', 'mistakes', 'quizList', 'plansList'];
+const FC_TOP_LEVEL_VIEWS = ['list', 'mistakes', 'quizList', 'plansList', 'gamesList'];
 
 function showFcView(view) {
   Object.values(FC_VIEWS).forEach(id => document.getElementById(id).classList.add('hidden'));
@@ -3845,6 +4101,9 @@ function showFcView(view) {
   } else if (view === 'planDetail') {
     title.textContent = 'Chi tiết kế hoạch';
     backBtn.onclick = () => switchFcTab('plans');
+  } else if (view === 'qmSetup' || view === 'qmPlay' || view === 'qmResult') {
+    title.textContent = 'Đố Vui Tính Nhanh';
+    backBtn.onclick = () => { stopQuickMathTimer(); switchFcTab('games'); };
 
   }
 }
@@ -4261,6 +4520,161 @@ async function finishMemoryGame() {
     });
     const data = await res.json();
     document.getElementById('gameXpText').textContent = data.xpAwarded ? `+${data.xpAwarded} XP 🎉` : '';
+    if (data.gamify) handleGamifyEvent(data.gamify);
+  } catch (e) { /* im lặng bỏ qua lỗi mạng */ }
+}
+
+// ==================================================================
+// ĐỐ VUI TÍNH NHANH (Quick Math)
+// ==================================================================
+const QM_OP_LABELS = { '+': 'Phép cộng', '-': 'Phép trừ', '×': 'Phép nhân', '÷': 'Phép chia' };
+let qmState = null;
+let qmTimerHandle = null;
+let qmSelectedDifficulty = 'easy';
+
+async function loadGameStats() {
+  try {
+    const res = await fetch('/api/games/stats');
+    if (!res.ok) return;
+    const stats = await res.json();
+    document.getElementById('quickMathBestScore').textContent =
+      stats.quick_math ? `Điểm cao nhất: ${stats.quick_math.bestScore} (${stats.quick_math.playCount} lượt chơi)` : 'Điểm cao nhất: — (chưa chơi lần nào)';
+    document.getElementById('memoryMatchBestScore').textContent =
+      stats.memory_match ? `Điểm cao nhất: ${stats.memory_match.bestScore} (${stats.memory_match.playCount} lượt chơi)` : 'Điểm cao nhất: — (chưa chơi lần nào)';
+  } catch (e) { /* im lặng bỏ qua lỗi mạng */ }
+}
+
+function openQuickMathSetup() {
+  showFcView('qmSetup');
+  document.querySelectorAll('.qm-diff-btn').forEach(btn => {
+    btn.classList.toggle('border-emerald-500', btn.dataset.diff === qmSelectedDifficulty);
+    btn.classList.toggle('bg-emerald-50', btn.dataset.diff === qmSelectedDifficulty);
+    btn.classList.toggle('dark:bg-emerald-900/20', btn.dataset.diff === qmSelectedDifficulty);
+    btn.classList.toggle('border-gray-200', btn.dataset.diff !== qmSelectedDifficulty);
+    btn.classList.toggle('dark:border-gray-700', btn.dataset.diff !== qmSelectedDifficulty);
+  });
+}
+document.querySelectorAll('.qm-diff-btn').forEach(btn => {
+  btn.addEventListener('click', () => { qmSelectedDifficulty = btn.dataset.diff; openQuickMathSetup(); });
+});
+
+function qmRandInt(min, max) { return Math.floor(Math.random() * (max - min + 1)) + min; }
+
+function generateQmQuestion(difficulty) {
+  const ranges = {
+    easy:   { max: 10, ops: ['+', '-'] },
+    medium: { max: 20, ops: ['+', '-', '×'] },
+    hard:   { max: 50, ops: ['+', '-', '×', '÷'] },
+  }[difficulty];
+
+  const op = ranges.ops[qmRandInt(0, ranges.ops.length - 1)];
+  let a, b, answer;
+  if (op === '+') { a = qmRandInt(1, ranges.max); b = qmRandInt(1, ranges.max); answer = a + b; }
+  else if (op === '-') { a = qmRandInt(1, ranges.max); b = qmRandInt(1, a); answer = a - b; }
+  else if (op === '×') { a = qmRandInt(2, Math.min(12, ranges.max)); b = qmRandInt(2, 12); answer = a * b; }
+  else { b = qmRandInt(2, 12); answer = qmRandInt(2, 12); a = b * answer; }  // chia hết, không có số dư
+
+  const options = new Set([answer]);
+  while (options.size < 4) {
+    const delta = qmRandInt(-5, 5) || 1;
+    const wrong = answer + delta;
+    if (wrong >= 0) options.add(wrong);
+  }
+  const optionsArr = Array.from(options).sort(() => Math.random() - 0.5);
+  return { text: `${a} ${op} ${b}`, answer, options: optionsArr, opLabel: QM_OP_LABELS[op] };
+}
+
+function startQuickMath() {
+  qmState = {
+    difficulty: qmSelectedDifficulty, score: 0, correctCount: 0, totalCount: 0,
+    combo: 0, bestCombo: 0, wrongOperations: [], current: null, seconds: 60,
+  };
+  document.getElementById('qmScore').textContent = '0';
+  document.getElementById('qmCombo').textContent = '0';
+  document.getElementById('qmTimer').textContent = '60';
+  showFcView('qmPlay');
+  nextQmQuestion();
+
+  stopQuickMathTimer();
+  qmTimerHandle = setInterval(() => {
+    qmState.seconds--;
+    document.getElementById('qmTimer').textContent = qmState.seconds;
+    if (qmState.seconds <= 0) finishQuickMath();
+  }, 1000);
+}
+
+function stopQuickMathTimer() {
+  if (qmTimerHandle) { clearInterval(qmTimerHandle); qmTimerHandle = null; }
+}
+
+function nextQmQuestion() {
+  const q = generateQmQuestion(qmState.difficulty);
+  qmState.current = q;
+  document.getElementById('qmQuestion').textContent = q.text + ' = ?';
+  const grid = document.getElementById('qmAnswerGrid');
+  grid.innerHTML = '';
+  q.options.forEach(opt => {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'py-3 rounded-xl bg-gray-100 dark:bg-gray-800 hover:bg-gray-200 dark:hover:bg-gray-700 font-semibold text-lg';
+    btn.textContent = opt;
+    btn.addEventListener('click', () => answerQmQuestion(opt, btn));
+    grid.appendChild(btn);
+  });
+}
+
+function answerQmQuestion(selected, btn) {
+  if (!qmState || qmState.seconds <= 0) return;
+  const q = qmState.current;
+  qmState.totalCount++;
+  const correct = selected === q.answer;
+
+  if (correct) {
+    qmState.correctCount++;
+    qmState.combo++;
+    qmState.bestCombo = Math.max(qmState.bestCombo, qmState.combo);
+    qmState.score += 10 + qmState.combo * 2;
+    btn.classList.add('bg-emerald-500', 'text-white');
+  } else {
+    qmState.combo = 0;
+    qmState.wrongOperations.push(q.opLabel);
+    btn.classList.add('bg-red-500', 'text-white');
+  }
+  document.getElementById('qmScore').textContent = qmState.score;
+  document.getElementById('qmCombo').textContent = qmState.combo;
+
+  setTimeout(() => { if (qmState && qmState.seconds > 0) nextQmQuestion(); }, 250);
+}
+
+async function finishQuickMath() {
+  stopQuickMathTimer();
+  if (!qmState) return;
+  const state = qmState;
+  qmState = null;
+  showFcView('qmResult');
+
+  const accuracy = state.totalCount ? Math.round((state.correctCount / state.totalCount) * 100) : 0;
+  document.getElementById('qmResultEmoji').textContent = accuracy === 100 && state.totalCount >= 10 ? '💯' : accuracy >= 70 ? '🎉' : accuracy >= 40 ? '👍' : '💪';
+  document.getElementById('qmResultScore').textContent = `${state.score} điểm`;
+  document.getElementById('qmResultDetail').textContent = `${state.correctCount}/${state.totalCount} câu đúng (${accuracy}%) · Combo tốt nhất x${state.bestCombo}`;
+
+  try {
+    const res = await fetch('/api/games/quick-math/submit', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        difficulty: state.difficulty, score: state.score, correctCount: state.correctCount,
+        totalCount: state.totalCount, bestCombo: state.bestCombo, wrongOperations: state.wrongOperations,
+      })
+    });
+    const data = await res.json();
+    document.getElementById('qmResultXp').textContent = data.xpAwarded ? `+${data.xpAwarded} XP 🎉` : '';
+    const weakBox = document.getElementById('qmWeakTopicsBox');
+    if (data.weakTopics && data.weakTopics.length) {
+      weakBox.classList.remove('hidden');
+      document.getElementById('qmWeakTopicsList').textContent = data.weakTopics.join(', ');
+    } else {
+      weakBox.classList.add('hidden');
+    }
     if (data.gamify) handleGamifyEvent(data.gamify);
   } catch (e) { /* im lặng bỏ qua lỗi mạng */ }
 }
@@ -4898,9 +5312,9 @@ chatPanel.addEventListener('drop', (e) => {
   }
 });
 
-window.onload = () => {
+window.onload = async () => {
+  await loadPreferences();
   showWelcome();
-  loadPreferences();
   loadProjects();
   loadConversations();
   loadBanner();
@@ -5264,6 +5678,9 @@ DEV_STATS_HTML = r'''
       <button onclick="document.documentElement.classList.toggle('dark')" class="w-9 h-9 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-800 flex items-center justify-center text-gray-500 dark:text-gray-300">
         <i class="fas fa-moon"></i>
       </button>
+      <a href="{{ url_for('developer_lab') }}" class="text-sm font-semibold px-3.5 py-2 rounded-xl bg-pink-50 dark:bg-pink-900/30 text-pink-600 dark:text-pink-400 hover:bg-pink-100 dark:hover:bg-pink-900/50 whitespace-nowrap">
+        <i class="fas fa-flask mr-1"></i> Dev Lab
+      </a>
       <a href="{{ url_for('home') }}" class="text-sm font-semibold px-3.5 py-2 rounded-xl bg-gray-100 dark:bg-gray-800 hover:bg-gray-200 dark:hover:bg-gray-700 whitespace-nowrap">
         <i class="fas fa-arrow-left mr-1"></i> Về trang chat
       </a>
@@ -6660,6 +7077,477 @@ AUDIT_LOG_HTML = r'''
 '''
 
 
+DEV_LAB_HTML = r'''
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>StudyMate Lab - StudyMate AI Max</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>tailwind.config = { darkMode: 'class' };</script>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.6.0/css/all.min.css">
+</head>
+<body class="bg-[#0f0f0f] text-gray-200 min-h-screen">
+  <nav class="sticky top-0 z-10 bg-[#0f0f0f]/90 backdrop-blur border-b border-gray-800 px-4 sm:px-6 py-3 flex items-center justify-between">
+    <div class="flex items-center gap-2 font-bold"><i class="fas fa-flask text-pink-400"></i> 🧪 StudyMate Lab</div>
+    <a href="/developer" class="text-sm text-indigo-400 hover:underline"><i class="fas fa-arrow-left mr-1"></i>Về Dashboard</a>
+  </nav>
+  <main class="max-w-5xl mx-auto px-4 sm:px-6 py-6 space-y-6">
+    {% with messages = get_flashed_messages() %}
+      {% if messages %}
+        <div class="space-y-2">
+          {% for m in messages %}
+          <div class="text-sm text-emerald-300 bg-emerald-900/30 border border-emerald-800 rounded-xl px-4 py-2.5">{{ m }}</div>
+          {% endfor %}
+        </div>
+      {% endif %}
+    {% endwith %}
+
+    <div>
+      <h1 class="text-xl font-bold flex items-center gap-2"><i class="fas fa-toggle-on text-pink-400"></i> Feature Flags</h1>
+      <p class="text-sm text-gray-500 mt-1">Đăng ký, thử nghiệm, và tăng dần tỉ lệ ra mắt tính năng mới một cách an toàn — không cần sửa code hay khởi động lại server.</p>
+    </div>
+
+    <!-- Đăng ký tính năng mới -->
+    <div class="bg-[#1a1a1a] rounded-2xl border border-gray-800 p-5">
+      <h2 class="font-bold mb-3 flex items-center gap-2 text-sm"><i class="fas fa-plus text-pink-400"></i> Đăng ký tính năng mới</h2>
+      <form method="POST" action="{{ url_for('developer_lab_create_flag') }}" class="grid sm:grid-cols-2 gap-2.5">
+        <input name="key" required maxlength="60" placeholder="feature.key (vd: game.snake_quiz)"
+          class="px-3 py-2 rounded-lg bg-[#0f0f0f] border border-gray-700 text-sm focus:outline-none focus:ring-2 focus:ring-pink-500 font-mono">
+        <input name="name" maxlength="80" placeholder="Tên hiển thị (vd: Snake Quiz)"
+          class="px-3 py-2 rounded-lg bg-[#0f0f0f] border border-gray-700 text-sm focus:outline-none focus:ring-2 focus:ring-pink-500">
+        <select name="category" class="px-3 py-2 rounded-lg bg-[#0f0f0f] border border-gray-700 text-sm focus:outline-none focus:ring-2 focus:ring-pink-500">
+          {% for c in categories %}<option value="{{ c }}">{{ c }}</option>{% endfor %}
+        </select>
+        <input name="description" maxlength="300" placeholder="Mô tả ngắn"
+          class="px-3 py-2 rounded-lg bg-[#0f0f0f] border border-gray-700 text-sm focus:outline-none focus:ring-2 focus:ring-pink-500">
+        <button type="submit" class="sm:col-span-2 px-4 py-2.5 rounded-lg bg-pink-600 hover:bg-pink-700 text-white text-sm font-semibold">
+          Đăng ký (luôn bắt đầu ở INTERNAL — không bao giờ tự động công khai)
+        </button>
+      </form>
+    </div>
+
+    <!-- Tìm kiếm / lọc -->
+    <form method="GET" class="flex flex-wrap gap-2">
+      <input name="q" value="{{ search_q }}" placeholder="Tìm theo tên, key, người tạo..."
+        class="flex-1 min-w-[180px] px-3 py-2 rounded-lg bg-[#1a1a1a] border border-gray-700 text-sm focus:outline-none focus:ring-2 focus:ring-pink-500">
+      <select name="status" onchange="this.form.submit()" class="px-3 py-2 rounded-lg bg-[#1a1a1a] border border-gray-700 text-sm">
+        <option value="">Mọi trạng thái</option>
+        {% for s in statuses %}<option value="{{ s }}" {{ 'selected' if s == status_filter else '' }}>{{ s }}</option>{% endfor %}
+      </select>
+      <select name="category" onchange="this.form.submit()" class="px-3 py-2 rounded-lg bg-[#1a1a1a] border border-gray-700 text-sm">
+        <option value="">Mọi danh mục</option>
+        {% for c in categories %}<option value="{{ c }}" {{ 'selected' if c == category_filter else '' }}>{{ c }}</option>{% endfor %}
+      </select>
+      <button type="submit" class="px-4 py-2 rounded-lg bg-gray-800 hover:bg-gray-700 text-sm font-semibold">Lọc</button>
+    </form>
+
+    <!-- Danh sách flags -->
+    <div class="space-y-3">
+      {% for f in flags %}
+      <div class="bg-[#1a1a1a] rounded-2xl border border-gray-800 p-4">
+        <div class="flex flex-wrap items-start justify-between gap-3">
+          <div class="min-w-0">
+            <div class="flex items-center gap-2 flex-wrap">
+              <a href="{{ url_for('developer_lab_feature_detail', key=f.key) }}" class="font-semibold hover:text-pink-400">{{ f.name or f.key }}</a>
+              <span class="text-[10px] font-mono text-gray-500">{{ f.key }}</span>
+              <span class="text-[10px] font-semibold px-2 py-0.5 rounded-full
+                {{ 'bg-red-900/50 text-red-300' if f.status in ('off','archived') else 'bg-amber-900/50 text-amber-300' if f.status in ('internal','beta') else 'bg-emerald-900/50 text-emerald-300' }}">
+                {{ f.status|upper }}{{ ' ' ~ f.rollout_pct ~ '%' if f.status == 'beta' else '' }}
+              </span>
+              {% if f.is_expiring_soon %}<span class="text-[10px] font-semibold px-2 py-0.5 rounded-full bg-orange-900/50 text-orange-300"><i class="fas fa-clock"></i> Sắp hết hạn</span>{% endif %}
+            </div>
+            {% if f.description %}<p class="text-xs text-gray-500 mt-1">{{ f.description }}</p>{% endif %}
+            <p class="text-[11px] text-gray-600 mt-1">{{ f.category }} · v{{ f.version }} · {{ f.environment }} · chủ: {{ f.owner_username or '—' }} · cập nhật {{ f.updated_at[:16].replace('T',' ') }}</p>
+          </div>
+          <a href="{{ url_for('developer_lab_feature_detail', key=f.key) }}" class="flex-shrink-0 text-xs font-semibold px-3 py-1.5 rounded-lg bg-gray-800 hover:bg-gray-700">Quản lý →</a>
+        </div>
+      </div>
+      {% else %}
+      <p class="text-sm text-gray-500 text-center py-10">Chưa có tính năng nào được đăng ký — đăng ký tính năng đầu tiên ở trên.</p>
+      {% endfor %}
+    </div>
+
+    <div class="bg-[#1a1a1a] rounded-2xl border border-gray-800 p-5">
+      <h2 class="font-bold mb-2 flex items-center gap-2"><i class="fas fa-gamepad text-indigo-400"></i> Trò chơi học tập</h2>
+      <p class="text-xs text-gray-500 mb-3">Số liệu tổng hợp toàn hệ thống cho các trò chơi đã có (Lật thẻ ghi nhớ, Đố Vui Tính Nhanh).</p>
+      <div class="grid sm:grid-cols-3 gap-3">
+        <div class="rounded-xl border border-gray-800 p-3.5">
+          <p class="text-xs text-gray-500 uppercase">Tổng lượt chơi</p>
+          <p class="text-2xl font-bold mt-1">{{ game_stats.total_sessions }}</p>
+        </div>
+        <div class="rounded-xl border border-gray-800 p-3.5">
+          <p class="text-xs text-gray-500 uppercase">Điểm trung bình</p>
+          <p class="text-2xl font-bold mt-1">{{ game_stats.avg_score }}</p>
+        </div>
+        <div class="rounded-xl border border-gray-800 p-3.5">
+          <p class="text-xs text-gray-500 uppercase">Độ chính xác TB</p>
+          <p class="text-2xl font-bold mt-1">{{ game_stats.avg_accuracy }}%</p>
+        </div>
+      </div>
+    </div>
+  </main>
+</body>
+</html>
+'''
+
+
+DEV_LAB_FEATURE_HTML = r'''
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>{{ flag.name or flag.key }} · StudyMate Lab</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>tailwind.config = { darkMode: 'class' };</script>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.6.0/css/all.min.css">
+</head>
+<body class="bg-[#0f0f0f] text-gray-200 min-h-screen">
+  <nav class="sticky top-0 z-10 bg-[#0f0f0f]/90 backdrop-blur border-b border-gray-800 px-4 sm:px-6 py-3 flex items-center justify-between">
+    <div class="flex items-center gap-2 font-bold"><i class="fas fa-flask text-pink-400"></i> 🧪 StudyMate Lab</div>
+    <a href="{{ url_for('developer_lab') }}" class="text-sm text-indigo-400 hover:underline"><i class="fas fa-arrow-left mr-1"></i>Tất cả tính năng</a>
+  </nav>
+  <main class="max-w-3xl mx-auto px-4 sm:px-6 py-6 space-y-6">
+    {% with messages = get_flashed_messages() %}
+      {% if messages %}
+        <div class="space-y-2">
+          {% for m in messages %}
+          <div class="text-sm text-emerald-300 bg-emerald-900/30 border border-emerald-800 rounded-xl px-4 py-2.5">{{ m }}</div>
+          {% endfor %}
+        </div>
+      {% endif %}
+    {% endwith %}
+
+    <div>
+      <div class="flex items-center gap-2 flex-wrap">
+        <h1 class="text-xl font-bold">{{ flag.name or flag.key }}</h1>
+        <span class="text-xs font-mono text-gray-500">{{ flag.key }}</span>
+        <span class="text-[10px] font-semibold px-2 py-0.5 rounded-full
+          {{ 'bg-red-900/50 text-red-300' if flag.status in ('off','archived') else 'bg-amber-900/50 text-amber-300' if flag.status in ('internal','beta') else 'bg-emerald-900/50 text-emerald-300' }}">
+          {{ flag.status|upper }}
+        </span>
+      </div>
+      {% if flag.description %}<p class="text-sm text-gray-400 mt-1">{{ flag.description }}</p>{% endif %}
+    </div>
+
+    <!-- Trạng thái + rollout -->
+    <div class="bg-[#1a1a1a] rounded-2xl border border-gray-800 p-5">
+      <h2 class="font-bold text-sm mb-3">Trạng thái</h2>
+      <form method="POST" action="{{ url_for('developer_lab_update_status', flag_id=flag.id) }}" id="statusForm" class="space-y-3">
+        <div class="flex flex-wrap gap-2">
+          {% for s in statuses %}
+          <button type="submit" name="status" value="{{ s }}"
+            {% if s == 'off' and flag.status == 'public' %}onclick="return confirm('Đây là kill switch — TẮT NGAY tính năng này cho TẤT CẢ người dùng đang dùng thật. Chắc chắn chứ?');"{% endif %}
+            class="px-3.5 py-2 rounded-lg text-sm font-semibold {{ 'bg-pink-600 text-white' if s == flag.status else 'bg-gray-800 text-gray-400 hover:bg-gray-700' }}">
+            {{ s }}
+          </button>
+          {% endfor %}
+        </div>
+        <div id="rolloutRow" class="flex items-center gap-3 {{ '' if flag.status == 'beta' else 'opacity-40' }}">
+          <label class="text-xs text-gray-400">Rollout (chỉ áp dụng khi ở BETA):</label>
+          <input type="range" name="rollout_pct" min="0" max="100" step="1" value="{{ flag.rollout_pct }}"
+            oninput="document.getElementById('rolloutVal').textContent = this.value + '%';"
+            class="flex-1">
+          <span id="rolloutVal" class="text-sm font-semibold w-12 text-right">{{ flag.rollout_pct }}%</span>
+        </div>
+        <p class="text-xs text-gray-500">Developer trở lên LUÔN thấy được tính năng (trừ khi ở <strong>off</strong>/<strong>archived</strong>) để tự test bất cứ lúc nào.</p>
+      </form>
+    </div>
+
+    <!-- Cấu hình -->
+    <div class="bg-[#1a1a1a] rounded-2xl border border-gray-800 p-5">
+      <h2 class="font-bold text-sm mb-3">Cấu hình</h2>
+      <form method="POST" action="{{ url_for('developer_lab_configure_flag', flag_id=flag.id) }}" class="grid sm:grid-cols-2 gap-2.5">
+        <div>
+          <label class="text-xs text-gray-500">Tên hiển thị</label>
+          <input name="name" value="{{ flag.name }}" maxlength="80" class="w-full px-3 py-2 rounded-lg bg-[#0f0f0f] border border-gray-700 text-sm mt-1">
+        </div>
+        <div>
+          <label class="text-xs text-gray-500">Phiên bản</label>
+          <input name="version" value="{{ flag.version }}" maxlength="20" class="w-full px-3 py-2 rounded-lg bg-[#0f0f0f] border border-gray-700 text-sm mt-1">
+        </div>
+        <div>
+          <label class="text-xs text-gray-500">Danh mục</label>
+          <select name="category" class="w-full px-3 py-2 rounded-lg bg-[#0f0f0f] border border-gray-700 text-sm mt-1">
+            {% for c in categories %}<option value="{{ c }}" {{ 'selected' if c == flag.category else '' }}>{{ c }}</option>{% endfor %}
+          </select>
+        </div>
+        <div>
+          <label class="text-xs text-gray-500">Môi trường</label>
+          <select name="environment" class="w-full px-3 py-2 rounded-lg bg-[#0f0f0f] border border-gray-700 text-sm mt-1">
+            {% for e in environments %}<option value="{{ e }}" {{ 'selected' if e == flag.environment else '' }}>{{ e }}</option>{% endfor %}
+          </select>
+          <p class="text-[10px] text-gray-600 mt-1">Chỉ mang tính ghi chú — app chạy 1 server duy nhất, không có hạ tầng tách môi trường thật.</p>
+        </div>
+        <div class="sm:col-span-2">
+          <label class="text-xs text-gray-500">Mô tả</label>
+          <textarea name="description" rows="2" maxlength="300" class="w-full px-3 py-2 rounded-lg bg-[#0f0f0f] border border-gray-700 text-sm mt-1">{{ flag.description }}</textarea>
+        </div>
+        <div>
+          <label class="text-xs text-gray-500">Phụ thuộc vào (feature key, cách nhau bởi dấu phẩy)</label>
+          <input name="depends_on" value="{{ flag.depends_on }}" placeholder="vd: quiz_engine,xp_system" class="w-full px-3 py-2 rounded-lg bg-[#0f0f0f] border border-gray-700 text-sm mt-1 font-mono">
+        </div>
+        <div>
+          <label class="text-xs text-gray-500">Ngày hết hạn (tuỳ chọn)</label>
+          <input type="date" name="expires_at" value="{{ flag.expires_at[:10] if flag.expires_at else '' }}" class="w-full px-3 py-2 rounded-lg bg-[#0f0f0f] border border-gray-700 text-sm mt-1">
+        </div>
+        <button type="submit" class="sm:col-span-2 px-4 py-2.5 rounded-lg bg-gray-800 hover:bg-gray-700 text-white text-sm font-semibold">Lưu cấu hình</button>
+      </form>
+    </div>
+
+    <!-- Phụ thuộc -->
+    {% if dependencies %}
+    <div class="bg-[#1a1a1a] rounded-2xl border border-gray-800 p-5">
+      <h2 class="font-bold text-sm mb-3">Phụ thuộc</h2>
+      <div class="space-y-2">
+        {% for d in dependencies %}
+        <div class="flex items-center justify-between text-sm rounded-lg border border-gray-800 px-3 py-2">
+          <span class="font-mono">{{ d.key }}</span>
+          {% if d.found %}
+            <span class="text-xs px-2 py-0.5 rounded-full {{ 'bg-emerald-900/50 text-emerald-300' if d.status == 'public' else 'bg-amber-900/50 text-amber-300' }}">{{ d.status }}</span>
+          {% else %}
+            <span class="text-xs px-2 py-0.5 rounded-full bg-red-900/50 text-red-300"><i class="fas fa-triangle-exclamation mr-1"></i>không tìm thấy</span>
+          {% endif %}
+        </div>
+        {% endfor %}
+      </div>
+    </div>
+    {% endif %}
+
+    <!-- Xoá hẳn -->
+    <div class="bg-[#1a1a1a] rounded-2xl border border-red-900/50 p-5">
+      <h2 class="font-bold text-sm mb-2 text-red-400">Vùng nguy hiểm</h2>
+      <p class="text-xs text-gray-500 mb-3">Xoá hẳn tính năng này khỏi hệ thống (khác với "archived" — archived vẫn giữ lại lịch sử để tra cứu). Chỉ Admin trở lên thực hiện được.</p>
+      <form method="POST" action="{{ url_for('developer_lab_delete_flag', flag_id=flag.id) }}" onsubmit="return confirm('Xoá hẳn \'' + {{ flag.key|tojson }} + '\'? Không thể hoàn tác.');">
+        <button type="submit" class="px-4 py-2 rounded-lg bg-red-900/50 hover:bg-red-900 text-red-300 text-sm font-semibold">Xoá hẳn tính năng này</button>
+      </form>
+    </div>
+
+    <!-- Audit log riêng của flag này -->
+    <div class="bg-[#1a1a1a] rounded-2xl border border-gray-800 p-5">
+      <h2 class="font-bold text-sm mb-3">Nhật ký thay đổi</h2>
+      <div class="space-y-2">
+        {% for log in logs %}
+        <div class="text-xs border-b border-gray-900 pb-2">
+          <span class="text-gray-500">{{ log.created_at[:16].replace('T',' ') }}</span> ·
+          <span class="font-medium">{{ log.actor_username or '(hệ thống)' }}</span> ·
+          {{ log.detail }}
+        </div>
+        {% else %}
+        <p class="text-sm text-gray-500 text-center py-4">Chưa có thay đổi nào được ghi lại.</p>
+        {% endfor %}
+      </div>
+    </div>
+  </main>
+</body>
+</html>
+'''
+
+
+@app.route('/developer/lab')
+@developer_required
+def developer_lab():
+    db = get_db()
+    q = (request.args.get('q') or '').strip()
+    status_filter = (request.args.get('status') or '').strip()
+    category_filter = (request.args.get('category') or '').strip()
+
+    query = 'SELECT * FROM feature_flags WHERE 1=1'
+    params = []
+    if q:
+        query += ' AND (key LIKE ? OR name LIKE ? OR owner_username LIKE ?)'
+        like = f'%{q}%'
+        params += [like, like, like]
+    if status_filter in FEATURE_FLAG_STATUSES:
+        query += ' AND status = ?'
+        params.append(status_filter)
+    if category_filter in FEATURE_CATEGORIES:
+        query += ' AND category = ?'
+        params.append(category_filter)
+    query += ' ORDER BY updated_at DESC'
+    flags = db.execute(query, params).fetchall()
+
+    today = now_iso()[:10]
+    flags_out = []
+    for f in flags:
+        d = dict(f)
+        d['is_expiring_soon'] = bool(d['expires_at'] and d['status'] in ('internal', 'beta') and d['expires_at'][:10] <= today)
+        flags_out.append(d)
+
+    sessions = db.execute('SELECT score, correct_count, total_count FROM game_sessions').fetchall()
+    total_sessions = len(sessions)
+    avg_score = round(sum(s['score'] for s in sessions) / total_sessions) if total_sessions else 0
+    total_answered = sum(s['total_count'] for s in sessions)
+    total_correct = sum(s['correct_count'] for s in sessions)
+    avg_accuracy = round(100 * total_correct / total_answered) if total_answered else 0
+
+    return render_template_string(
+        DEV_LAB_HTML,
+        flags=flags_out,
+        all_flag_keys=[f['key'] for f in flags],
+        search_q=q, status_filter=status_filter, category_filter=category_filter,
+        statuses=FEATURE_FLAG_STATUSES, categories=FEATURE_CATEGORIES, environments=FEATURE_ENVIRONMENTS,
+        rollout_steps=FEATURE_ROLLOUT_STEPS,
+        game_stats={'total_sessions': total_sessions, 'avg_score': avg_score, 'avg_accuracy': avg_accuracy},
+    )
+
+
+@app.route('/developer/lab/features/<key>')
+@developer_required
+def developer_lab_feature_detail(key):
+    db = get_db()
+    flag = db.execute('SELECT * FROM feature_flags WHERE key = ?', (key,)).fetchone()
+    if not flag:
+        flash(f"Không tìm thấy tính năng '{key}'.")
+        return redirect(url_for('developer_lab'))
+
+    logs = db.execute(
+        'SELECT * FROM audit_logs WHERE target = ? AND action LIKE ? ORDER BY id DESC LIMIT 100',
+        (key, '%feature%')
+    ).fetchall()
+
+    deps = [d.strip() for d in (flag['depends_on'] or '').split(',') if d.strip()]
+    dep_rows = []
+    for dep_key in deps:
+        dep_flag = db.execute('SELECT key, name, status FROM feature_flags WHERE key = ?', (dep_key,)).fetchone()
+        dep_rows.append({'key': dep_key, 'found': bool(dep_flag), 'status': dep_flag['status'] if dep_flag else None,
+                          'name': dep_flag['name'] if dep_flag else ''})
+
+    return render_template_string(
+        DEV_LAB_FEATURE_HTML,
+        flag=dict(flag), logs=[dict(l) for l in logs], dependencies=dep_rows,
+        statuses=FEATURE_FLAG_STATUSES, categories=FEATURE_CATEGORIES, environments=FEATURE_ENVIRONMENTS,
+        rollout_steps=FEATURE_ROLLOUT_STEPS,
+    )
+
+
+@app.route('/developer/lab/flags', methods=['POST'])
+@developer_required
+def developer_lab_create_flag():
+    key = (request.form.get('key') or '').strip().lower().replace(' ', '_')
+    name = (request.form.get('name') or '').strip()[:80] or key
+    category = (request.form.get('category') or 'other').strip()
+    description = (request.form.get('description') or '').strip()[:300]
+    if category not in FEATURE_CATEGORIES:
+        category = 'other'
+
+    if not re.match(r'^[a-z0-9_.]{2,60}$', key):
+        flash('Tên flag chỉ gồm chữ thường/số/gạch dưới/dấu chấm, 2-60 ký tự (vd: game.snake_quiz).')
+        return redirect(url_for('developer_lab'))
+
+    db = get_db()
+    existing = db.execute('SELECT id FROM feature_flags WHERE key = ?', (key,)).fetchone()
+    if existing:
+        flash(f"Flag '{key}' đã tồn tại.")
+        return redirect(url_for('developer_lab'))
+
+    # Luật bắt buộc: tính năng mới đăng ký KHÔNG BAO GIỜ tự động public — luôn bắt đầu ở
+    # 'internal' (chỉ Developer trở lên thấy được) để tự test an toàn trước.
+    db.execute(
+        '''INSERT INTO feature_flags (key, name, status, category, description, owner_username,
+           environment, version, rollout_pct, created_at, updated_at)
+           VALUES (?, ?, 'internal', ?, ?, ?, 'development', '1.0.0', 0, ?, ?)''',
+        (key, name, category, description, session.get('username', ''), now_iso(), now_iso())
+    )
+    db.commit()
+    write_audit('create_feature_flag', target=key, detail=f"đăng ký mới, bắt đầu ở INTERNAL ({name})")
+    flash(f"Đã đăng ký tính năng '{key}' — bắt đầu ở trạng thái INTERNAL (an toàn mặc định).")
+    return redirect(url_for('developer_lab_feature_detail', key=key))
+
+
+@app.route('/developer/lab/flags/<int:flag_id>/status', methods=['POST'])
+@developer_required
+def developer_lab_update_status(flag_id):
+    status = (request.form.get('status') or '').strip()
+    try:
+        rollout_pct = int(request.form.get('rollout_pct', 0))
+    except (TypeError, ValueError):
+        rollout_pct = 0
+    rollout_pct = max(0, min(100, rollout_pct))
+
+    if status not in FEATURE_FLAG_STATUSES:
+        flash('Trạng thái không hợp lệ.')
+        return redirect(url_for('developer_lab'))
+
+    db = get_db()
+    flag = db.execute('SELECT * FROM feature_flags WHERE id = ?', (flag_id,)).fetchone()
+    if not flag:
+        flash('Không tìm thấy flag này.')
+        return redirect(url_for('developer_lab'))
+
+    # "Kill switch" / thao tác nguy hiểm: chuyển 1 tính năng ĐANG public về off/archived —
+    # ghi audit chi tiết hơn (log rõ giá trị cũ -> mới) vì đây là hành động ảnh hưởng ngay tới
+    # người dùng thật đang dùng tính năng đó.
+    old_status = flag['status']
+    db.execute(
+        'UPDATE feature_flags SET status = ?, rollout_pct = ?, updated_at = ? WHERE id = ?',
+        (status, rollout_pct if status == 'beta' else flag['rollout_pct'], now_iso(), flag_id)
+    )
+    db.commit()
+    detail = f"{old_status} → {status}" + (f" (rollout {rollout_pct}%)" if status == 'beta' else '')
+    write_audit('update_feature_status', target=flag['key'], detail=detail)
+    flash(f"Đã đổi '{flag['key']}': {detail}.")
+    return redirect(request.referrer or url_for('developer_lab'))
+
+
+@app.route('/developer/lab/flags/<int:flag_id>/configure', methods=['POST'])
+@developer_required
+def developer_lab_configure_flag(flag_id):
+    db = get_db()
+    flag = db.execute('SELECT * FROM feature_flags WHERE id = ?', (flag_id,)).fetchone()
+    if not flag:
+        flash('Không tìm thấy flag này.')
+        return redirect(url_for('developer_lab'))
+
+    name = (request.form.get('name') or '').strip()[:80] or flag['key']
+    category = (request.form.get('category') or flag['category']).strip()
+    if category not in FEATURE_CATEGORIES:
+        category = flag['category']
+    environment = (request.form.get('environment') or flag['environment']).strip()
+    if environment not in FEATURE_ENVIRONMENTS:
+        environment = flag['environment']
+    description = (request.form.get('description') or '').strip()[:300]
+    version = (request.form.get('version') or flag['version']).strip()[:20]
+    expires_at = (request.form.get('expires_at') or '').strip() or None
+
+    raw_deps = (request.form.get('depends_on') or '').strip()
+    dep_keys = [d.strip().lower() for d in raw_deps.split(',') if d.strip()]
+    if flag['key'] in dep_keys:
+        flash('Một tính năng không thể tự phụ thuộc vào chính nó.')
+        return redirect(url_for('developer_lab_feature_detail', key=flag['key']))
+    depends_on = ','.join(dep_keys)
+
+    db.execute(
+        '''UPDATE feature_flags SET name = ?, category = ?, environment = ?, description = ?,
+           version = ?, expires_at = ?, depends_on = ?, updated_at = ? WHERE id = ?''',
+        (name, category, environment, description, version, expires_at, depends_on, now_iso(), flag_id)
+    )
+    db.commit()
+    write_audit('configure_feature', target=flag['key'], detail=f"cập nhật cấu hình (v{version}, {environment})")
+    flash(f"Đã cập nhật cấu hình '{flag['key']}'.")
+    return redirect(url_for('developer_lab_feature_detail', key=flag['key']))
+
+
+@app.route('/developer/lab/flags/<int:flag_id>/delete', methods=['POST'])
+@admin_required
+def developer_lab_delete_flag(flag_id):
+    """Xoá hẳn 1 flag (khác với 'archived' — archived vẫn giữ lại lịch sử/audit log để tra
+    cứu sau này, delete là xoá thật). Chỉ Admin trở lên được xoá, để tránh Developer lỡ tay
+    xoá mất tính năng đang chạy production."""
+    db = get_db()
+    flag = db.execute('SELECT key FROM feature_flags WHERE id = ?', (flag_id,)).fetchone()
+    if not flag:
+        flash('Không tìm thấy flag này.')
+        return redirect(url_for('developer_lab'))
+    db.execute('DELETE FROM feature_flags WHERE id = ?', (flag_id,))
+    db.commit()
+    write_audit('delete_feature_flag', target=flag['key'], detail='đã xoá hẳn')
+    flash(f"Đã xoá flag '{flag['key']}'.")
+    return redirect(url_for('developer_lab'))
+
+
 @app.route('/developer/audit')
 @super_admin_required
 def developer_audit_log():
@@ -7371,6 +8259,90 @@ def api_game_complete():
     gamify = award_xp_and_streak(current_user_id(), xp_amount=bonus_xp,
                                   extra_achievement_checks={'game_player': True})
     return jsonify({"success": True, "xpAwarded": bonus_xp, "gamify": gamify})
+
+
+@app.route('/api/games/quick-math/submit', methods=['POST'])
+@login_required
+def api_quick_math_submit():
+    """Nộp kết quả 1 ván 'Đố Vui Tính Nhanh'. Không cần gọi AI để biết học sinh yếu phép tính
+    nào — client tự gửi lên danh sách phép tính đã trả lời SAI (vd: ["Phép nhân", "Phép
+    chia"]), server đếm và tự động lưu vào Sổ lỗi sai (dùng lại đúng cơ chế gộp trùng của
+    Mistake Book) — đây chính là 'Post-Game Learning Report' của trò chơi này, không cần
+    thêm 1 bài quiz AI riêng vì bản thân ván chơi đã LÀ 1 chuỗi câu hỏi rồi."""
+    data = request.get_json(silent=True) or {}
+    difficulty = (data.get('difficulty') or 'medium').strip()
+    if difficulty not in ('easy', 'medium', 'hard'):
+        difficulty = 'medium'
+    try:
+        score = max(0, int(data.get('score') or 0))
+        correct_count = max(0, int(data.get('correctCount') or 0))
+        total_count = max(0, int(data.get('totalCount') or 0))
+        best_combo = max(0, int(data.get('bestCombo') or 0))
+    except (TypeError, ValueError):
+        return jsonify({"error": "Dữ liệu ván chơi không hợp lệ."}), 400
+
+    wrong_ops = data.get('wrongOperations') or []
+    if not isinstance(wrong_ops, list):
+        wrong_ops = []
+
+    user_id = current_user_id()
+    db = get_db()
+
+    op_counts = {}
+    for op in wrong_ops:
+        if isinstance(op, str) and op.strip():
+            op_counts[op] = op_counts.get(op, 0) + 1
+    weak_topics = [op for op, _ in sorted(op_counts.items(), key=lambda kv: kv[1], reverse=True)][:3]
+
+    db.execute(
+        '''INSERT INTO game_sessions (user_id, game, difficulty, score, correct_count, total_count,
+           best_combo, weak_topics, created_at) VALUES (?, 'quick_math', ?, ?, ?, ?, ?, ?, ?)''',
+        (user_id, difficulty, score, correct_count, total_count, best_combo, json.dumps(weak_topics), now_iso())
+    )
+
+    for topic in weak_topics:
+        desc = f"Hay tính sai: {topic}"
+        norm_desc = desc.strip().lower()
+        existing = db.execute(
+            "SELECT id FROM mistakes WHERE user_id = ? AND subject = 'Toán' AND LOWER(TRIM(description)) = ? AND resolved = 0",
+            (user_id, norm_desc)
+        ).fetchone()
+        if existing:
+            db.execute('UPDATE mistakes SET occurrence_count = occurrence_count + 1, last_occurred_at = ? WHERE id = ?',
+                       (now_iso(), existing['id']))
+        else:
+            db.execute(
+                '''INSERT INTO mistakes (user_id, subject, description, occurrence_count, conversation_id,
+                   resolved, created_at, last_occurred_at) VALUES (?, 'Toán', ?, 1, NULL, 0, ?, ?)''',
+                (user_id, desc, now_iso(), now_iso())
+            )
+    db.commit()
+
+    is_perfect = total_count >= 10 and correct_count == total_count
+    bonus_xp = min(60, 10 + correct_count * 2)
+    gamify = award_xp_and_streak(
+        user_id, xp_amount=bonus_xp,
+        extra_achievement_checks={
+            'game_player': True,
+            'speed_demon': best_combo >= 10,
+            'perfect_run': is_perfect,
+        }
+    )
+
+    return jsonify({"success": True, "xpAwarded": bonus_xp, "weakTopics": weak_topics, "gamify": gamify})
+
+
+@app.route('/api/games/stats', methods=['GET'])
+@login_required
+def api_game_stats():
+    """Điểm cao nhất + số lượt chơi của CHÍNH tài khoản đang đăng nhập, theo từng trò chơi —
+    hiển thị ở thư viện trò chơi."""
+    db = get_db()
+    rows = db.execute(
+        'SELECT game, MAX(score) AS best_score, COUNT(*) AS play_count FROM game_sessions WHERE user_id = ? GROUP BY game',
+        (current_user_id(),)
+    ).fetchall()
+    return jsonify({r['game']: {'bestScore': r['best_score'], 'playCount': r['play_count']} for r in rows})
 
 
 # ==========================================
