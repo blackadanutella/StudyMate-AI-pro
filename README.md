@@ -377,6 +377,38 @@ Panel mới trong `/developer`, mục đích: **test tính năng nhanh mà khôn
 
 ⚠️ "Chỉnh các chế độ" trong yêu cầu gốc của bạn hơi mơ hồ (không rõ ý là Chế độ suy nghĩ, Chế độ học tập, hay thứ khác) — hiện mình mới làm phần XP/streak (rõ nghĩa nhất, khớp với "để test... hiệu ứng"). Nếu ý bạn là 1 loại "chế độ" cụ thể khác, nói rõ hơn để mình bổ sung đúng.
 
+## 25. Về yêu cầu "Desktop Companion" (Alt+Space, system tray, chụp màn hình OS) — cần đọc trước khi dùng
+
+Bạn gửi 1 bản đặc tả rất chi tiết cho 1 **ứng dụng desktop Windows thật** (Tauri/Electron + React + TypeScript) với phím tắt toàn hệ điều hành, system tray, chụp màn hình cấp OS, theo dõi clipboard... Cần nói thẳng trước khi bạn kỳ vọng nhầm:
+
+**Phần này KHÔNG THỂ xây dựng như 1 tính năng mở rộng của `app.py` (Flask web app hiện tại)**, vì lý do kỹ thuật thật sự, không phải mình ngại làm:
+
+1. **Khác hẳn nền tảng**: `ALT+SPACE` hoạt động được ngay cả khi đang chơi Minecraft hay gõ Word — đó là hotkey **cấp hệ điều hành**. Trình duyệt (và app Flask chạy trong trình duyệt) **không có quyền** đăng ký hotkey toàn hệ thống — đây là giới hạn bảo mật cố ý của mọi trình duyệt, không phải thứ có thể "code thêm" để vượt qua. Muốn có `ALT+SPACE` thật, bắt buộc phải là 1 ứng dụng desktop biên dịch riêng (native), viết bằng Tauri (Rust) hoặc Electron (Node.js) — 2 công nghệ này **không chạy được trong `app.py`**, cần 1 dự án, 1 repo, 1 quy trình build hoàn toàn khác.
+2. **Mình không kiểm thử được**: Toàn bộ phần còn lại của cuộc trò chuyện này, mọi tính năng mình giao đều đã chạy thử thật (test tự động, giả lập request, kiểm tra kết quả) trước khi gửi cho bạn — đó là lý do bạn có thể tin các tính năng đó hoạt động đúng. Với 1 ứng dụng Windows thật, mình **không có máy Windows, không có Rust/Node toolchain, không cài đặt/chạy thử được** — nếu mình viết code Tauri/Electron rồi gửi luôn mà không chạy thử, rất có thể sẽ có lỗi mà mình không phát hiện ra được, khác hẳn cách làm việc nghiêm túc mình đã giữ suốt từ đầu.
+3. **Không có đường "cài đặt" qua chat**: Kể cả code đúng 100%, đây vẫn là 1 ứng dụng cần build ra file `.exe`/`.msi` rồi cài vào Windows — không phải thứ có thể "gửi qua chat" như file `app.py` được.
+
+**Vì vậy mình đã làm phần mà chính bản đặc tả của bạn cũng ghi rõ là hướng đi đúng cho người dùng web** ("Fallback for Web Users" trong đặc tả — dùng `CTRL+K` cho command palette trong trình duyệt thay vì giả vờ đó là phím tắt toàn hệ thống):
+
+### ⌨️ Command Palette / Web Quick Launcher (`Ctrl/⌘ + K`) — đã làm, đã test
+- Bấm `Ctrl/⌘ + K` ở bất kỳ đâu trong app → mở bảng lệnh nhanh kiểu Raycast/Linear ngay giữa màn hình.
+- Gõ để lọc lệnh: Đoạn chat mới, Tạo Quiz bằng AI, Tạo bộ thẻ ghi nhớ bằng AI, Tạo kế hoạch ôn tập, Sổ lỗi sai, Cài đặt, Nâng cấp gói, Trợ giúp, (Trang Developer nếu có quyền), Đăng xuất.
+- **Gõ thẳng câu hỏi rồi Enter** → mở đoạn chat mới và hỏi AI ngay lập tức — đúng tinh thần "Ask AI" trong đặc tả gốc, chỉ khác là mở trong trang thay vì cửa sổ nổi trên desktop.
+- Điều hướng bằng phím mũi tên lên/xuống + Enter để chọn, ESC để đóng.
+- Đây cũng chính là mục **"⌨️ Command Palette"** ở Phase 4 trong roadmap bạn tự đề ra — coi như đã hoàn thành mục đó.
+
+⚠️ Đổi 1 hành vi cũ: `Ctrl+K` trước đây tạo đoạn chat mới ngay lập tức; giờ mở bảng lệnh trước (giống Linear/Notion) — "Đoạn chat mới" vẫn là lựa chọn đầu tiên, chỉ cần bấm Enter thêm 1 lần.
+
+### Nếu bạn THỰC SỰ muốn app desktop Windows thật
+Đây sẽ là 1 dự án tách biệt hoàn toàn khỏi `app.py`. Vài điều thật sự cần biết trước khi bắt đầu (không phải code, chỉ là định hướng kỹ thuật trung thực):
+- **Tauri** (khuyến nghị, đúng như đặc tả gốc đề xuất) — nhẹ hơn Electron vì dùng WebView có sẵn của hệ điều hành thay vì đóng gói cả Chromium. Cần cài Rust toolchain.
+- Đăng ký global hotkey: crate `tauri-plugin-global-shortcut`.
+- System tray: crate `tray-icon` (hoặc plugin tray tích hợp sẵn trong Tauri 2.x).
+- Chụp vùng màn hình: crate `screenshots` hoặc `xcap`, kèm xin quyền hệ điều hành (Windows sẽ tự hỏi quyền Chụp màn hình nếu chạy trên Windows 10+ tuỳ cấu hình).
+- App desktop này gọi vào **CHÍNH các API `/api/chat`, `/api/decks/generate`, `/api/quizzes/generate`... mà `app.py` đã có sẵn** — không cần viết lại logic AI, chỉ cần app desktop biết đăng nhập (lưu session/cookie hoặc đổi sang API key — xem `/api/keys` đã có sẵn cho Developer) rồi gọi HTTP tới server Flask này.
+- Ước lượng thực tế: đây là 1 dự án vài tuần cho 1 người biết Rust/Tauri, không phải vài giờ.
+
+Nếu bạn muốn, mình có thể bắt đầu 1 cuộc trò chuyện RIÊNG chuyên về dự án Tauri này (không lẫn vào `app.py`), viết code từng phần và giải thích rõ phần nào mình **chưa** chạy thử được (vì không có Windows) để bạn tự kiểm tra khi build máy thật — miễn là hiểu rõ từ đầu đây là 1 dự án khác, tốc độ và độ tin cậy sẽ khác hẳn so với những gì mình giao trong `app.py` suốt từ đầu tới giờ.
+
 ## Chưa làm (nằm ngoài phạm vi yêu cầu lần này)
 Phần đầu prompt gốc của bạn từng có yêu cầu dựng lại toàn bộ thành một sản phẩm Next.js/TypeScript quy mô lớn (nhiều trang, Dashboard, Blog, Pricing...). Bản cập nhật này vẫn giữ nguyên nền tảng Flask hiện có của bạn. Nếu bạn vẫn muốn bản Next.js quy mô lớn, đó sẽ là một dự án tách riêng — cho mình biết nếu bạn muốn triển khai.
 
