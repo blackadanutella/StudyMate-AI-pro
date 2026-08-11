@@ -773,6 +773,48 @@ def init_db():
     # thay vì tạo bảng "bài nộp" riêng, để điểm/phân tích điểm yếu dùng chung một nguồn.
     ensure_columns(conn, 'quiz_attempts', {'assignment_id': 'INTEGER'})
 
+    # ========== CHỈ MỤC (INDEX) — HIỆU NĂNG ==========
+    # Trước đây toàn bộ 29 bảng KHÔNG có index nào, trong khi có ~38 truy vấn lọc theo
+    # user_id. Nghĩa là MỖI lần mở lịch sử chat / bảng tiến độ / trang developer, SQLite phải
+    # QUÉT TOÀN BỘ bảng từ đầu tới cuối. Lúc ít dữ liệu thì không thấy gì, nhưng càng dùng lâu
+    # càng chậm dần đều — và chậm nhất đúng với tài khoản CHĂM HỌC NHẤT (nhiều dữ liệu nhất),
+    # tức là phạt oan chính người dùng tốt nhất.
+    # CREATE INDEX IF NOT EXISTS chạy lại nhiều lần vẫn an toàn; SQLite tự dựng index cho dữ
+    # liệu đã có sẵn ngay lần khởi động đầu tiên sau khi cập nhật.
+    for idx_sql in [
+        'CREATE INDEX IF NOT EXISTS idx_conv_user ON conversations(user_id, updated_at DESC)',
+        'CREATE INDEX IF NOT EXISTS idx_msg_conv ON messages(conversation_id, id)',
+        'CREATE INDEX IF NOT EXISTS idx_usage_user ON usage_logs(user_id, created_at)',
+        'CREATE INDEX IF NOT EXISTS idx_usage_created ON usage_logs(created_at)',
+        'CREATE INDEX IF NOT EXISTS idx_mistakes_user ON mistakes(user_id, resolved, occurrence_count DESC)',
+        'CREATE INDEX IF NOT EXISTS idx_memories_user ON memories(user_id, created_at DESC)',
+        'CREATE INDEX IF NOT EXISTS idx_quizzes_user ON quizzes(user_id, created_at DESC)',
+        'CREATE INDEX IF NOT EXISTS idx_qquestions_quiz ON quiz_questions(quiz_id, order_index)',
+        'CREATE INDEX IF NOT EXISTS idx_qattempts_user ON quiz_attempts(user_id, created_at DESC)',
+        'CREATE INDEX IF NOT EXISTS idx_qattempts_assignment ON quiz_attempts(assignment_id)',
+        'CREATE INDEX IF NOT EXISTS idx_decks_user ON flashcard_decks(user_id, updated_at DESC)',
+        'CREATE INDEX IF NOT EXISTS idx_cards_deck ON flashcards(deck_id)',
+        'CREATE INDEX IF NOT EXISTS idx_plans_user ON study_plans(user_id, created_at DESC)',
+        'CREATE INDEX IF NOT EXISTS idx_tasks_plan ON study_tasks(plan_id, day_number)',
+        'CREATE INDEX IF NOT EXISTS idx_gamesess_user ON game_sessions(user_id, game)',
+        'CREATE INDEX IF NOT EXISTS idx_achieve_user ON achievements(user_id)',
+        'CREATE INDEX IF NOT EXISTS idx_projects_user ON projects(user_id)',
+        'CREATE INDEX IF NOT EXISTS idx_uploads_user ON file_uploads(user_id, created_at)',
+        'CREATE INDEX IF NOT EXISTS idx_issues_status ON issue_reports(status, created_at DESC)',
+        'CREATE INDEX IF NOT EXISTS idx_orders_user ON payment_orders(user_id, created_at DESC)',
+        'CREATE INDEX IF NOT EXISTS idx_audit_created ON audit_logs(created_at DESC)',
+        'CREATE INDEX IF NOT EXISTS idx_classmem_class ON class_members(class_id)',
+        'CREATE INDEX IF NOT EXISTS idx_classmem_user ON class_members(user_id)',
+        'CREATE INDEX IF NOT EXISTS idx_assign_class ON assignments(class_id, created_at DESC)',
+        'CREATE INDEX IF NOT EXISTS idx_assign_quiz ON assignments(quiz_id)',
+        'CREATE INDEX IF NOT EXISTS idx_classes_owner ON classes(owner_id, archived)',
+    ]:
+        try:
+            conn.execute(idx_sql)
+        except sqlite3.OperationalError:
+            pass   # bảng chưa tồn tại ở database rất cũ — bỏ qua an toàn
+    conn.commit()
+
 
     # Có thể tuỳ chỉnh qua .env: DEVELOPER_USERNAME / DEVELOPER_PASSWORD.
     # Nếu chưa có tài khoản này, server sẽ tự tạo và in mật khẩu ra console 1 lần duy nhất.
@@ -2244,7 +2286,16 @@ HTML = r'''
     .theme-opt.active { border-color: #3b82f6; background: rgba(59,130,246,0.08); color: #2563eb; }
     .dark .theme-opt.active { color: #93c5fd; }
 
-    .conv-menu { position: absolute; z-index: 45; min-width: 180px; }
+    /* Menu 3 chấm của đoạn chat (Ghim / Đổi tên / Chuyển dự án / Xoá).
+       LỖI ĐÃ SỬA: trước đây dùng z-index 45, THẤP HƠN sidebar (z-50) — mà menu lại mở ra
+       ngay bên trong vùng ngang của sidebar. Trên ĐIỆN THOẠI sidebar là position:fixed nên
+       z-index có hiệu lực -> sidebar (nền đục) VẼ ĐÈ LÊN menu, khiến menu vừa không nhìn
+       thấy vừa không bấm được. Trên máy tính sidebar là position:static (z-index không có
+       tác dụng) nên vẫn chạy — vì vậy lỗi chỉ xuất hiện khi dùng điện thoại.
+       Sửa: z-index 55 (trên sidebar 50, dưới hộp thoại 60).
+       Đổi absolute -> fixed cho khớp với toạ độ lấy từ getBoundingClientRect() (vốn tính
+       theo màn hình), đồng thời tránh bị cắt bởi overflow:hidden của phần tử cha. */
+    .conv-menu { position: fixed; z-index: 55; min-width: 180px; }
 
     /* Chiều cao khung app: trên trình duyệt ĐIỆN THOẠI, 100vh tính cả phần bị thanh địa chỉ
        và thanh công cụ dưới che mất -> layout cao hơn vùng nhìn thấy thật, khiến khung chat
@@ -4253,7 +4304,7 @@ function addMessage(sender, content, isMarkdown = false, actionsCtx = null) {
   avatar.innerHTML = '<i class="fas fa-robot"></i>';
   const bubble = document.createElement('div');
   bubble.className = 'ai-content flex-1 min-w-0 leading-relaxed pt-1.5';
-  bubble.innerHTML = isMarkdown ? marked.parse(content) : escapeHtml(content).replace(/\n/g, '<br>');
+  bubble.innerHTML = isMarkdown ? renderMarkdownSafe(content) : escapeHtml(content).replace(/\n/g, '<br>');
   if (isMarkdown) renderMathIn(bubble);
   wrapper.appendChild(avatar);
   wrapper.appendChild(bubble);
@@ -4273,10 +4324,77 @@ function createAiStreamBubble() {
   scrollChatToBottom();
   return wrapper.querySelector('.ai-content');
 }
-function updateAiStreamBubble(bubble, text, showCursor) {
-  bubble.innerHTML = marked.parse(text) + (showCursor ? '<span class="stream-cursor"></span>' : '');
+// Dựng lại bong bóng tin nhắn khi đang nhận từng phần (streaming).
+// HIỆU NĂNG (đã sửa): trước đây MỖI token nhận về đều dựng lại TOÀN BỘ tin nhắn — chạy lại
+// Markdown + KaTeX trên cả bài từ đầu tới cuối. Câu trả lời 1500 token = 1500 lần dựng lại
+// một chuỗi ngày càng dài (độ phức tạp bình phương), nên càng về cuối câu trả lời càng giật,
+// đúng lúc học sinh đang chờ đọc — và trên điện thoại thì tệ hơn nhiều.
+// CÁCH SỬA: gom các token đến liên tiếp lại, chỉ vẽ TỐI ĐA 1 lần mỗi khung hình
+// (requestAnimationFrame). Chữ vẫn hiện mượt như cũ với mắt người, nhưng khối lượng tính
+// toán giảm rất nhiều. Lúc kết thúc (showCursor=false) thì vẽ NGAY, không hoãn, để đảm bảo
+// nội dung cuối cùng luôn đầy đủ và chính xác.
+let _streamRafId = null;
+let _streamPending = null;
+
+function _flushStreamBubble() {
+  _streamRafId = null;
+  if (!_streamPending) return;
+  const { bubble, text, showCursor } = _streamPending;
+  _streamPending = null;
+  bubble.innerHTML = renderMarkdownSafe(text) + (showCursor ? '<span class="stream-cursor"></span>' : '');
   renderMathIn(bubble);
   scrollChatToBottom();
+}
+
+function updateAiStreamBubble(bubble, text, showCursor) {
+  _streamPending = { bubble, text, showCursor };
+  if (!showCursor) {
+    // Lượt vẽ cuối cùng (hoặc báo lỗi): vẽ ngay lập tức, huỷ lượt hoãn đang chờ.
+    if (_streamRafId !== null) { cancelAnimationFrame(_streamRafId); _streamRafId = null; }
+    _flushStreamBubble();
+    return;
+  }
+  if (_streamRafId === null) {
+    _streamRafId = requestAnimationFrame(_flushStreamBubble);
+  }
+}
+
+// ---------- Dựng Markdown mà KHÔNG làm hỏng công thức toán ----------
+// LỖI GỐC (đã sửa): trước đây gọi thẳng marked.parse() rồi mới tới KaTeX. Nhưng theo chuẩn
+// Markdown, dấu "\" đứng trước dấu câu là KÝ TỰ THOÁT -> marked NUỐT MẤT dấu "\" trong
+// "\(", "\)", "\[", "\]". Tới lượt KaTeX thì dấu hiệu nhận biết công thức đã biến mất, nên
+// nó không dựng được gì cả, và học sinh thấy nguyên "( a = 0 )", "\dfrac" mất dấu... Ngoài
+// ra dấu "_" trong công thức (vd y_1) còn bị Markdown hiểu là IN NGHIÊNG, làm hỏng chỉ số dưới.
+// CÁCH SỬA: tách các đoạn công thức ra, thay bằng mã giữ chỗ (@@KTX0@@) TRƯỚC khi chạy
+// Markdown, rồi trả lại nguyên văn SAU khi Markdown xong -> KaTeX nhận được công thức y hệt
+// những gì AI viết ra.
+function protectMath(text) {
+  const store = [];
+  const patterns = [
+    /\$\$[\s\S]+?\$\$/g,                  // $$...$$
+    /\\\[[\s\S]+?\\\]/g,                   // \[...\]
+    /\\\([\s\S]+?\\\)/g,                   // \(...\)
+    /\$([^\s$][^$\n]*?[^\s$]|[^\s$])\$/g,  // $...$ (bỏ qua kiểu tiền tệ "50$ và 100$")
+    // Lưu ý: CỐ TÌNH không dùng regex lookbehind (?<!...) ở đây — Safari trên iPhone cũ hơn
+    // iOS 16.4 không hỗ trợ, và nó gây LỖI CÚ PHÁP làm chết toàn bộ JavaScript của trang.
+  ];
+  let out = text;
+  patterns.forEach(re => {
+    out = out.replace(re, (m) => {
+      store.push(m);
+      return `@@KTX${store.length - 1}@@`;
+    });
+  });
+  return { text: out, store };
+}
+
+function restoreMath(html, store) {
+  return html.replace(/@@KTX(\d+)@@/g, (m, i) => (store[+i] !== undefined ? store[+i] : m));
+}
+
+function renderMarkdownSafe(text) {
+  const p = protectMath(text);
+  return restoreMath(marked.parse(p.text), p.store);
 }
 
 // ---------- Báo lỗi câu trả lời ----------
@@ -4637,9 +4755,22 @@ function toggleConvMenu(conv, anchorEl) {
     </button>`;
 
   document.body.appendChild(menu);
+  // Đặt vị trí SAU khi đã gắn vào trang để đo được kích thước THẬT của menu.
+  // Trước đây code giả định menu luôn cao 260px — nhưng menu có nhiều dự án thì cao hơn,
+  // nên phần cuối (đúng chỗ nút "Xoá đoạn chat") bị tràn ra ngoài màn hình điện thoại.
   const rect = anchorEl.getBoundingClientRect();
-  menu.style.top = Math.min(rect.bottom + 4, window.innerHeight - 260) + 'px';
-  menu.style.left = Math.min(rect.right - 200, window.innerWidth - 210) + 'px';
+  const mw = menu.offsetWidth || 200;
+  const mh = menu.offsetHeight || 260;
+  const pad = 8;
+  let left = rect.right - mw;
+  left = Math.max(pad, Math.min(left, window.innerWidth - mw - pad));
+  let top = rect.bottom + 4;
+  if (top + mh > window.innerHeight - pad) {
+    // Không đủ chỗ bên dưới -> mở NGƯỢC LÊN trên nút 3 chấm.
+    top = Math.max(pad, rect.top - mh - 4);
+  }
+  menu.style.left = left + 'px';
+  menu.style.top = top + 'px';
 
   menu.querySelector('.pin-opt').addEventListener('click', async (e) => {
     e.stopPropagation();
