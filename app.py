@@ -2196,11 +2196,19 @@ HTML = r'''
     .dark .theme-opt.active { color: #93c5fd; }
 
     .conv-menu { position: absolute; z-index: 45; min-width: 180px; }
+
+    /* Chiều cao khung app: trên trình duyệt ĐIỆN THOẠI, 100vh tính cả phần bị thanh địa chỉ
+       và thanh công cụ dưới che mất -> layout cao hơn vùng nhìn thấy thật, khiến khung chat
+       và ô nhập câu hỏi bị đẩy ra ngoài màn hình mà KHÔNG cuộn tới được (vì body đang
+       overflow:hidden). 100dvh (dynamic viewport height) tính đúng vùng đang nhìn thấy và tự
+       co giãn khi thanh địa chỉ ẩn/hiện. Giữ 100vh ở dòng trên làm phương án dự phòng cho
+       trình duyệt cũ chưa hỗ trợ dvh. */
+    .app-shell { height: 100vh; height: 100dvh; }
   </style>
 </head>
-<body class="h-screen overflow-hidden bg-white dark:bg-[#212121] text-gray-800 dark:text-gray-100">
+<body class="app-shell overflow-hidden bg-white dark:bg-[#212121] text-gray-800 dark:text-gray-100">
 
-<div class="flex h-screen">
+<div class="flex app-shell">
 
   <!-- ===================== SIDEBAR ===================== -->
   <aside id="sidebar" class="fixed lg:static inset-y-0 left-0 z-50 w-72 flex-shrink-0 bg-gray-50 dark:bg-[#171717] border-r border-gray-200 dark:border-gray-800 flex flex-col">
@@ -2303,9 +2311,9 @@ HTML = r'''
   <div id="sidebarOverlay" class="hidden fixed inset-0 bg-black/40 z-40 lg:hidden"></div>
 
   <!-- ===================== MAIN ===================== -->
-  <div class="flex-1 flex flex-col min-w-0">
+  <div class="flex-1 flex flex-col min-w-0 min-h-0">
 
-    <header class="flex items-center gap-2 px-3 lg:px-5 py-3 border-b border-gray-200 dark:border-gray-800 flex-wrap">
+    <header class="flex items-center gap-2 px-3 lg:px-5 py-3 border-b border-gray-200 dark:border-gray-800 flex-wrap flex-shrink-0">
       <button id="openSidebarBtn" class="lg:hidden w-9 h-9 flex items-center justify-center rounded-lg hover:bg-gray-100 dark:hover:bg-gray-800 text-gray-600 dark:text-gray-300">
         <i class="fas fa-bars"></i>
       </button>
@@ -2359,7 +2367,7 @@ HTML = r'''
         </div>
       </div>
 
-      <div class="flex-1"></div>
+      <div class="hidden lg:block lg:flex-1"></div>
 
       <button onclick="startVoice()" data-i18n-title="voice_tooltip" class="w-9 h-9 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-800 text-gray-600 dark:text-gray-300 flex items-center justify-center" title="Trợ lý giọng nói">
         <i class="fas fa-microphone"></i>
@@ -2375,7 +2383,7 @@ HTML = r'''
       <button onclick="dismissBanner()" class="w-6 h-6 flex items-center justify-center rounded hover:bg-amber-200/60 dark:hover:bg-amber-800/60 flex-shrink-0"><i class="fas fa-xmark text-xs"></i></button>
     </div>
 
-    <div id="chatPanel" class="flex-1 overflow-y-auto scroll-smooth">
+    <div id="chatPanel" class="flex-1 min-h-0 overflow-y-auto scroll-smooth">
       <div class="drag-overlay">
         <i class="fas fa-cloud-arrow-up text-4xl"></i>
         <span>Thả file hoặc ảnh vào đây</span>
@@ -2383,7 +2391,7 @@ HTML = r'''
       <div id="chat" class="max-w-3xl mx-auto px-4 py-6 space-y-6"></div>
     </div>
 
-    <div class="border-t border-gray-200 dark:border-gray-800 p-3 lg:p-4">
+    <div class="border-t border-gray-200 dark:border-gray-800 p-3 lg:p-4 flex-shrink-0">
       <div class="max-w-3xl mx-auto">
         <div id="attachmentsBar" class="hidden flex flex-wrap gap-2 mb-2"></div>
         <div class="flex items-end gap-2 bg-gray-100 dark:bg-gray-800 rounded-3xl px-2.5 py-2 border border-transparent focus-within:border-blue-400 dark:focus-within:border-blue-500 transition-colors">
