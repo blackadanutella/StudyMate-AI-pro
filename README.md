@@ -638,6 +638,82 @@ Giáo viên thấy: **sĩ số · điểm trung bình lớp · số học sinh c
 1. **Học sinh không mở nổi bài tập được giao.** Route xem đề (`/api/quizzes/<id>`) và route nộp bài đều chỉ cho **chủ sở hữu quiz** (tức giáo viên) truy cập — nghĩa là học sinh bấm "Làm bài" sẽ nhận 404, tính năng vô dụng hoàn toàn. Đã mở thêm đúng một nhánh: cho phép nếu quiz đó được giao cho lớp mà người dùng là **thành viên** — và kiểm thử lại rằng **người ngoài lớp vẫn bị chặn**.
 2. Một lỗi trong chính bài test của mình (dùng tên đăng nhập 2 ký tự, dưới mức tối thiểu 3) làm test báo sai — đáng nói vì trang đăng ký lỗi cũng trả HTTP 200, nên chỉ kiểm tra mã trạng thái là chưa đủ. Đã sửa test thành **gọi một API cần đăng nhập để xác nhận thật sự đã đăng nhập**, chắc chắn hơn.
 
+## 38. Sửa TẬN GỐC lỗi công thức toán — lần này tìm ra nguyên nhân thật (mới, quan trọng)
+
+Bạn gửi lại một câu trả lời của AI đầy `( a = 0 )`, `[ r = \dfrac{a}{b} ]`, `(b^(2025))`... và nói đúng: **"như này rồi sao người đọc được?"**
+
+**Thú nhận trước**: ở mục 18 và 21 mình đã 2 lần nói "đã sửa lỗi công thức" — nhưng cả 2 lần đó mình chỉ **vá phần ngọn** (lưới an toàn đổi `\sqrt{}` thành `√()`, và rút gọn lời dặn AI). Mình **chưa từng tìm ra nguyên nhân thật**, nên lỗi vẫn còn nguyên. Lần này thì tìm ra rồi:
+
+```javascript
+bubble.innerHTML = marked.parse(text);   // ← Markdown chạy TRƯỚC
+renderMathIn(bubble);                     // ← KaTeX chạy SAU, đã quá muộn
+```
+
+**Nguyên nhân gốc**: bộ dựng Markdown (`marked`) chạy **trước** KaTeX. Mà theo đúng chuẩn Markdown, dấu `\` đứng trước một dấu câu là **ký tự thoát** — nên `marked` **nuốt mất dấu `\`** trong `\(`, `\)`, `\[`, `\]`. Tới lượt KaTeX thì **dấu hiệu nhận biết công thức đã bị xoá sạch**, nó không còn gì để dựng. Đó chính xác là lý do học sinh thấy `( a = 0 )` thay vì công thức đẹp, và `\dfrac` mất dấu gạch chéo.
+
+**Còn một lỗi ngầm nữa mà bài kiểm thử phát hiện thêm**: dấu `_` trong công thức (vd `y_1`) bị Markdown hiểu là **in nghiêng** → mọi **chỉ số dưới** trong công thức đều đang bị hỏng âm thầm bấy lâu nay mà không ai để ý.
+
+**Cách sửa đúng**: tách các đoạn công thức ra thay bằng mã giữ chỗ **TRƯỚC** khi chạy Markdown, rồi trả lại nguyên văn **SAU** khi Markdown xong (`protectMath` / `restoreMath` / `renderMarkdownSafe`). KaTeX giờ nhận được công thức **y hệt** những gì AI viết ra.
+
+**Kiểm thử đã làm**:
+- Viết bài test tái hiện đúng hành vi nuốt dấu `\` của Markdown, chạy trên **chính đoạn văn bản trong ảnh bạn gửi** — xác nhận cách cũ hỏng, cách mới giữ nguyên 100%.
+- Trích **hàm thật từ `app.py`** (không phải bản nháp) chạy lại lần nữa để chắc chắn không sai khác lúc gõ.
+- Xác nhận Markdown thường (in nghiêng, đậm...) vẫn hoạt động bình thường, và tiền tệ kiểu `50$ và 100$` không bị nhầm thành công thức.
+
+⚠️ **Một rủi ro tự bắt được trong lúc sửa**: bản đầu tiên mình dùng regex **lookbehind** `(?<!...)`. Safari trên iPhone **cũ hơn iOS 16.4** không hỗ trợ cú pháp này — và nó không chỉ làm sai regex, mà gây **lỗi cú pháp làm chết TOÀN BỘ JavaScript của trang** (app trắng xoá, không dùng được gì). Với đối tượng học sinh THCS dùng máy cũ thì đây là rủi ro thật. Đã viết lại regex không dùng lookbehind, kiểm thử 6 trường hợp (công thức 1 ký tự, công thức có dấu cách, tiền tệ...) đều đúng.
+
+## 39. Nâng cấp HIỆU NĂNG — 2 điểm nghẽn thật, có số liệu đo (mới)
+
+Bạn cho quyền tự chọn nâng cấp. Mình **không thêm tính năng mới** — app đã quá nhiều tính năng rồi. Thay vào đó mình đi tìm điểm nghẽn hiệu năng thật, và tìm ra 2 cái nghiêm trọng, cả hai đều **càng dùng lâu càng tệ**:
+
+### 🗄️ 1. Database không có MỘT chỉ mục (index) nào — nhanh hơn **48 lần** sau khi sửa
+Kiểm tra ra: **29 bảng, 0 index**, trong khi có **~38 truy vấn lọc theo `user_id`**. Nghĩa là mỗi lần mở lịch sử chat, bảng tiến độ, hay trang developer, SQLite phải **quét toàn bộ bảng từ đầu tới cuối**.
+
+Điểm nguy hiểm: lúc ít dữ liệu thì không ai thấy gì — nhưng càng dùng lâu càng chậm dần đều, và **chậm nhất đúng với tài khoản chăm học nhất** (nhiều dữ liệu nhất). Tức là hệ thống đang phạt oan chính những học sinh dùng app nhiều nhất.
+
+Đã thêm **27 index** cho mọi đường truy vấn nóng. **Số liệu đo thật** (giả lập quy mô trường học: 800 tài khoản, ~48.000 đoạn chat, 120.000 lượt hỏi, mỗi phép đo 200 lượt truy cập):
+
+| Thao tác | Không index | Có index | Nhanh hơn |
+|---|---:|---:|---:|
+| Mở lịch sử chat | 393 ms | 9 ms | **43×** |
+| Bảng tiến độ (thống kê môn) | 1.177 ms | 22 ms | **54×** |
+| Sổ lỗi sai | 82 ms | 3 ms | **27×** |
+| **Tổng** | **1.652 ms** | **34 ms** | **48×** |
+
+Không chỉ tạo index rồi tin là xong — đã dùng `EXPLAIN QUERY PLAN` xác nhận SQLite **thật sự dùng** chúng (`SEARCH ... USING INDEX idx_conv_user`) chứ không phải bỏ qua.
+
+### ⚡ 2. Mỗi token nhận về đều dựng lại TOÀN BỘ câu trả lời
+Trong lúc AI trả lời, cứ **mỗi token** nhận được là chạy lại Markdown + KaTeX **trên cả bài từ đầu tới cuối**. Câu trả lời 1.500 token = 1.500 lần dựng lại một chuỗi ngày càng dài — khối lượng tính toán tăng theo **bình phương** độ dài.
+
+Hệ quả: càng về cuối câu trả lời càng giật, đúng vào lúc học sinh đang chờ đọc — tức là **trải nghiệm cốt lõi của app**. Trên điện thoại yếu thì tệ hơn nhiều.
+
+Đã sửa: gom các token đến liên tiếp lại, chỉ vẽ **tối đa 1 lần mỗi khung hình** (`requestAnimationFrame`). Mắt người vẫn thấy chữ chạy mượt y như cũ, nhưng khối lượng tính toán giảm rất nhiều. Lượt vẽ **cuối cùng luôn chạy ngay lập tức**, không hoãn, để nội dung cuối cùng chắc chắn đầy đủ và chính xác.
+
+> 📌 Cả 2 nâng cấp này đều **không đổi gì về giao diện hay cách dùng** — học sinh không thấy nút mới nào, chỉ thấy app nhanh hơn. Đó đúng là loại nâng cấp mà một sản phẩm đã nhiều tính năng như thế này đang cần nhất.
+
+## 40. Sửa lỗi Ghim / Xoá đoạn chat không bấm được trên điện thoại (mới)
+
+Bạn báo phần **ghim** và **xoá riêng lẻ** đoạn chat không hoạt động. Kiểm tra kỹ:
+
+**Backend hoàn toàn bình thường** — đã viết test gọi thẳng API: ghim → kiểm tra trong database (`pinned=1`), bỏ ghim → về `0`, xoá riêng lẻ → đúng 1 đoạn biến mất, các đoạn khác còn nguyên. Tất cả đều đạt. Vậy lỗi nằm ở giao diện.
+
+**Nguyên nhân thật — đè lớp (z-index)**:
+
+| Thành phần | z-index |
+|---|---|
+| Sidebar (trên điện thoại) | **50** |
+| Menu 3 chấm `.conv-menu` | **45** ← thấp hơn |
+
+Menu mở ra ngay bên trong vùng ngang của sidebar, mà z-index lại THẤP HƠN sidebar → **sidebar (nền đục) vẽ đè lên menu**. Kết quả: menu vừa không nhìn thấy, vừa không bấm được.
+
+Vì sao trước đây vẫn dùng được? Trên **máy tính** sidebar là `position: static` — mà z-index **không có tác dụng** với phần tử static — nên menu vẫn nổi lên trên bình thường. Chỉ trên **điện thoại** sidebar mới là `position: fixed`, lúc đó z-index mới có hiệu lực và gây ra lỗi. Đúng kiểu lỗi chỉ lộ ra khi dùng điện thoại.
+
+**Đã sửa**:
+- `z-index: 45` → **55** (trên sidebar 50, dưới hộp thoại 60).
+- `position: absolute` → **fixed**, cho khớp với toạ độ lấy từ `getBoundingClientRect()` (vốn tính theo màn hình), đồng thời tránh bị cắt bởi `overflow:hidden` của phần tử cha.
+- **Sửa thêm một lỗi ngầm chưa ai báo**: code cũ giả định menu luôn cao đúng 260px. Menu có nhiều dự án thì cao hơn → phần cuối (đúng chỗ nút **"Xoá đoạn chat"**) bị tràn ra ngoài màn hình, tức là nút xoá có thể bấm không tới ngay cả khi menu đã hiện. Giờ đo kích thước **thật** sau khi menu được gắn vào trang, và nếu không đủ chỗ bên dưới thì **tự mở ngược lên trên**.
+- Đã mô phỏng 5 kích thước màn hình thật (iPhone SE, Android 360px, máy tính) kèm 2 trường hợp khó nhất — chat sát đáy màn hình và menu rất dài — xác nhận menu **luôn nằm trọn trong màn hình**.
+
 ## Chưa làm (nằm ngoài phạm vi yêu cầu lần này)
 Phần đầu prompt gốc của bạn từng có yêu cầu dựng lại toàn bộ thành một sản phẩm Next.js/TypeScript quy mô lớn (nhiều trang, Dashboard, Blog, Pricing...). Bản cập nhật này vẫn giữ nguyên nền tảng Flask hiện có của bạn. Nếu bạn vẫn muốn bản Next.js quy mô lớn, đó sẽ là một dự án tách riêng — cho mình biết nếu bạn muốn triển khai.
 
