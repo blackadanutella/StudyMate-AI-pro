@@ -591,6 +591,24 @@ Bạn hỏi "còn thiếu gì, cần thứ đột phá" — nhận định của
 
 ⚠️ **Tự bắt được 1 lỗi nghiêm trọng trong lúc làm**: 1 thao tác chỉnh sửa đã vô tình xoá mất dòng khai báo `function openPalette() {` (bảng lệnh nhanh Ctrl+K), làm phần thân hàm bị "mồ côi" — biến thành code chạy ngay lúc tải trang thay vì đợi người dùng bấm. Việc chạy lại kiểm tra cú pháp JS bằng Node.js sau MỖI thay đổi lớn (không chỉ tin `python3 -m py_compile`, vì lệnh đó chỉ kiểm tra phần Python bao quanh) đã bắt được lỗi này ngay lập tức — đã sửa và xác nhận lại bảng lệnh nhanh hoạt động bình thường trước khi giao.
 
+## 36. Sửa lỗi ĐIỆN THOẠI: khung chat với AI bị ẩn mất (mới, quan trọng)
+
+Bạn báo: dùng trên điện thoại thì phần chat với AI bị ẩn, "quá cỡ". Đã tìm ra **2 lỗi CSS kinh điển của mobile cộng lại** — đều nằm ở trang chat, không phải lỗi dữ liệu:
+
+**Lỗi 1 — `100vh` trên trình duyệt điện thoại KHÔNG bằng vùng nhìn thấy thật.**
+Trang chat dùng `h-screen` (= `height: 100vh`) kèm `overflow: hidden` ở `body`. Trên Safari/Chrome điện thoại, `100vh` tính cả phần bị **thanh địa chỉ phía trên và thanh công cụ phía dưới che mất** — nghĩa là khung app cao hơn màn hình thật khoảng 100–150px. Vì `body` đang `overflow:hidden` nên phần thừa đó **không cuộn tới được** → ô nhập câu hỏi và phần dưới khung chat bị đẩy hẳn ra ngoài, đúng như bạn thấy.
+→ Đã đổi sang **`100dvh`** (dynamic viewport height — tính đúng vùng đang nhìn thấy, tự co giãn khi thanh địa chỉ ẩn/hiện), vẫn giữ `100vh` làm dự phòng cho trình duyệt cũ.
+
+**Lỗi 2 — thiếu `min-h-0` trong flex column.**
+Trong CSS Flexbox, phần tử `flex-1` mặc định có `min-height: auto`, tức là **không co lại được nhỏ hơn nội dung bên trong**. Khi đoạn chat dài ra, khung `#chatPanel` cứ phình theo nội dung thay vì cuộn, đẩy ô nhập câu hỏi xuống dưới đáy màn hình.
+→ Đã thêm `min-h-0` cho cả cột nội dung chính lẫn `#chatPanel`, và `flex-shrink-0` cho header + vùng ô nhập để 2 phần này không bao giờ bị bóp méo.
+
+**Sửa thêm cho gọn trên màn hình nhỏ**: khoảng đệm `flex-1` giữa các nút ở header trước đây ép nút micro + đổi giao diện **xuống hẳn một dòng riêng** trên điện thoại (tốn thêm ~44px chiều cao vô ích). Giờ khoảng đệm đó chỉ bật từ màn hình lớn (`hidden lg:block`).
+
+Đã kiểm chứng cả 9 điểm sửa có mặt đúng trong HTML trang chat, và chạy lại kiểm thử tổng thể (chat, lưu lịch sử, tiến độ, thẻ ghi nhớ, trò chơi, developer, đăng nhập) — không có gì hỏng.
+
+> 📌 **Nhân tiện, về việc "mất lưu lịch sử trò chuyện" bạn báo trước đó**: bài kiểm thử ở trên có kiểm tra riêng phần này (gửi 1 tin nhắn → đọc lại `/api/conversations`) và **lịch sử được lưu đúng**. Nghĩa là code không có lỗi — càng củng cố nghi ngờ ở mục 31/32: dữ liệu bị mất là do **ổ đĩa tạm của Render** xoá file `studymate.db` mỗi lần deploy lại, chứ không phải app ghi sai. Cách xử lý triệt để vẫn là gắn Persistent Disk (mục 32) hoặc chuyển sang Postgres.
+
 ## Chưa làm (nằm ngoài phạm vi yêu cầu lần này)
 Phần đầu prompt gốc của bạn từng có yêu cầu dựng lại toàn bộ thành một sản phẩm Next.js/TypeScript quy mô lớn (nhiều trang, Dashboard, Blog, Pricing...). Bản cập nhật này vẫn giữ nguyên nền tảng Flask hiện có của bạn. Nếu bạn vẫn muốn bản Next.js quy mô lớn, đó sẽ là một dự án tách riêng — cho mình biết nếu bạn muốn triển khai.
 
