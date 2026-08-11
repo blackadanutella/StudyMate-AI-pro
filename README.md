@@ -609,6 +609,35 @@ Trong CSS Flexbox, phần tử `flex-1` mặc định có `min-height: auto`, t�
 
 > 📌 **Nhân tiện, về việc "mất lưu lịch sử trò chuyện" bạn báo trước đó**: bài kiểm thử ở trên có kiểm tra riêng phần này (gửi 1 tin nhắn → đọc lại `/api/conversations`) và **lịch sử được lưu đúng**. Nghĩa là code không có lỗi — càng củng cố nghi ngờ ở mục 31/32: dữ liệu bị mất là do **ổ đĩa tạm của Render** xoá file `studymate.db` mỗi lần deploy lại, chứ không phải app ghi sai. Cách xử lý triệt để vẫn là gắn Persistent Disk (mục 32) hoặc chuyển sang Postgres.
 
+## 37. 👩‍🏫 LỚP HỌC (Teacher Mode) — bước nhảy từ "app cá nhân" thành "nền tảng cho cả lớp" (mới)
+
+Bạn hỏi còn thiếu gì và muốn nâng lên tầm cao mới. Nhận định của mình: mọi tính năng tới giờ đều phục vụ **1 học sinh dùng một mình**. Thứ thay đổi được BẢN CHẤT sản phẩm — và cũng là mục đầu tiên trong Phase 2 do chính bạn đề ra — là **Teacher Mode**. Một giáo viên kéo theo cả lớp 40 học sinh; đó là khác biệt giữa "một công cụ" và "một nền tảng".
+
+Điểm hay: nó **dùng lại gần như toàn bộ** những gì đã xây suốt các lượt trước (Quiz Generator, hệ chấm điểm, phân tích điểm yếu theo chủ đề, Sổ lỗi sai) — không phải xây lại từ đầu.
+
+### Cách dùng (tab "Lớp học" mới)
+- **Giáo viên**: Tạo lớp → nhận **mã mời 6 ký tự** (bỏ ký tự dễ nhầm 0/O/1/I/L để đọc to trong lớp/chép lên bảng không sai) → đọc mã cho học sinh.
+- **Học sinh**: nhập mã → vào lớp ngay, không cần duyệt.
+- **Giao bài**: giáo viên chọn 1 quiz **đã tạo ở tab Quiz** + đặt hạn nộp → cả lớp thấy bài tập. Không nhân bản đề — cả lớp làm chung 1 quiz, điểm tách nhau nhờ mã bài tập.
+- **Học sinh làm bài** ngay trong app, chấm tự động, nộp xong quay lại lớp thấy điểm liền.
+
+### Bảng điều khiển lớp (đúng như mockup bạn từng vẽ)
+Giáo viên thấy: **sĩ số · điểm trung bình lớp · số học sinh cần chú ý**, kèm:
+- **"Cả lớp yếu nhất phần này"** — gom `weak_topics` của mọi bài làm trong lớp, không cần gọi thêm AI (dữ liệu vốn đã có từ hệ chấm quiz).
+- **Bảng từng học sinh**: đã làm bao nhiêu bài, điểm trung bình, tự gắn cờ ⚠️ **"cần chú ý"** (điểm TB dưới 50% hoặc chưa nộp bài nào).
+- Mỗi bài tập: bao nhiêu em đã nộp / điểm trung bình.
+- Mỗi học sinh chỉ tính **lần làm tốt nhất** cho mỗi bài tập (công bằng nếu cho làm lại).
+
+### Về phân quyền & riêng tư — đã kiểm thử kỹ
+- **Học sinh chỉ thấy điểm CỦA CHÍNH MÌNH.** Đã viết test xác nhận API trả về cho học sinh **không hề chứa** danh sách điểm bạn khác, điểm trung bình lớp, phân tích điểm yếu lớp, và **không chứa cả mã mời lớp**.
+- Chỉ giáo viên của lớp mới giao được bài. Người ngoài không xem được lớp (403).
+- **Chống giả mạo**: đã test kịch bản người ngoài cố gửi mã bài tập của lớp mình không tham gia để chèn điểm vào — bị chặn, sĩ số và số bài nộp của lớp không đổi.
+- Không tạo vai trò "teacher" riêng: **bất kỳ tài khoản nào cũng tạo được lớp** (giáo viên thật, hoặc học sinh lập nhóm học chung) — đơn giản hơn và không đụng vào hệ phân quyền user/developer/admin/super_admin đang chạy ổn định.
+
+### 🐞 Hai lỗi thật do kiểm thử phát hiện (nếu không test thì đã giao hàng lỗi)
+1. **Học sinh không mở nổi bài tập được giao.** Route xem đề (`/api/quizzes/<id>`) và route nộp bài đều chỉ cho **chủ sở hữu quiz** (tức giáo viên) truy cập — nghĩa là học sinh bấm "Làm bài" sẽ nhận 404, tính năng vô dụng hoàn toàn. Đã mở thêm đúng một nhánh: cho phép nếu quiz đó được giao cho lớp mà người dùng là **thành viên** — và kiểm thử lại rằng **người ngoài lớp vẫn bị chặn**.
+2. Một lỗi trong chính bài test của mình (dùng tên đăng nhập 2 ký tự, dưới mức tối thiểu 3) làm test báo sai — đáng nói vì trang đăng ký lỗi cũng trả HTTP 200, nên chỉ kiểm tra mã trạng thái là chưa đủ. Đã sửa test thành **gọi một API cần đăng nhập để xác nhận thật sự đã đăng nhập**, chắc chắn hơn.
+
 ## Chưa làm (nằm ngoài phạm vi yêu cầu lần này)
 Phần đầu prompt gốc của bạn từng có yêu cầu dựng lại toàn bộ thành một sản phẩm Next.js/TypeScript quy mô lớn (nhiều trang, Dashboard, Blog, Pricing...). Bản cập nhật này vẫn giữ nguyên nền tảng Flask hiện có của bạn. Nếu bạn vẫn muốn bản Next.js quy mô lớn, đó sẽ là một dự án tách riêng — cho mình biết nếu bạn muốn triển khai.
 
