@@ -724,7 +724,56 @@ def init_db():
     ''')
     conn.commit()
 
-    # ---- Tạo (hoặc nâng cấp) tài khoản developer ----
+    # ========== "LỚP HỌC" (Teacher Mode) ==========
+    # Biến app từ công cụ cá nhân thành nền tảng cho cả lớp: giáo viên tạo lớp -> lấy mã mời ->
+    # học sinh vào lớp bằng mã -> giáo viên giao BÀI QUIZ CÓ SẴN (dùng lại nguyên hệ Quiz
+    # Generator đã có) kèm hạn nộp -> hệ thống tự tổng hợp ai đã làm, điểm trung bình, và
+    # ĐIỂM YẾU CHUNG CỦA CẢ LỚP (gom từ weak_topics của từng bài làm — dữ liệu vốn đã có sẵn,
+    # không cần gọi thêm AI).
+    # KHÔNG tạo vai trò "teacher" riêng: bất kỳ tài khoản nào cũng có thể tạo lớp (giáo viên
+    # thật, hoặc 1 học sinh lập nhóm học chung) — đơn giản hơn và không phá vỡ hệ phân quyền
+    # user/developer/admin/super_admin đang chạy ổn định.
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS classes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            owner_id INTEGER NOT NULL,
+            name TEXT NOT NULL,
+            subject TEXT DEFAULT '',
+            join_code TEXT UNIQUE NOT NULL,
+            archived INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (owner_id) REFERENCES users (id)
+        )
+    ''')
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS class_members (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            class_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            joined_at TEXT NOT NULL,
+            UNIQUE(class_id, user_id),
+            FOREIGN KEY (class_id) REFERENCES classes (id),
+            FOREIGN KEY (user_id) REFERENCES users (id)
+        )
+    ''')
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS assignments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            class_id INTEGER NOT NULL,
+            quiz_id INTEGER NOT NULL,
+            title TEXT NOT NULL,
+            due_at TEXT,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (class_id) REFERENCES classes (id),
+            FOREIGN KEY (quiz_id) REFERENCES quizzes (id)
+        )
+    ''')
+    conn.commit()
+    # Nối bài làm quiz với bài tập được giao (nếu có) — dùng lại bảng quiz_attempts sẵn có
+    # thay vì tạo bảng "bài nộp" riêng, để điểm/phân tích điểm yếu dùng chung một nguồn.
+    ensure_columns(conn, 'quiz_attempts', {'assignment_id': 'INTEGER'})
+
+
     # Có thể tuỳ chỉnh qua .env: DEVELOPER_USERNAME / DEVELOPER_PASSWORD.
     # Nếu chưa có tài khoản này, server sẽ tự tạo và in mật khẩu ra console 1 lần duy nhất.
     dev_username = (os.environ.get('DEVELOPER_USERNAME', '') or 'developer').strip()
@@ -2439,9 +2488,107 @@ HTML = r'''
     <button id="fcTabGames" onclick="switchFcTab('games')" class="px-3.5 py-2 text-sm font-medium border-b-2 border-transparent text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 flex items-center gap-1.5 whitespace-nowrap">
       <i class="fas fa-gamepad"></i> Trò chơi
     </button>
+    <button id="fcTabClasses" onclick="switchFcTab('classes')" class="px-3.5 py-2 text-sm font-medium border-b-2 border-transparent text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 flex items-center gap-1.5 whitespace-nowrap">
+      <i class="fas fa-chalkboard-user"></i> Lớp học
+    </button>
   </div>
 
   <div class="flex-1 overflow-y-auto">
+    <!-- ============ Lớp học: danh sách ============ -->
+    <div id="fcClassesListView" class="hidden max-w-3xl mx-auto p-4 lg:p-6">
+      <div class="flex flex-wrap gap-2 mb-5">
+        <button onclick="document.getElementById('createClassForm').classList.toggle('hidden')" class="px-4 py-2.5 rounded-xl bg-gradient-to-r from-indigo-600 to-purple-600 hover:opacity-90 text-white text-sm font-semibold flex items-center gap-2">
+          <i class="fas fa-plus"></i> Tạo lớp (dạy)
+        </button>
+        <button onclick="document.getElementById('joinClassForm').classList.toggle('hidden')" class="px-4 py-2.5 rounded-xl border border-gray-300 dark:border-gray-700 hover:bg-gray-100 dark:hover:bg-gray-800 text-sm font-medium flex items-center gap-2">
+          <i class="fas fa-right-to-bracket"></i> Vào lớp bằng mã
+        </button>
+      </div>
+
+      <div id="createClassForm" class="hidden mb-5 p-4 rounded-2xl border border-indigo-200 dark:border-indigo-900 bg-indigo-50 dark:bg-indigo-900/10 space-y-2.5">
+        <input id="newClassName" maxlength="80" placeholder="Tên lớp (vd: Lớp 8A2 - Toán cô Anh)" class="w-full px-3 py-2.5 rounded-xl bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 text-sm dark:text-white focus:outline-none focus:ring-2 focus:ring-indigo-500">
+        <input id="newClassSubject" maxlength="60" placeholder="Môn học (tuỳ chọn)" class="w-full px-3 py-2 rounded-xl bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 text-sm dark:text-white focus:outline-none focus:ring-2 focus:ring-indigo-500">
+        <button onclick="submitCreateClass()" class="px-4 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-white text-sm font-semibold">Tạo lớp</button>
+        <p id="createClassError" class="hidden text-xs text-red-500"></p>
+      </div>
+
+      <div id="joinClassForm" class="hidden mb-5 p-4 rounded-2xl border border-gray-200 dark:border-gray-700 space-y-2.5">
+        <input id="joinClassCode" maxlength="8" placeholder="Nhập mã lớp (vd: 4TFBF5)" class="w-full px-3 py-2.5 rounded-xl bg-gray-100 dark:bg-gray-800 border-0 text-sm dark:text-white font-mono tracking-widest uppercase focus:outline-none focus:ring-2 focus:ring-indigo-500">
+        <button onclick="submitJoinClass()" class="px-4 py-2 rounded-xl bg-gray-800 dark:bg-gray-700 hover:bg-gray-900 text-white text-sm font-semibold">Vào lớp</button>
+        <p id="joinClassError" class="hidden text-xs text-red-500"></p>
+      </div>
+
+      <div id="teachingSection" class="hidden mb-6">
+        <h3 class="text-sm font-bold mb-2.5">👩‍🏫 Lớp em dạy</h3>
+        <div id="teachingList" class="space-y-2"></div>
+      </div>
+      <div id="learningSection" class="hidden">
+        <h3 class="text-sm font-bold mb-2.5">🎒 Lớp em học</h3>
+        <div id="learningList" class="space-y-2"></div>
+      </div>
+      <p id="classesEmptyState" class="hidden text-center text-sm text-gray-400 py-16">Chưa có lớp nào.<br>Tạo lớp để giao bài cho học sinh, hoặc nhập mã lớp để vào lớp của thầy cô.</p>
+    </div>
+
+    <!-- ============ Lớp học: chi tiết ============ -->
+    <div id="fcClassDetailView" class="hidden max-w-3xl mx-auto p-4 lg:p-6 space-y-5">
+      <div>
+        <div class="flex flex-wrap items-start justify-between gap-2">
+          <div>
+            <h3 id="classDetailName" class="font-bold text-lg"></h3>
+            <p id="classDetailMeta" class="text-xs text-gray-400"></p>
+          </div>
+          <button id="classLeaveBtn" onclick="deleteOrLeaveClass()" class="px-3 py-2 rounded-xl bg-red-50 dark:bg-red-900/20 text-red-600 dark:text-red-400 text-xs font-semibold hover:bg-red-100 dark:hover:bg-red-900/40"></button>
+        </div>
+        <div id="classJoinCodeBox" class="hidden mt-3 p-3 rounded-xl bg-indigo-50 dark:bg-indigo-900/20 border border-indigo-100 dark:border-indigo-900/50 flex items-center justify-between gap-2">
+          <div>
+            <p class="text-[11px] text-indigo-500 uppercase font-semibold">Mã mời vào lớp</p>
+            <p id="classJoinCode" class="font-mono text-2xl font-bold tracking-widest text-indigo-700 dark:text-indigo-300 select-all"></p>
+          </div>
+          <button onclick="copyJoinCode()" id="copyJoinCodeBtn" class="text-xs font-semibold px-3 py-2 rounded-lg bg-white dark:bg-gray-800 border border-indigo-200 dark:border-indigo-800"><i class="fas fa-copy mr-1"></i>Chép</button>
+        </div>
+      </div>
+
+      <!-- Tổng quan lớp (chỉ giáo viên) -->
+      <div id="classOverview" class="hidden grid grid-cols-3 gap-3">
+        <div class="rounded-2xl border border-gray-200 dark:border-gray-800 p-4 text-center">
+          <p class="text-2xl font-bold" id="classStudentCount">0</p><p class="text-[11px] text-gray-400 uppercase mt-0.5">Học sinh</p>
+        </div>
+        <div class="rounded-2xl border border-gray-200 dark:border-gray-800 p-4 text-center">
+          <p class="text-2xl font-bold text-emerald-500" id="classAvg">—</p><p class="text-[11px] text-gray-400 uppercase mt-0.5">Điểm TB lớp</p>
+        </div>
+        <div class="rounded-2xl border border-gray-200 dark:border-gray-800 p-4 text-center">
+          <p class="text-2xl font-bold text-amber-500" id="classNeedAttention">0</p><p class="text-[11px] text-gray-400 uppercase mt-0.5">Cần chú ý</p>
+        </div>
+      </div>
+
+      <div id="classWeakSection" class="hidden">
+        <h4 class="text-sm font-bold mb-2">⚠️ Cả lớp yếu nhất phần này</h4>
+        <div id="classWeakTopics" class="flex flex-wrap gap-2"></div>
+      </div>
+
+      <!-- Giao bài (chỉ giáo viên) -->
+      <div id="assignSection" class="hidden">
+        <h4 class="text-sm font-bold mb-2">📤 Giao bài mới</h4>
+        <div class="flex flex-wrap gap-2 items-center">
+          <select id="assignQuizSelect" class="flex-1 min-w-[160px] px-3 py-2 rounded-xl bg-gray-100 dark:bg-gray-800 border-0 text-sm dark:text-white"></select>
+          <input id="assignDueDate" type="date" class="px-3 py-2 rounded-xl bg-gray-100 dark:bg-gray-800 border-0 text-sm dark:text-white">
+          <button onclick="submitAssignment()" class="px-4 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-white text-sm font-semibold">Giao</button>
+        </div>
+        <p class="text-[11px] text-gray-400 mt-1.5">Chỉ giao được quiz do chính em tạo (tab Quiz). Chưa có quiz nào thì tạo trước ở tab Quiz nhé.</p>
+        <p id="assignError" class="hidden text-xs text-red-500 mt-1"></p>
+      </div>
+
+      <div>
+        <h4 class="text-sm font-bold mb-2">📝 Bài tập</h4>
+        <div id="classAssignments" class="space-y-2"></div>
+      </div>
+
+      <div id="classStudentsSection" class="hidden">
+        <h4 class="text-sm font-bold mb-2">👥 Học sinh</h4>
+        <div id="classStudents" class="space-y-2"></div>
+      </div>
+    </div>
+
     <!-- ============ Thư viện trò chơi ============ -->
     <div id="fcGamesListView" class="hidden max-w-3xl mx-auto p-4 lg:p-6">
       <p class="text-xs text-gray-400 mb-4">Học mà chơi — chơi xong tự động lưu điểm yếu vào Sổ lỗi sai để ôn đúng chỗ.</p>
@@ -4598,7 +4745,7 @@ function closeFlashcards() {
 }
 document.getElementById('openFlashcardsBtn').addEventListener('click', openFlashcards);
 
-const FC_TABS = ['decks', 'mistakes', 'quiz', 'plans', 'games'];
+const FC_TABS = ['decks', 'mistakes', 'quiz', 'plans', 'games', 'classes'];
 function switchFcTab(tab) {
   FC_TABS.forEach(t => {
     const btn = document.getElementById('fcTab' + t.charAt(0).toUpperCase() + t.slice(1));
@@ -4615,6 +4762,7 @@ function switchFcTab(tab) {
   else if (tab === 'quiz') { showFcView('quizList'); loadQuizzes(); }
   else if (tab === 'plans') { showFcView('plansList'); loadStudyPlans(); }
   else if (tab === 'games') { showFcView('gamesList'); loadGameStats(); }
+  else if (tab === 'classes') { showFcView('classesList'); loadClasses(); }
 }
 
 const FC_VIEWS = {
@@ -4624,8 +4772,9 @@ const FC_VIEWS = {
   plansList: 'fcPlansListView', planDetail: 'fcPlanDetailView',
   gamesList: 'fcGamesListView', qmSetup: 'fcQuickMathSetupView', qmPlay: 'fcQuickMathPlayView', qmResult: 'fcQuickMathResultView',
   snakeSetup: 'fcSnakeSetupView', snakePlay: 'fcSnakePlayView', snakeResult: 'fcSnakeResultView',
+  classesList: 'fcClassesListView', classDetail: 'fcClassDetailView',
 };
-const FC_TOP_LEVEL_VIEWS = ['list', 'mistakes', 'quizList', 'plansList', 'gamesList'];
+const FC_TOP_LEVEL_VIEWS = ['list', 'mistakes', 'quizList', 'plansList', 'gamesList', 'classesList'];
 
 function showFcView(view) {
   Object.values(FC_VIEWS).forEach(id => document.getElementById(id).classList.add('hidden'));
@@ -4662,6 +4811,9 @@ function showFcView(view) {
   } else if (view === 'snakeSetup' || view === 'snakePlay' || view === 'snakeResult') {
     title.textContent = 'Rắn Săn Chữ';
     backBtn.onclick = () => { stopSnakeGame(); switchFcTab('games'); };
+  } else if (view === 'classDetail') {
+    title.textContent = 'Lớp học';
+    backBtn.onclick = () => switchFcTab('classes');
   }
 }
 
@@ -5088,6 +5240,210 @@ const QM_OP_LABELS = { '+': 'Phép cộng', '-': 'Phép trừ', '×': 'Phép nh�
 let qmState = null;
 let qmTimerHandle = null;
 let qmSelectedDifficulty = 'easy';
+
+// ==================================================================
+// LỚP HỌC (Teacher Mode)
+// ==================================================================
+let currentClassId = null;
+let currentClassRole = null;
+let currentJoinCode = '';
+
+async function loadClasses() {
+  try {
+    const res = await fetch('/api/classes');
+    if (!res.ok) return;
+    const d = await res.json();
+    const tSec = document.getElementById('teachingSection'), lSec = document.getElementById('learningSection');
+    const tList = document.getElementById('teachingList'), lList = document.getElementById('learningList');
+    tList.innerHTML = ''; lList.innerHTML = '';
+    tSec.classList.toggle('hidden', !d.teaching.length);
+    lSec.classList.toggle('hidden', !d.learning.length);
+    document.getElementById('classesEmptyState').classList.toggle('hidden', d.teaching.length || d.learning.length);
+
+    d.teaching.forEach(c => {
+      const el = document.createElement('div');
+      el.className = 'rounded-2xl border border-gray-200 dark:border-gray-800 p-4 cursor-pointer hover:border-indigo-400 dark:hover:border-indigo-600 transition-colors';
+      el.innerHTML = `<div class="flex items-center justify-between gap-2">
+          <p class="font-semibold truncate">${escapeHtml(c.name)}</p>
+          <span class="font-mono text-xs px-2 py-1 rounded-lg bg-indigo-50 dark:bg-indigo-900/30 text-indigo-600 dark:text-indigo-300 flex-shrink-0">${escapeHtml(c.join_code)}</span>
+        </div>
+        <p class="text-xs text-gray-400 mt-1">${escapeHtml(c.subject || 'Chung')} · ${c.student_count} học sinh · ${c.assignment_count} bài tập</p>`;
+      el.addEventListener('click', () => showClassDetail(c.id));
+      tList.appendChild(el);
+    });
+    d.learning.forEach(c => {
+      const el = document.createElement('div');
+      el.className = 'rounded-2xl border border-gray-200 dark:border-gray-800 p-4 cursor-pointer hover:border-emerald-400 dark:hover:border-emerald-600 transition-colors';
+      el.innerHTML = `<p class="font-semibold truncate">${escapeHtml(c.name)}</p>
+        <p class="text-xs text-gray-400 mt-1">GV: ${escapeHtml(c.teacher)} · ${escapeHtml(c.subject || 'Chung')} · ${c.assignment_count} bài tập</p>`;
+      el.addEventListener('click', () => showClassDetail(c.id));
+      lList.appendChild(el);
+    });
+  } catch (e) { /* im lặng bỏ qua lỗi mạng */ }
+}
+
+async function submitCreateClass() {
+  const name = document.getElementById('newClassName').value.trim();
+  const subject = document.getElementById('newClassSubject').value.trim();
+  const err = document.getElementById('createClassError');
+  err.classList.add('hidden');
+  if (!name) { document.getElementById('newClassName').focus(); return; }
+  try {
+    const res = await fetch('/api/classes', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({name, subject}) });
+    const d = await res.json();
+    if (!res.ok) { err.textContent = d.error || 'Không tạo được lớp.'; err.classList.remove('hidden'); return; }
+    document.getElementById('newClassName').value = '';
+    document.getElementById('newClassSubject').value = '';
+    document.getElementById('createClassForm').classList.add('hidden');
+    showClassDetail(d.id);
+  } catch (e) { err.textContent = 'Lỗi mạng.'; err.classList.remove('hidden'); }
+}
+
+async function submitJoinClass() {
+  const code = document.getElementById('joinClassCode').value.trim();
+  const err = document.getElementById('joinClassError');
+  err.classList.add('hidden');
+  if (!code) { document.getElementById('joinClassCode').focus(); return; }
+  try {
+    const res = await fetch('/api/classes/join', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({code}) });
+    const d = await res.json();
+    if (!res.ok) { err.textContent = d.error || 'Không vào được lớp.'; err.classList.remove('hidden'); return; }
+    document.getElementById('joinClassCode').value = '';
+    document.getElementById('joinClassForm').classList.add('hidden');
+    showClassDetail(d.id);
+  } catch (e) { err.textContent = 'Lỗi mạng.'; err.classList.remove('hidden'); }
+}
+
+async function showClassDetail(classId) {
+  try {
+    const res = await fetch(`/api/classes/${classId}`);
+    if (!res.ok) { switchFcTab('classes'); return; }
+    const d = await res.json();
+    currentClassId = classId;
+    currentClassRole = d.my_role;
+    const isOwner = d.my_role === 'owner';
+
+    document.getElementById('classDetailName').textContent = d.class.name;
+    document.getElementById('classDetailMeta').textContent =
+      (d.class.subject || 'Chung') + (isOwner ? ' · Em là giáo viên' : ` · GV: ${d.class.teacher}`);
+    document.getElementById('classLeaveBtn').textContent = isOwner ? 'Xoá lớp' : 'Rời lớp';
+
+    // Mã mời — chỉ giáo viên thấy
+    const codeBox = document.getElementById('classJoinCodeBox');
+    codeBox.classList.toggle('hidden', !isOwner);
+    if (isOwner) { currentJoinCode = d.class.join_code; document.getElementById('classJoinCode').textContent = d.class.join_code; }
+
+    document.getElementById('classOverview').classList.toggle('hidden', !isOwner);
+    document.getElementById('assignSection').classList.toggle('hidden', !isOwner);
+    document.getElementById('classStudentsSection').classList.toggle('hidden', !isOwner);
+    document.getElementById('classWeakSection').classList.toggle('hidden', !isOwner || !(d.class_weak_topics || []).length);
+
+    if (isOwner) {
+      document.getElementById('classStudentCount').textContent = d.students.length;
+      document.getElementById('classAvg').textContent = d.class_avg_pct === null ? '—' : d.class_avg_pct + '%';
+      document.getElementById('classNeedAttention').textContent = d.needs_attention_count;
+
+      const weakBox = document.getElementById('classWeakTopics');
+      weakBox.innerHTML = '';
+      (d.class_weak_topics || []).forEach(w => {
+        const chip = document.createElement('span');
+        chip.className = 'text-xs font-semibold px-3 py-1.5 rounded-lg bg-amber-100 dark:bg-amber-900/30 text-amber-700 dark:text-amber-400';
+        chip.textContent = `${w.topic} (${w.count} lượt sai)`;
+        weakBox.appendChild(chip);
+      });
+
+      const sBox = document.getElementById('classStudents');
+      sBox.innerHTML = '';
+      if (!d.students.length) sBox.innerHTML = '<p class="text-sm text-gray-400 py-3">Chưa có học sinh nào. Chia sẻ mã mời ở trên cho lớp nhé!</p>';
+      d.students.forEach(s => {
+        const row = document.createElement('div');
+        row.className = `flex items-center justify-between gap-2 rounded-xl border px-3.5 py-2.5 ${s.needs_attention ? 'border-amber-200 dark:border-amber-900/50 bg-amber-50 dark:bg-amber-900/10' : 'border-gray-100 dark:border-gray-800'}`;
+        row.innerHTML = `<div class="min-w-0">
+            <p class="text-sm font-medium truncate">${escapeHtml(s.username)} ${s.needs_attention ? '<span class="text-amber-500">⚠️</span>' : ''}</p>
+            <p class="text-[11px] text-gray-400">Đã làm ${s.done}/${s.total_assignments} bài</p>
+          </div>
+          <span class="text-sm font-bold flex-shrink-0 ${s.avg_pct === null ? 'text-gray-400' : s.avg_pct >= 80 ? 'text-emerald-500' : s.avg_pct >= 50 ? 'text-amber-500' : 'text-red-500'}">${s.avg_pct === null ? '—' : s.avg_pct + '%'}</span>`;
+        sBox.appendChild(row);
+      });
+      loadQuizzesForAssign();
+    }
+
+    const aBox = document.getElementById('classAssignments');
+    aBox.innerHTML = '';
+    if (!d.assignments.length) aBox.innerHTML = '<p class="text-sm text-gray-400 py-3">Chưa có bài tập nào.</p>';
+    d.assignments.forEach(a => {
+      const row = document.createElement('div');
+      row.className = 'rounded-xl border border-gray-200 dark:border-gray-800 px-3.5 py-3';
+      let right = '';
+      if (isOwner) {
+        right = `<span class="text-xs text-gray-400">${a.submitted}/${a.total_students} đã nộp${a.avg_pct !== null ? ` · TB ${a.avg_pct}%` : ''}</span>`;
+      } else if (a.my_result) {
+        const p = a.my_result.pct;
+        right = `<span class="text-sm font-bold ${p >= 80 ? 'text-emerald-500' : p >= 50 ? 'text-amber-500' : 'text-red-500'}">${a.my_result.score}/${a.my_result.total} (${p}%)</span>`;
+      } else {
+        right = `<button class="do-assignment-btn text-xs font-semibold px-3 py-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-700 text-white" data-quiz="${a.quiz_id}" data-assignment="${a.id}">Làm bài</button>`;
+      }
+      row.innerHTML = `<div class="flex items-center justify-between gap-2">
+          <div class="min-w-0"><p class="text-sm font-medium truncate">${escapeHtml(a.title)}</p>
+          ${a.due_at ? `<p class="text-[11px] text-gray-400">Hạn nộp: ${escapeHtml(a.due_at.slice(0,10))}</p>` : ''}</div>
+          <div class="flex-shrink-0">${right}</div>
+        </div>`;
+      const btn = row.querySelector('.do-assignment-btn');
+      if (btn) btn.addEventListener('click', () => startQuiz(parseInt(btn.dataset.quiz,10), parseInt(btn.dataset.assignment,10)));
+      aBox.appendChild(row);
+    });
+
+    showFcView('classDetail');
+  } catch (e) { alert('Không tải được lớp học này.'); }
+}
+
+async function loadQuizzesForAssign() {
+  try {
+    const res = await fetch('/api/quizzes');
+    if (!res.ok) return;
+    const quizzes = await res.json();
+    const sel = document.getElementById('assignQuizSelect');
+    sel.innerHTML = quizzes.length
+      ? quizzes.map(q => `<option value="${q.id}">${escapeHtml(q.title)} (${q.question_count} câu)</option>`).join('')
+      : '<option value="">— Chưa có quiz nào —</option>';
+  } catch (e) { /* im lặng */ }
+}
+
+async function submitAssignment() {
+  const quizId = document.getElementById('assignQuizSelect').value;
+  const dueAt = document.getElementById('assignDueDate').value;
+  const err = document.getElementById('assignError');
+  err.classList.add('hidden');
+  if (!quizId) { err.textContent = 'Em cần tạo quiz ở tab Quiz trước đã.'; err.classList.remove('hidden'); return; }
+  try {
+    const res = await fetch(`/api/classes/${currentClassId}/assignments`, {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ quizId: parseInt(quizId,10), dueAt })
+    });
+    const d = await res.json();
+    if (!res.ok) { err.textContent = d.error || 'Không giao được bài.'; err.classList.remove('hidden'); return; }
+    showClassDetail(currentClassId);
+  } catch (e) { err.textContent = 'Lỗi mạng.'; err.classList.remove('hidden'); }
+}
+
+function copyJoinCode() {
+  if (!currentJoinCode) return;
+  navigator.clipboard.writeText(currentJoinCode).then(() => {
+    const b = document.getElementById('copyJoinCodeBtn');
+    const o = b.innerHTML;
+    b.innerHTML = '<i class="fas fa-check mr-1"></i>Đã chép';
+    setTimeout(() => { b.innerHTML = o; }, 1500);
+  });
+}
+
+async function deleteOrLeaveClass() {
+  const isOwner = currentClassRole === 'owner';
+  if (!confirm(isOwner ? 'Xoá lớp này? Toàn bộ bài tập và danh sách học sinh sẽ mất.' : 'Rời khỏi lớp này?')) return;
+  try {
+    await fetch(`/api/classes/${currentClassId}`, { method: 'DELETE' });
+    switchFcTab('classes');
+  } catch (e) { alert('Lỗi mạng.'); }
+}
 
 async function loadGameStats() {
   try {
@@ -5553,12 +5909,13 @@ async function submitQuizGeneration() {
   }
 }
 
-async function startQuiz(quizId) {
+async function startQuiz(quizId, assignmentId) {
   try {
     const res = await fetch(`/api/quizzes/${quizId}`);
     if (!res.ok) return;
     const data = await res.json();
     currentQuizId = quizId;
+    currentAssignmentId = assignmentId || null;   // nếu đang làm bài tập lớp giao
     currentQuizQuestions = data.questions;
     currentQuizIndex = 0;
     currentQuizAnswers = [];
@@ -5570,6 +5927,7 @@ async function startQuiz(quizId) {
   }
 }
 let currentQuizId = null;
+let currentAssignmentId = null;
 
 function renderQuizQuestion() {
   const q = currentQuizQuestions[currentQuizIndex];
@@ -5634,7 +5992,7 @@ async function finishQuiz() {
   try {
     const res = await fetch(`/api/quizzes/${currentQuizId}/submit`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ answers: currentQuizAnswers, durationSeconds, saveMistakes: true })
+      body: JSON.stringify({ answers: currentQuizAnswers, durationSeconds, saveMistakes: true, assignmentId: currentAssignmentId })
     });
     const data = await res.json();
     showFcView('quizResult');
@@ -5669,7 +6027,13 @@ async function finishQuiz() {
       document.getElementById('quizResultXp').textContent = `+${Math.min(40, 10 + data.score * 3)} XP`;
       handleGamifyEvent(data.gamify);
     }
-    loadQuizzes();
+    if (currentAssignmentId && currentClassId) {
+      // Vừa nộp bài tập của lớp -> làm mới lại lớp để thấy điểm ngay
+      showClassDetail(currentClassId);
+      currentAssignmentId = null;
+    } else {
+      loadQuizzes();
+    }
   } catch (e) {
     alert('Không nộp được bài, em thử lại nhé.');
   }
@@ -9418,6 +9782,222 @@ def api_game_stats():
 
 
 # ==========================================
+# 8.12 API "LỚP HỌC" (Teacher Mode)
+# ==========================================
+CLASS_CODE_ALPHABET = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789'  # bỏ ký tự dễ nhầm 0/O/1/I/L
+
+
+def generate_join_code():
+    """Mã vào lớp 6 ký tự, dễ đọc to trong lớp / chép tay lên bảng."""
+    db = get_db()
+    for _ in range(20):
+        code = ''.join(secrets.choice(CLASS_CODE_ALPHABET) for _ in range(6))
+        if not db.execute('SELECT id FROM classes WHERE join_code = ?', (code,)).fetchone():
+            return code
+    return ''.join(secrets.choice(CLASS_CODE_ALPHABET) for _ in range(8))
+
+
+def _class_role(class_id, user_id):
+    """Trả về 'owner' | 'member' | None — dùng để phân quyền mọi thao tác trên lớp."""
+    db = get_db()
+    row = db.execute('SELECT owner_id FROM classes WHERE id = ?', (class_id,)).fetchone()
+    if not row:
+        return None
+    if row['owner_id'] == user_id:
+        return 'owner'
+    m = db.execute('SELECT id FROM class_members WHERE class_id = ? AND user_id = ?', (class_id, user_id)).fetchone()
+    return 'member' if m else None
+
+
+@app.route('/api/classes', methods=['GET'])
+@login_required
+def api_list_classes():
+    """Lớp mình DẠY (owner) và lớp mình HỌC (member) — tách riêng để giao diện hiển thị đúng vai trò."""
+    uid = current_user_id()
+    db = get_db()
+    teaching = db.execute('''
+        SELECT c.id, c.name, c.subject, c.join_code, c.created_at,
+               (SELECT COUNT(*) FROM class_members m WHERE m.class_id = c.id) AS student_count,
+               (SELECT COUNT(*) FROM assignments a WHERE a.class_id = c.id) AS assignment_count
+        FROM classes c WHERE c.owner_id = ? AND c.archived = 0 ORDER BY c.created_at DESC
+    ''', (uid,)).fetchall()
+    learning = db.execute('''
+        SELECT c.id, c.name, c.subject, u.username AS teacher,
+               (SELECT COUNT(*) FROM assignments a WHERE a.class_id = c.id) AS assignment_count
+        FROM class_members m JOIN classes c ON c.id = m.class_id JOIN users u ON u.id = c.owner_id
+        WHERE m.user_id = ? AND c.archived = 0 ORDER BY m.joined_at DESC
+    ''', (uid,)).fetchall()
+    return jsonify({'teaching': [dict(r) for r in teaching], 'learning': [dict(r) for r in learning]})
+
+
+@app.route('/api/classes', methods=['POST'])
+@login_required
+def api_create_class():
+    data = request.get_json(silent=True) or {}
+    name = (data.get('name') or '').strip()[:80]
+    subject = (data.get('subject') or '').strip()[:60]
+    if not name:
+        return jsonify({"error": "Em đặt tên cho lớp nhé."}), 400
+    db = get_db()
+    code = generate_join_code()
+    cur = db.execute(
+        'INSERT INTO classes (owner_id, name, subject, join_code, created_at) VALUES (?, ?, ?, ?, ?)',
+        (current_user_id(), name, subject, code, now_iso())
+    )
+    db.commit()
+    return jsonify({"id": cur.lastrowid, "name": name, "join_code": code})
+
+
+@app.route('/api/classes/join', methods=['POST'])
+@login_required
+def api_join_class():
+    data = request.get_json(silent=True) or {}
+    code = (data.get('code') or '').strip().upper()
+    if not code:
+        return jsonify({"error": "Em nhập mã lớp nhé."}), 400
+
+    db = get_db()
+    cls = db.execute('SELECT id, owner_id, name FROM classes WHERE join_code = ? AND archived = 0', (code,)).fetchone()
+    if not cls:
+        return jsonify({"error": "Mã lớp không đúng hoặc lớp đã đóng."}), 404
+    if cls['owner_id'] == current_user_id():
+        return jsonify({"error": "Đây là lớp của chính em — em đang là giáo viên của lớp này rồi."}), 400
+    try:
+        db.execute('INSERT INTO class_members (class_id, user_id, joined_at) VALUES (?, ?, ?)',
+                   (cls['id'], current_user_id(), now_iso()))
+        db.commit()
+    except sqlite3.IntegrityError:
+        return jsonify({"error": "Em đã ở trong lớp này rồi."}), 400
+    return jsonify({"success": True, "id": cls['id'], "name": cls['name']})
+
+
+@app.route('/api/classes/<int:class_id>', methods=['GET'])
+@login_required
+def api_get_class(class_id):
+    """Bảng điều khiển lớp học. Giáo viên thấy TOÀN BỘ (danh sách học sinh, điểm từng người,
+    điểm yếu chung của lớp, ai cần chú ý). Học sinh chỉ thấy bài tập của mình + điểm của
+    CHÍNH MÌNH — không xem được điểm bạn khác."""
+    uid = current_user_id()
+    role = _class_role(class_id, uid)
+    if not role:
+        return jsonify({"error": "Em không có quyền xem lớp này."}), 403
+
+    db = get_db()
+    cls = db.execute('''SELECT c.*, u.username AS teacher FROM classes c
+                        JOIN users u ON u.id = c.owner_id WHERE c.id = ?''', (class_id,)).fetchone()
+    assignments = db.execute(
+        'SELECT id, quiz_id, title, due_at, created_at FROM assignments WHERE class_id = ? ORDER BY created_at DESC',
+        (class_id,)
+    ).fetchall()
+    member_rows = db.execute('''
+        SELECT u.id, u.username FROM class_members m JOIN users u ON u.id = m.user_id
+        WHERE m.class_id = ? ORDER BY u.username
+    ''', (class_id,)).fetchall()
+
+    out_assignments = []
+    weak_counter = {}
+    for a in assignments:
+        attempts = db.execute(
+            'SELECT user_id, score, total, weak_topics FROM quiz_attempts WHERE assignment_id = ?', (a['id'],)
+        ).fetchall()
+        # Mỗi học sinh chỉ tính LẦN LÀM TỐT NHẤT cho 1 bài tập (công bằng khi cho làm lại).
+        best = {}
+        for at in attempts:
+            pct = round(100 * at['score'] / at['total']) if at['total'] else 0
+            if at['user_id'] not in best or pct > best[at['user_id']]['pct']:
+                best[at['user_id']] = {'pct': pct, 'score': at['score'], 'total': at['total']}
+            for t in (json.loads(at['weak_topics']) if at['weak_topics'] else []):
+                weak_counter[t] = weak_counter.get(t, 0) + 1
+        submitted = len(best)
+        avg = round(sum(b['pct'] for b in best.values()) / submitted) if submitted else None
+        item = {'id': a['id'], 'quiz_id': a['quiz_id'], 'title': a['title'], 'due_at': a['due_at'],
+                'submitted': submitted, 'total_students': len(member_rows), 'avg_pct': avg}
+        if role == 'member':
+            mine = best.get(uid)
+            item['my_result'] = mine
+            item['submitted'] = None      # học sinh không xem được số bạn đã nộp
+            item['avg_pct'] = None
+            item['total_students'] = None
+        out_assignments.append(item)
+
+    payload = {'class': {'id': cls['id'], 'name': cls['name'], 'subject': cls['subject'],
+                          'teacher': cls['teacher'], 'join_code': cls['join_code'] if role == 'owner' else None},
+                'my_role': role, 'assignments': out_assignments}
+
+    if role == 'owner':
+        # Bảng học sinh + "ai cần chú ý": điểm TB dưới 50% hoặc chưa nộp bài nào.
+        students = []
+        for m in member_rows:
+            rows = db.execute('''SELECT a.id AS aid, qa.score, qa.total FROM assignments a
+                                 LEFT JOIN quiz_attempts qa ON qa.assignment_id = a.id AND qa.user_id = ?
+                                 WHERE a.class_id = ?''', (m['id'], class_id)).fetchall()
+            best_by_a = {}
+            for r in rows:
+                if r['score'] is None or not r['total']:
+                    continue
+                pct = round(100 * r['score'] / r['total'])
+                best_by_a[r['aid']] = max(best_by_a.get(r['aid'], 0), pct)
+            done = len(best_by_a)
+            avg = round(sum(best_by_a.values()) / done) if done else None
+            students.append({'id': m['id'], 'username': m['username'], 'done': done,
+                              'total_assignments': len(assignments), 'avg_pct': avg,
+                              'needs_attention': (avg is not None and avg < 50) or (len(assignments) > 0 and done == 0)})
+        payload['students'] = students
+        payload['class_weak_topics'] = [{'topic': t, 'count': c} for t, c in
+                                          sorted(weak_counter.items(), key=lambda kv: kv[1], reverse=True)[:5]]
+        graded = [s['avg_pct'] for s in students if s['avg_pct'] is not None]
+        payload['class_avg_pct'] = round(sum(graded) / len(graded)) if graded else None
+        payload['needs_attention_count'] = sum(1 for s in students if s['needs_attention'])
+    return jsonify(payload)
+
+
+@app.route('/api/classes/<int:class_id>/assignments', methods=['POST'])
+@login_required
+def api_create_assignment(class_id):
+    """Giao 1 bài quiz ĐÃ CÓ cho lớp. Bản sao đề không được tạo ra — cả lớp làm chung 1 quiz,
+    điểm tách nhau nhờ assignment_id trên từng bài làm."""
+    if _class_role(class_id, current_user_id()) != 'owner':
+        return jsonify({"error": "Chỉ giáo viên của lớp mới giao được bài."}), 403
+
+    data = request.get_json(silent=True) or {}
+    quiz_id = data.get('quizId')
+    due_at = (data.get('dueAt') or '').strip() or None
+
+    db = get_db()
+    quiz = db.execute('SELECT id, title FROM quizzes WHERE id = ? AND user_id = ?',
+                       (quiz_id, current_user_id())).fetchone()
+    if not quiz:
+        return jsonify({"error": "Không tìm thấy quiz này trong danh sách quiz của em."}), 404
+
+    title = (data.get('title') or quiz['title']).strip()[:120]
+    cur = db.execute(
+        'INSERT INTO assignments (class_id, quiz_id, title, due_at, created_at) VALUES (?, ?, ?, ?, ?)',
+        (class_id, quiz['id'], title, due_at, now_iso())
+    )
+    db.commit()
+    return jsonify({"id": cur.lastrowid, "title": title})
+
+
+@app.route('/api/classes/<int:class_id>', methods=['DELETE'])
+@login_required
+def api_delete_class(class_id):
+    """Giáo viên xoá lớp (xoá luôn thành viên + bài tập). Học sinh gọi API này = RỜI lớp."""
+    uid = current_user_id()
+    role = _class_role(class_id, uid)
+    if not role:
+        return jsonify({"error": "Không tìm thấy lớp này."}), 404
+    db = get_db()
+    if role == 'owner':
+        db.execute('DELETE FROM assignments WHERE class_id = ?', (class_id,))
+        db.execute('DELETE FROM class_members WHERE class_id = ?', (class_id,))
+        db.execute('DELETE FROM classes WHERE id = ?', (class_id,))
+    else:
+        db.execute('DELETE FROM class_members WHERE class_id = ? AND user_id = ?', (class_id, uid))
+    db.commit()
+    return jsonify({"success": True, "action": 'deleted' if role == 'owner' else 'left'})
+
+
+# ==========================================
 # 8.9 API "QUIZ GENERATOR"
 # ==========================================
 def _get_owned_quiz(quiz_id, user_id):
@@ -9509,7 +10089,19 @@ def api_generate_quiz():
 @app.route('/api/quizzes/<int:quiz_id>', methods=['GET'])
 @login_required
 def api_get_quiz(quiz_id):
-    quiz = _get_owned_quiz(quiz_id, current_user_id())
+    """Cho xem đề nếu: (a) mình là chủ quiz, HOẶC (b) quiz này được GIAO cho 1 lớp mà mình
+    đang là thành viên — nếu không có nhánh (b) thì học sinh không mở nổi bài tập giáo viên
+    giao (đã phát hiện đúng lỗi này khi kiểm thử Teacher Mode)."""
+    uid = current_user_id()
+    quiz = _get_owned_quiz(quiz_id, uid)
+    if not quiz:
+        db = get_db()
+        allowed = db.execute('''
+            SELECT 1 FROM assignments a JOIN class_members m ON m.class_id = a.class_id
+            WHERE a.quiz_id = ? AND m.user_id = ? LIMIT 1
+        ''', (quiz_id, uid)).fetchone()
+        if allowed:
+            quiz = db.execute('SELECT * FROM quizzes WHERE id = ?', (quiz_id,)).fetchone()
     if not quiz:
         return jsonify({"error": "Không tìm thấy quiz này."}), 404
     db = get_db()
@@ -9544,7 +10136,17 @@ def api_submit_quiz(quiz_id):
     """Chấm bài NGAY, KHÔNG gọi thêm AI nào (so khớp đáp án đã chuẩn hoá — xem
     grade_quiz_answer()). Tự lưu câu sai vào Sổ lỗi sai (nếu học sinh đồng ý, mặc định có)
     để nối liền 2 hệ thống, và cộng XP + kiểm tra thành tựu 'Điểm tuyệt đối'."""
-    quiz = _get_owned_quiz(quiz_id, current_user_id())
+    uid = current_user_id()
+    quiz = _get_owned_quiz(quiz_id, uid)
+    if not quiz:
+        # Học sinh nộp bài tập được giao: cho phép nếu quiz này thuộc 1 bài tập của lớp mình.
+        db_chk = get_db()
+        allowed = db_chk.execute('''
+            SELECT 1 FROM assignments a JOIN class_members m ON m.class_id = a.class_id
+            WHERE a.quiz_id = ? AND m.user_id = ? LIMIT 1
+        ''', (quiz_id, uid)).fetchone()
+        if allowed:
+            quiz = db_chk.execute('SELECT * FROM quizzes WHERE id = ?', (quiz_id,)).fetchone()
     if not quiz:
         return jsonify({"error": "Không tìm thấy quiz này."}), 404
 
@@ -9601,11 +10203,26 @@ def api_submit_quiz(quiz_id):
     total = len(q_rows)
     weak_topics = sorted(weak_topic_counter, key=weak_topic_counter.get, reverse=True)
 
+    # Nếu bài làm này là để nộp cho 1 BÀI TẬP ĐƯỢC GIAO trong lớp -> gắn assignment_id.
+    # Chỉ chấp nhận khi bài tập đó có thật, đúng quiz đang làm, VÀ học sinh thật sự ở trong
+    # lớp đó — tránh việc gửi assignment_id bừa để chèn điểm vào lớp mình không tham gia.
+    assignment_id = None
+    raw_assignment = data.get('assignmentId')
+    if raw_assignment is not None:
+        try:
+            cand = int(raw_assignment)
+        except (TypeError, ValueError):
+            cand = None
+        if cand is not None:
+            a_row = db.execute('SELECT id, class_id, quiz_id FROM assignments WHERE id = ?', (cand,)).fetchone()
+            if a_row and a_row['quiz_id'] == quiz_id and _class_role(a_row['class_id'], user_id):
+                assignment_id = a_row['id']
+
     db.execute(
-        '''INSERT INTO quiz_attempts (quiz_id, user_id, score, total, duration_seconds, answers, weak_topics, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
+        '''INSERT INTO quiz_attempts (quiz_id, user_id, score, total, duration_seconds, answers, weak_topics, assignment_id, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
         (quiz_id, user_id, correct_count, total, int(duration or 0), json.dumps(graded),
-         json.dumps(weak_topics), now_iso())
+         json.dumps(weak_topics), assignment_id, now_iso())
     )
     db.commit()
 
